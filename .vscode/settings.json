@@ -1,0 +1,16 @@
+{
+  // Pylance : cherche aussi les modules dans ./src
+  "python.analysis.extraPaths": ["./src"],
+  // (optionnel) active les complétions d’auto-import
+  "python.analysis.autoImportCompletions": true,
+
+  // Path Intellisense : “/” = racine du workspace
+  "path-intellisense.absolutePathToWorkspace": true,
+  // Raccourcis pratiques
+  "path-intellisense.mappings": {
+    "@": "${workspaceFolder}/src",
+    "data": "${workspaceFolder}/data",
+    "models": "${workspaceFolder}/models",
+    "nb": "${workspaceFolder}/notebook"
+  }
+}

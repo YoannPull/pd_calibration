@@ -1,0 +1,12 @@
+# For version control we should comit the poetry.lock
+
+poetry init -> initialise a poetry environment
+poetry_env activate -> show the env path
+eval $(poetry env activate) -> activate directly the environment
+poetry add numpy -> add numpy into the pyproject.toml
+poetry update -> update all the package to their last version 
+
+When adding a package we can specify the exact version that we want (see https://python-poetry.org/docs/dependency-specification/)
+An example of that is :
+poetry add "django@^4.0.0"
+
