@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Build loan-level default labels from Freddie Mac Single-Family datasets.
-
-Usage (notebook):
-    from freddie.build_default_labels import build_default_labels
-
-    df_scoring = build_default_labels(
-        path_orig="../data/raw/mortgage_data/historical_data_2022Q1/historical_data_2022Q1.txt",
-        path_perf="../data/raw/mortgage_data/historical_data_2022Q1/historical_data_time_2022Q1.txt",
-        window_months=24,                      # label horizon (12/24/36)
-        delinquency_threshold=3,               # 3 => 90+ DPD (0=current,1=30,2=60,3=90)
-        liquidation_codes=("02","03","09"),    # default events (Third Party/Short Sale/REO)
-        include_ra=True                        # treat "RA" (REO acquisition) as default
-    )
-
-Returns:
-    DataFrame: Origination columns + 'default_{T}m' (int8)
-"""
-
 from __future__ import annotations
 import pandas as pd
 import numpy as np
@@ -82,10 +63,14 @@ def _parse_yyyymm(series: pd.Series) -> pd.PeriodIndex:
     s = pd.to_datetime(series.astype("string"), format="%Y%m", errors="coerce")
     return s.dt.to_period("M")
 
-def _month_diff(mpr: pd.PeriodIndex, fpd: pd.PeriodIndex) -> pd.Series:
-    """Vectorized difference in months between two monthly Periods."""
-    # (year2 - year1) * 12 + (month2 - month1)
-    return (mpr.year - fpd.year) * 12 + (mpr.month - fpd.month)
+def _month_diff(mpr: pd.Series, fpd: pd.Series) -> pd.Series:
+    # Ensure period[M] dtype even if input are strings/datetimes by accident
+    if not pd.api.types.is_period_dtype(mpr):
+        mpr = pd.PeriodIndex(mpr.astype("string"), freq="M").to_series(index=mpr.index)
+    if not pd.api.types.is_period_dtype(fpd):
+        fpd = pd.PeriodIndex(fpd.astype("string"), freq="M").to_series(index=fpd.index)
+    return (mpr.dt.year - fpd.dt.year) * 12 + (mpr.dt.month - fpd.dt.month)
+
 
 def _normalize_zb_code(z: pd.Series) -> pd.Series:
     """Zero-balance codes as 2-digit strings ('02','03','09',...)."""

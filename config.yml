@@ -1,0 +1,18 @@
+data:
+  root: "data/raw/mortgage_data"
+  quarters: ["2022Q3", "2022Q1", "2022Q2"]   # <-- process these quarters
+  # (single-file option if we don’t specify 'quarters')
+  # orig: "data/raw/mortgage_data/historical_data_2022Q1/historical_data_2022Q1.txt"
+  # perf: "data/raw/mortgage_data/historical_data_2022Q1/historical_data_time_2022Q1.txt"
+
+labels:
+  window_months: 24
+  delinquency_threshold: 3         # 3 = 90+ days past due (0=cur,1=30,2=60,3=90)
+  liquidation_codes: ["02","03","09"]   # foreclosure / REO / charge-off codes
+  include_ra: true                 # count 'RA' (repurchase/realignment) as default
+  require_full_window: false       # true = keep only loans with a complete observation window
+
+output:
+  dir: "data/processed/default_labels"            # one CSV per quarter will be saved here
+  make_pooled: true                # if true => also create a concatenated CSV (all quarters)
+  # path: "data/processed/default_labels_24m.csv"   # used in single-file mode
