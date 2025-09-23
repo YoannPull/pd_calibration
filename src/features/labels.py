@@ -203,5 +203,5 @@ def build_default_labels(
     # No default observed in window => 0
     label_col = f"default_{window_months}m"
     df_out[label_col] = df_out[label_col].fillna(0).astype("Int8")
-
+    
     return df_out
