@@ -1,0 +1,3 @@
+- Review the pipeline code.
+- Train the pipeline on a longer TTC-PD time series.
+- Implement a rolling-window backtest: for each quarterly forecast, generate a table matching the format used in our article—this will provide the inputs needed for the Jeffreys calibration test
