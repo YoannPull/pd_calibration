@@ -1,9 +1,44 @@
 # -*- coding: utf-8 -*-
+# ============================================================
+# Binning max |Gini| (cat + num), WOE + sélection, logit + isotonic,
+# diagnostics (KS, déciles, calibration, PSI, importance, ablation, prior-shift)
+# Version complète, corrigée & optimisée + OPTION SUBSET
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*is_period_dtype is deprecated.*")
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
+
+# ================================
+# Réglages généraux
+# ================================
+# Sous-échantillonnage pour accélérer (stratifié sur la cible si dispo)
+USE_SUBSET         = False
+SUBSET_FRAC_TRAIN  = None      # ex: 0.25  (prioritaire sur MAX si non-None)
+SUBSET_FRAC_VAL    = None      # ex: 0.25
+SUBSET_MAX_TRAIN   = 150_000   # nb max lignes train (utilisé si FRAC est None)
+SUBSET_MAX_VAL     = 50_000    # nb max lignes val   (utilisé si FRAC est None)
+SUBSET_RANDOM_STATE= 42
+SUBSET_MIN_PER_CL  = 100       # garde au moins N obs/classe si possible
+TARGET_NAME        = "default_24m"
+
+# Ablation
+ABLATION_MAX_STEPS = 10        # 0 pour désactiver l’ablation
+ABLATION_MAX_AUC_LOSS = 0.02   # perte AUC tolérée par étape
+
+# PSI proxy temporel (drop automatique si instable)
+PSI_CUTOFF_PROXY   = 0.25
+conditional_proxies = ["original_interest_rate"]  # variables "sensibles" au drift macro
 
 # ================================
 # Imports
 # ================================
 import re
+import json
+import math
+import logging
+from itertools import zip_longest
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,26 +51,117 @@ except Exception:  # fallback si joblib indisponible
     Parallel = None
     def delayed(f): return f
 
-# ================================
-# Options
-# ================================
-# Par défaut on NE supprime PAS les *_missing : on laissera la sélection (Gini) décider
-no_flag_missing = False  # ne supprime plus les colonnes *_missing par défaut
+# Sklearn (modèle + metrics)
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, roc_curve
 
 # ================================
-# Chargement unique des données
+# Logging
+# ================================
+logger = logging.getLogger("binning_pipeline")
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _fmt = logging.Formatter("[%(levelname)s] %(message)s")
+    _h.setFormatter(_fmt)
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
+
+def set_verbosity(verbose: int = 0):
+    """0: WARN, 5: INFO, 10+: DEBUG."""
+    if verbose >= 10:
+        logger.setLevel(logging.DEBUG)
+    elif verbose >= 5:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARN)
+
+# ================================
+# Options I/O (facultatif)
+# ================================
+no_flag_missing = True  # supprimer les *_missing auto-générées ?
+
+# ================================
+# Chargement des données (adapter les chemins)
 # ================================
 df_train_imp = pd.read_parquet("../data/processed/merged/imputed/train.parquet")
 df_val_imp   = pd.read_parquet("../data/processed/merged/imputed/validation.parquet")
 
-# Ajustements spécifiques (idéalement dans l'imputer)
-# 👉 On ne remplace plus les NaN de 'first_time_homebuyer_flag' par False.
-#    On laisse la mécanique de binning gérer les NaN via __MISSING__.
-# for _df in (df_train_imp, df_val_imp):
-#     if "first_time_homebuyer_flag" in _df.columns:
-#         _df["first_time_homebuyer_flag"] = _df["first_time_homebuyer_flag"].fillna(False)
+# --- 0) Sous-échantillonnage (facultatif, très utile pour itérer vite) ---
+def stratified_sample(df, y_col, frac=None, max_rows=None, random_state=42, min_per_class=50):
+    """Sous-échantillonne df (stratifié sur y_col si dispo).
+       frac prioritaire sur max_rows si non-None.
+    """
+    if frac is None and (max_rows is None or len(df) <= max_rows):
+        return df.copy()
 
-# Suppression optionnelle des flags *_missing (insensible à la casse) sur train+val
+    if frac is not None:
+        if y_col in df.columns:
+            return (df
+                    .groupby(df[y_col], group_keys=False, dropna=False)
+                    .apply(lambda g: g.sample(frac=frac, random_state=random_state))
+                    .reset_index(drop=True))
+        else:
+            return df.sample(frac=frac, random_state=random_state).reset_index(drop=True)
+
+    # max_rows défini
+    n = len(df)
+    if n <= max_rows:
+        return df.copy()
+
+    if y_col in df.columns:
+        # répartition proportionnelle + min par classe si possible
+        counts = df[y_col].value_counts(dropna=False)
+        props = counts / counts.sum()
+        target_counts = (props * max_rows).astype(int)
+        # garantie min
+        for cls in counts.index:
+            target_counts.loc[cls] = max(target_counts.loc[cls], min_per_class if counts.loc[cls] >= min_per_class else counts.loc[cls])
+        # ajuste au total demandé
+        delta = max_rows - int(target_counts.sum())
+        if delta > 0:
+            # ajoute delta aux classes les plus fréquentes
+            order = counts.sort_values(ascending=False).index
+            for cls in order:
+                if delta == 0: break
+                can_add = counts.loc[cls] - target_counts.loc[cls]
+                add = min(delta, max(can_add, 0))
+                target_counts.loc[cls] += add
+                delta -= add
+        elif delta < 0:
+            # retire -delta depuis les plus fréquentes
+            order = counts.sort_values(ascending=False).index
+            for cls in order:
+                if delta == 0: break
+                can_remove = target_counts.loc[cls] - min_per_class
+                rm = min(-delta, max(can_remove, 0))
+                target_counts.loc[cls] -= rm
+                delta += rm
+
+        parts = []
+        for cls, n_take in target_counts.items():
+            g = df[df[y_col] == cls]
+            if n_take > 0 and len(g) > 0:
+                parts.append(g.sample(n=min(int(n_take), len(g)), random_state=random_state))
+        return pd.concat(parts, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+    else:
+        return df.sample(n=max_rows, random_state=random_state).reset_index(drop=True)
+
+if USE_SUBSET:
+    df_train_imp = stratified_sample(
+        df_train_imp, y_col=TARGET_NAME,
+        frac=SUBSET_FRAC_TRAIN, max_rows=SUBSET_MAX_TRAIN,
+        random_state=SUBSET_RANDOM_STATE, min_per_class=SUBSET_MIN_PER_CL
+    )
+    df_val_imp = stratified_sample(
+        df_val_imp, y_col=TARGET_NAME,
+        frac=SUBSET_FRAC_VAL, max_rows=SUBSET_MAX_VAL,
+        random_state=SUBSET_RANDOM_STATE, min_per_class=SUBSET_MIN_PER_CL
+    )
+    print(f"[SUBSET] train -> {df_train_imp.shape}, val -> {df_val_imp.shape}")
+
+# --- 1) Drop des colonnes *_missing si demandé ---
 if no_flag_missing:
     rx = re.compile(r"_missing$", re.I)
     missing_cols = sorted(set(
@@ -43,9 +169,19 @@ if no_flag_missing:
         [c for c in df_val_imp.columns if rx.search(c)]
     ))
     if missing_cols:
-        print("Suppression des colonnes *_missing :", missing_cols)
+        logger.info("Suppression des colonnes *_missing : %s", missing_cols)
         df_train_imp.drop(columns=missing_cols, inplace=True, errors="ignore")
         df_val_imp.drop(columns=missing_cols, inplace=True, errors="ignore")
+
+# --- 2) Denylist FORTE (toujours retirée) ---
+denylist_strict = [
+    "first_payment_date",       # proxy temporel
+    "maturity_date",            # proxy temporel redondant
+    "vintage",                  # proxy temporel
+    "mi_cancellation_indicator" # post-événement → fuite
+]
+df_train_imp.drop(columns=denylist_strict, inplace=True, errors="ignore")
+df_val_imp.drop(columns=denylist_strict, inplace=True, errors="ignore")
 
 print("train shape:", df_train_imp.shape)
 print("val   shape:", df_val_imp.shape)
@@ -57,16 +193,9 @@ def gini_trapz(df_cum,
                y_col="bad_client_share_cumsum",
                x_col="good_client_share_cumsum",
                signed=False):
-    """
-    Gini = 1 - 2 * aire(y vs x).
-    Par défaut on renvoie |Gini| (signed=False).
-    Sécurise les endpoints (0,0) et (1,1) et clamp dans [0,1].
-    """
     df = df_cum[[x_col, y_col]].astype(float).copy().sort_values(x_col)
-    # clamp
     df[x_col] = df[x_col].clip(0, 1)
     df[y_col] = df[y_col].clip(0, 1)
-    # endpoints
     if df[x_col].iloc[0] > 0 or df[y_col].iloc[0] > 0:
         df = pd.concat([pd.DataFrame({x_col: [0.0], y_col: [0.0]}), df], ignore_index=True)
     if df[x_col].iloc[-1] < 1 - 1e-12 or df[y_col].iloc[-1] < 1 - 1e-12:
@@ -80,12 +209,8 @@ def gini_trapz(df_cum,
 # ======================================================
 # Dé-one-hot (protège la cible) + contrôle d'exclusivité
 # ======================================================
-def detect_onehot_groups(df, allow_singleton=True, exclude_cols=None):
-    """
-    Détecte les groupes one-hot en scindant au DERNIER underscore.
-    Accepte tout suffixe (state_CA, grade_A, ...). 0/1 ou bool requis.
-    exclude_cols : colonnes à ignorer (ex: la cible).
-    """
+def detect_onehot_groups(df, allow_singleton=True, exclude_cols=None,
+                         exclusivity_check=True, exclusivity_thr=0.95):
     exclude = set(exclude_cols or [])
     groups = {}
     for col in df.columns:
@@ -101,19 +226,25 @@ def detect_onehot_groups(df, allow_singleton=True, exclude_cols=None):
     clean = {}
     for base, items in groups.items():
         if len(items) >= 2 or allow_singleton:
+            if exclusivity_check:
+                cols_sorted = [c for c, _ in items]
+                vals = df[cols_sorted].apply(pd.to_numeric, errors="coerce")
+                row_sum = vals.fillna(0).astype("Int64").sum(axis=1)
+                excl_rate = float(((row_sum <= 1) | row_sum.isna()).mean())
+                if excl_rate < exclusivity_thr:
+                    logger.warning("[WARN] OHE: groupe '%s' exclus (exclusivité %.1f%% < %.1f%%).",
+                                   base, 100*excl_rate, 100*exclusivity_thr)
+                    continue
             clean[base] = items
     return clean
 
-def deonehot_categoricals(df, allow_singleton=False, exclude_cols=None, ambiguous_label=None):
-    """
-    Recompose des colonnes one-hot en une seule catégorie (dtype category).
-    - multi-colonnes -> fusion
-    - singleton -> fusion seulement si allow_singleton=True
-    - "<NA>" (texte) -> NaN, rangé en dernier
-    - exclude_cols protégées (ex: cible)
-    - contrôle d'exclusivité: si plusieurs 1 sur une même ligne -> valeur ambiguë (NaN par défaut)
-    """
-    groups = detect_onehot_groups(df, allow_singleton=allow_singleton, exclude_cols=exclude_cols)
+def deonehot_categoricals(df, allow_singleton=False, exclude_cols=None,
+                          ambiguous_label=None,
+                          exclusivity_check=True, exclusivity_thr=0.95):
+    groups = detect_onehot_groups(
+        df, allow_singleton=allow_singleton, exclude_cols=exclude_cols,
+        exclusivity_check=exclusivity_check, exclusivity_thr=exclusivity_thr
+    )
     out = df.copy()
 
     def label_sort_key(lab):
@@ -124,22 +255,19 @@ def deonehot_categoricals(df, allow_singleton=False, exclude_cols=None, ambiguou
         cols_sorted = [c for c, _ in items_sorted]
         labels = [lab for _, lab in items_sorted]
 
-        # Contrôle d'exclusivité (somme par ligne des OHE du groupe)
         group_vals = df[cols_sorted].apply(pd.to_numeric, errors="coerce")
         row_sum = group_vals.fillna(0).astype("Int64").sum(axis=1)
         n_amb = int((row_sum > 1).sum())
-        n_any = int((row_sum >= 1).sum())
         if n_amb > 0:
             rate = n_amb / max(len(df), 1)
-            print(f"[WARN] deonehot: groupe '{base}' ambigu sur {n_amb} lignes "
-                  f"({rate:.2%} des lignes du DF). Ces lignes seront mises en NaN.")
+            logger.warning("[WARN] deonehot: groupe '%s' ambigu sur %d lignes (%.2f%%). NaN affectés.",
+                           base, n_amb, 100*rate)
 
         if len(items_sorted) == 1 and allow_singleton:
             col, lab = items_sorted[0]
             ser = pd.Series("__OTHER__", index=df.index, dtype="object")
             mask = (df[col] == 1)
             ser[mask] = (pd.NA if lab == "<NA>" else lab)
-            # Ambiguïtés (théoriquement impossibles en singleton) -> NaN/ambiguous_label
             if n_amb > 0:
                 amb_mask = row_sum > 1
                 ser[amb_mask] = ambiguous_label if ambiguous_label is not None else pd.NA
@@ -152,7 +280,6 @@ def deonehot_categoricals(df, allow_singleton=False, exclude_cols=None, ambiguou
             for c, lab in zip(cols_sorted, labels):
                 mask = (df[c] == 1)
                 ser[mask] = (pd.NA if lab == "<NA>" else lab)
-            # Ambiguïtés -> NaN/ambiguous_label
             if n_amb > 0:
                 amb_mask = row_sum > 1
                 ser[amb_mask] = ambiguous_label if ambiguous_label is not None else pd.NA
@@ -185,7 +312,10 @@ def infer_binary_target(df, prefer_name_patterns=('default', 'delinq', 'bad', 't
     if not candidates:
         raise ValueError("Aucune colonne binaire éligible trouvée pour servir de cible.")
     candidates.sort(reverse=True)
-    return candidates[0][1]
+    target = candidates[0][1]
+    rate = float(pd.to_numeric(df[target], errors="coerce").fillna(0).mean())
+    logger.info("[INFO] Cible inférée: '%s' (taux d'événements ≈ %.3f)", target, rate)
+    return target
 
 # ===================================================
 # Colonnes catégorielles brutes
@@ -288,7 +418,7 @@ def maximize_gini_via_merging(
     df, col, target_col,
     include_missing=True, missing_label="__MISSING__",
     ordered=False, explicit_order=None,
-    max_bins=6, min_bin_size=200,
+    max_bins=6, min_bin_size=200, min_bin_frac=None,
     order_key_for_curve="bad_rate", nominal_order_key="bad_rate"
 ):
     stats_df = _cat_stats(df, col, target_col, include_missing, missing_label)
@@ -301,17 +431,22 @@ def maximize_gini_via_merging(
         return {"mapping": mapping, "gini_before": float(gini_single), "gini_after": float(gini_single),
                 "bins_table": gdf_final, "bins": [tuple(grp) for grp in groups]}
 
-    # Contraintes
+    n_total = int(stats_df["n_total"].sum())
+    min_needed = 0
+    if min_bin_frac is not None:
+        min_needed = max(min_needed, math.ceil(float(min_bin_frac) * max(n_total, 1)))
+    if min_bin_size is not None:
+        min_needed = max(min_needed, int(min_bin_size))
+
     def constraints_ok(groups_):
         if max_bins is not None and len(groups_) > max_bins:
             return False
-        if min_bin_size and min_bin_size > 0:
+        if min_needed and min_needed > 0:
             for mods in groups_:
-                if int(stats_df[stats_df["modality"].isin(mods)]["n_total"].sum()) < min_bin_size:
+                if int(stats_df[stats_df["modality"].isin(mods)]["n_total"].sum()) < min_needed:
                     return False
         return True
 
-    # Merge glouton tant que les contraintes ne sont pas respectées
     while not constraints_ok(groups):
         best_g, best_i = -np.inf, None
         for i in range(len(groups) - 1):
@@ -344,15 +479,12 @@ def _is_period_dtype(dt):
         return False
 
 def _to_float_series(s):
-    # Period -> début de période -> jours depuis epoch
     if _is_period_dtype(s.dtype):
         ts = s.dt.to_timestamp(how="start")
-        days = (ts.astype("int64") // 86_400_000_000_000)  # ns -> jours
+        days = (ts.astype("int64") // 86_400_000_000_000)
         return days.astype("float64")
-    # Datetime -> jours depuis epoch (protège les tz)
     if pd.api.types.is_datetime64_any_dtype(s):
         s_dt = s
-        # si tz-aware -> rendre naïf
         try:
             if getattr(s_dt.dt, "tz", None) is not None:
                 s_dt = s_dt.dt.tz_convert(None)
@@ -361,30 +493,21 @@ def _to_float_series(s):
         s_dt = s_dt.astype("datetime64[ns]")
         days = (s_dt.astype("int64") // 86_400_000_000_000)
         return days.astype("float64")
-    # Numérique
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce").astype("float64")
-    # Objet -> numérique (coerce)
     return pd.to_numeric(s, errors="coerce").astype("float64")
 
 def _safe_edges_for_cut(edges, s_float):
-    """
-    edges: liste triée [-inf, t1, ..., +inf] -> array strictement croissante
-    élargit extrémités et corrige les égalités numériques.
-    """
     e = np.array(edges, dtype="float64")
     for i in range(1, len(e)):
         if not (e[i] > e[i - 1]):
             e[i] = np.nextafter(e[i - 1], np.inf)
-
     s_vals = s_float.to_numpy()
     try:
         s_min = float(np.nanmin(s_vals))
         s_max = float(np.nanmax(s_vals))
     except ValueError:
-        # tout NaN
         s_min, s_max = -1.0, 1.0
-
     rel_eps_lo = 1e-6 * (abs(e[1]) + 1.0) if len(e) > 1 else 1e-6
     rel_eps_hi = 1e-6 * (abs(e[-2]) + 1.0) if len(e) > 1 else 1e-6
     if len(e) >= 2:
@@ -434,17 +557,24 @@ def _gini_from_numeric_bins(y_int, x_float, edges, include_missing=True):
 
 def optimize_numeric_binning_by_quantiles(
     df, col, target_col,
-    max_bins=6, min_bin_size=200,
+    max_bins=6, min_bin_size=200, min_bin_frac=None,
     n_quantiles=50, q_low=0.02, q_high=0.98,
     include_missing=True, min_gain=1e-5
 ):
     s = _to_float_series(df[col])
     y = df[target_col].astype(int)
     nunique = s.dropna().nunique()
+
     if nunique < 2:
-        # une seule modalité -> un bin
+        s_f = s[np.isfinite(s)]
+        if s_f.empty:
+            e_cut = np.array([-1.0, 1.0], dtype="float64")
+        else:
+            lo, hi = float(np.nanmin(s_f)), float(np.nanmax(s_f))
+            eps = 1e-6 * (abs(lo) + abs(hi) + 1.0)
+            e_cut = np.array([lo - eps, hi + eps], dtype="float64")
         g0, _ = _gini_from_numeric_bins(y, s, [-np.inf, np.inf], include_missing)
-        return {"edges": [-np.inf, np.inf], "edges_for_cut": [-1.0, 1.0], "labels": ["(-inf, inf]"],
+        return {"edges": [-np.inf, np.inf], "edges_for_cut": e_cut, "labels": [f"({e_cut[0]}, {e_cut[1]}]"],
                 "gini_before": float(g0), "gini_after": float(g0), "bins_table": pd.DataFrame()}
 
     qs = np.linspace(q_low, q_high, n_quantiles)
@@ -452,11 +582,18 @@ def optimize_numeric_binning_by_quantiles(
     cand_vals = np.unique(cand_vals)
     edges = [-np.inf, np.inf]
 
+    n = len(s)
+    min_needed = 0
+    if min_bin_frac is not None:
+        min_needed = max(min_needed, math.ceil(float(min_bin_frac) * max(n, 1)))
+    if min_bin_size is not None:
+        min_needed = max(min_needed, int(min_bin_size))
+
     def edges_ok(e):
         arr = s.to_numpy()
         bins_idx = np.digitize(arr, e[1:-1], right=True)
         for k in range(len(e) - 1):
-            if int(((bins_idx == k) & ~np.isnan(arr)).sum()) < min_bin_size:
+            if int(((bins_idx == k) & ~np.isnan(arr)).sum()) < min_needed:
                 return False
         return True
 
@@ -472,7 +609,6 @@ def optimize_numeric_binning_by_quantiles(
             if t in edges:
                 continue
             new_edges = sorted([*edges, t])
-            # ignore seuils quasi-identiques
             if any(np.isclose(new_edges[i], new_edges[i + 1]) for i in range(len(new_edges) - 1)):
                 continue
             if not edges_ok(new_edges):
@@ -500,25 +636,23 @@ def optimize_numeric_binning_by_quantiles(
 def _compute_cat_bin_result(df_small, col, target_col,
                             include_missing, missing_label,
                             is_ord, explicit_order,
-                            max_bins, min_bin_size,
+                            max_bins, min_bin_size, min_bin_frac,
                             order_key_for_curve, nominal_order_key):
-    # df_small contient uniquement [col, target_col]
     res = maximize_gini_via_merging(
         df=df_small, col=col, target_col=target_col,
         include_missing=include_missing, missing_label=missing_label,
         ordered=is_ord, explicit_order=explicit_order,
-        max_bins=max_bins, min_bin_size=min_bin_size,
+        max_bins=max_bins, min_bin_size=min_bin_size, min_bin_frac=min_bin_frac,
         order_key_for_curve=order_key_for_curve, nominal_order_key=nominal_order_key
     )
     return col, res
 
 def _compute_num_bin_result(df_small, col, target_col,
-                            max_bins, min_bin_size, n_quantiles,
+                            max_bins, min_bin_size, min_bin_frac, n_quantiles,
                             include_missing):
-    # df_small contient uniquement [col, target_col]
     res = optimize_numeric_binning_by_quantiles(
         df=df_small, col=col, target_col=target_col,
-        max_bins=max_bins, min_bin_size=min_bin_size,
+        max_bins=max_bins, min_bin_size=min_bin_size, min_bin_frac=min_bin_frac,
         n_quantiles=n_quantiles, include_missing=include_missing
     )
     return col, res
@@ -530,17 +664,17 @@ def auto_bin_all_categoricals(
     df, cat_columns, target_col,
     include_missing=True, missing_label="__MISSING__",
     ordinal_cols=None, explicit_orders=None,
-    max_bins=6, min_bin_size=200,
+    max_bins=6, min_bin_size=200, min_bin_frac=None,
     order_key_for_curve="bad_rate", nominal_order_key="bad_rate",
     add_binned_columns=True, bin_col_suffix="__BIN",
     n_jobs=1, verbose=0
 ):
+    set_verbosity(verbose)
     ordinal_cols = set(ordinal_cols or [])
     explicit_orders = explicit_orders or {}
     df_out = df.copy()
     results, summary_rows = {}, []
 
-    # 1) calcule les binnings en parallèle (pas de mapping ici)
     if n_jobs != 1 and Parallel is not None and len(cat_columns) > 0:
         tasks = (
             delayed(_compute_cat_bin_result)(
@@ -548,7 +682,7 @@ def auto_bin_all_categoricals(
                 col, target_col,
                 include_missing, missing_label,
                 (col in ordinal_cols), explicit_orders.get(col),
-                max_bins, min_bin_size,
+                max_bins, min_bin_size, min_bin_frac,
                 order_key_for_curve, nominal_order_key
             )
             for col in cat_columns
@@ -563,12 +697,11 @@ def auto_bin_all_categoricals(
                 df=df_out, col=col, target_col=target_col,
                 include_missing=include_missing, missing_label=missing_label,
                 ordered=is_ord, explicit_order=explicit_orders.get(col),
-                max_bins=max_bins, min_bin_size=min_bin_size,
+                max_bins=max_bins, min_bin_size=min_bin_size, min_bin_frac=min_bin_frac,
                 order_key_for_curve=order_key_for_curve, nominal_order_key=nominal_order_key
             )
             results[col] = res
 
-    # 2) mapping (série, pour limiter la conso mémoire)
     for col, res in results.items():
         summary_rows.append({
             "variable": col, "type": "categorical",
@@ -593,17 +726,17 @@ def auto_bin_all_categoricals(
 # ==========================================================
 def auto_bin_all_numerics(
     df, target_col,
-    max_bins=6, min_bin_size=200,
+    max_bins=6, min_bin_size=200, min_bin_frac=None,
     n_quantiles=50, include_missing=True,
     add_binned_columns=True, bin_col_suffix="__BIN",
     exclude_ids=None,
     n_jobs=1, verbose=0
 ):
+    set_verbosity(verbose)
     exclude_ids = set(exclude_ids or [])
     df_out = df.copy()
     results, summary_rows = {}, []
 
-    # Détection colonnes numériques/period/datetime
     numeric_cols = []
     for col in df.columns:
         if col == target_col or col in exclude_ids:
@@ -620,13 +753,12 @@ def auto_bin_all_numerics(
         elif _is_period_dtype(s.dtype) or pd.api.types.is_datetime64_any_dtype(s):
             numeric_cols.append(col)
 
-    # 1) calcule les binnings en parallèle (pas de cut ici)
     if n_jobs != 1 and Parallel is not None and len(numeric_cols) > 0:
         tasks = (
             delayed(_compute_num_bin_result)(
                 df_out[[col, target_col]].copy(),
                 col, target_col,
-                max_bins, min_bin_size, n_quantiles,
+                max_bins, min_bin_size, min_bin_frac, n_quantiles,
                 include_missing
             )
             for col in numeric_cols
@@ -638,12 +770,11 @@ def auto_bin_all_numerics(
         for col in numeric_cols:
             res = optimize_numeric_binning_by_quantiles(
                 df=df_out, col=col, target_col=target_col,
-                max_bins=max_bins, min_bin_size=min_bin_size,
+                max_bins=max_bins, min_bin_size=min_bin_size, min_bin_frac=min_bin_frac,
                 n_quantiles=n_quantiles, include_missing=include_missing
             )
             results[col] = res
 
-    # 2) application des cuts (série, mémoire friendly)
     for col, res in results.items():
         summary_rows.append({
             "variable": col, "type": "numeric",
@@ -666,16 +797,20 @@ def auto_bin_all_numerics(
     return {"results": results, "summary": summary, "df": df_out}
 
 # ============================================
-# Assemblage final + One-Hot des BIN (corrigé)
+# Assemblage final + One-Hot des BIN (avec -1/-2)
 # ============================================
+def _ensure_sentinel_categories(base_df: pd.DataFrame, bin_cols):
+    base = base_df.copy()
+    for c in bin_cols:
+        if c in base.columns:
+            s = base[c].astype("Int64")
+            cats = sorted(set([int(v) for v in s.dropna().unique()]).union({-1, -2}))
+            base[c] = pd.Categorical(s, categories=cats)
+    return base
+
 def build_final_datasets(out_cat, out_num, drop_original=True, bin_col_suffix="__BIN",
                          keep_vars=None):
-    """
-    keep_vars: iterable de noms de variables (sans suffixe __BIN) à conserver.
-               Si None -> conserve toutes les variables binned.
-    """
     df_enrichi = out_num["df"].copy()
-    # récupère aussi les BIN caté ajoutés dans out_cat
     for c in out_cat["df"].columns:
         if c.endswith(bin_col_suffix) and c not in df_enrichi.columns:
             df_enrichi[c] = out_cat["df"][c]
@@ -690,12 +825,10 @@ def build_final_datasets(out_cat, out_num, drop_original=True, bin_col_suffix="_
     else:
         cat_keep, num_keep = cat_all, num_all
 
-    # BIN à garder / à supprimer
     all_bin_cols  = [c for c in df_enrichi.columns if c.endswith(bin_col_suffix)]
     keep_bin_cols = [c + bin_col_suffix for c in (cat_keep + num_keep)]
     drop_bin_cols = [c for c in all_bin_cols if c not in keep_bin_cols]
 
-    # Dataset binned (on enlève les brutes + les BIN non gardés)
     base_drop = cat_all + num_all + drop_bin_cols
     if drop_original:
         df_binned = (df_enrichi
@@ -704,8 +837,9 @@ def build_final_datasets(out_cat, out_num, drop_original=True, bin_col_suffix="_
     else:
         df_binned = df_enrichi.drop(columns=drop_bin_cols, errors="ignore").copy()
 
-    # OHE final uniquement des BIN retenus
     base = df_enrichi.drop(columns=base_drop, errors="ignore")
+    base = _ensure_sentinel_categories(base, keep_bin_cols)
+
     df_ohe = pd.get_dummies(
         base,
         columns=keep_bin_cols,
@@ -713,39 +847,80 @@ def build_final_datasets(out_cat, out_num, drop_original=True, bin_col_suffix="_
         dummy_na=False,
         dtype=np.uint8
     )
-    # Option : ordre stable des colonnes
     df_ohe = df_ohe.reindex(sorted(df_ohe.columns), axis=1)
     return df_enrichi, df_binned, df_ohe
+
+# ============================================
+# Sérialisation binnings (JSON)
+# ============================================
+def bins_to_dict(res, include_missing=True, missing_label="__MISSING__", bin_col_suffix="__BIN"):
+    return {
+        "target": res["target"],
+        "include_missing": include_missing,
+        "missing_label": missing_label,
+        "bin_col_suffix": bin_col_suffix,
+        "cat_results": {
+            var: {
+                "mapping": {str(k): int(v) for k, v in info["mapping"].items()},
+                "gini_before": info["gini_before"],
+                "gini_after": info["gini_after"],
+                "bins": [list(b) for b in info["bins"]],
+            }
+            for var, info in res["cat_results"].items()
+        },
+        "num_results": {
+            var: {
+                "edges": list(info["edges"]),
+                "edges_for_cut": list(np.asarray(info["edges_for_cut"], dtype="float64")),
+                "gini_before": info["gini_before"],
+                "gini_after": info["gini_after"],
+                "labels": list(info.get("labels", [])),
+            }
+            for var, info in res["num_results"].items()
+        },
+    }
+
+def bins_from_dict(d):
+    return d
+
+def save_bins_json(res, path, **meta):
+    d = bins_to_dict(res, **meta)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+def load_bins_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 # ============================================
 # LANCEUR complet (protège la cible, parallélisé)
 # ============================================
 def run_full_pipeline_on_onehot_df(
     df_onehot,
-    target_col=None,                         # passe "default_24m" pour forcer
-    max_bins_categ=6, min_bin_size_categ=200,
-    max_bins_num=6,   min_bin_size_num=200, n_quantiles_num=50,
+    target_col=None,
+    max_bins_categ=6, min_bin_size_categ=200, min_bin_frac_categ=None,
+    max_bins_num=6,   min_bin_size_num=200, min_bin_frac_num=200, n_quantiles_num=50,
     include_missing=True, missing_label="__MISSING__", max_levels_object=50,
     bin_col_suffix="__BIN",
     exclude_ids=("loan_sequence_number", "postal_code", "seller_name", "servicer_name", "msa_md"),
     n_jobs_categ=-1, n_jobs_num=-1, verbose=0,
-    min_gini_keep=None   # ⇦ optionnel: filtre les variables à faible Gini (ex: 1e-6)
+    min_gini_keep=None
 ):
-    # 0) dé-one-hot en protégeant la cible si fournie (contrôle exclusivité intégré)
+    set_verbosity(verbose)
+
     DF = deonehot_categoricals(
         df_onehot,
-        allow_singleton=False,                         # évite d'avaler des singletons ambigus
-        exclude_cols=[target_col] if target_col else None
+        allow_singleton=False,
+        exclude_cols=[target_col] if target_col else None,
+        exclusivity_check=True, exclusivity_thr=0.95
     )
 
-    # 1) cible
     if target_col is not None and target_col not in DF.columns:
-        print(f"[INFO] Colonne cible '{target_col}' introuvable après préparation. Inférence automatique...")
+        logger.info("[INFO] Colonne cible '%s' introuvable après préparation. Inférence automatique...", target_col)
         TARGET = infer_binary_target(DF)
     else:
         TARGET = target_col if target_col is not None else infer_binary_target(DF)
 
-    # 2) catégorielles
     cat_cols = find_categorical_columns(DF, target_col=TARGET, max_levels_object=max_levels_object,
                                         exclude_ids=exclude_ids)
     ordinal_cols, explicit_orders = extract_ordinal_info(DF, cat_cols)
@@ -753,23 +928,21 @@ def run_full_pipeline_on_onehot_df(
         df=DF, cat_columns=cat_cols, target_col=TARGET,
         include_missing=include_missing, missing_label=missing_label,
         ordinal_cols=ordinal_cols, explicit_orders=explicit_orders,
-        max_bins=max_bins_categ, min_bin_size=min_bin_size_categ,
+        max_bins=max_bins_categ, min_bin_size=min_bin_size_categ, min_bin_frac=min_bin_frac_categ,
         order_key_for_curve="bad_rate", nominal_order_key="bad_rate",
         add_binned_columns=True, bin_col_suffix=bin_col_suffix,
         n_jobs=n_jobs_categ, verbose=verbose
     )
 
-    # 3) numériques
     out_num = auto_bin_all_numerics(
         df=out_cat["df"], target_col=TARGET,
-        max_bins=max_bins_num, min_bin_size=min_bin_size_num,
+        max_bins=max_bins_num, min_bin_size=min_bin_size_num, min_bin_frac=min_bin_frac_num,
         n_quantiles=n_quantiles_num, include_missing=include_missing,
         add_binned_columns=True, bin_col_suffix=bin_col_suffix,
         exclude_ids=exclude_ids,
         n_jobs=n_jobs_num, verbose=verbose
     )
 
-    # 4) datasets finaux (+ filtrage Gini optionnel)
     summary = (pd.concat([out_cat["summary"], out_num["summary"]], ignore_index=True)
                .sort_values(["type", "gini_after"], ascending=[True, False])
                .reset_index(drop=True))
@@ -778,7 +951,7 @@ def run_full_pipeline_on_onehot_df(
         keep_vars = summary.loc[summary["gini_after"] >= float(min_gini_keep), "variable"].tolist()
         if verbose:
             nb_drop = (summary["gini_after"] < float(min_gini_keep)).sum()
-            print(f"[INFO] min_gini_keep={min_gini_keep} -> exclusion de {nb_drop} variables.")
+            logger.info("[INFO] min_gini_keep=%s -> exclusion de %d variables.", min_gini_keep, int(nb_drop))
 
     df_enrichi, df_binned, df_ohe = build_final_datasets(
         out_cat, out_num,
@@ -790,9 +963,9 @@ def run_full_pipeline_on_onehot_df(
     return {
         "target": TARGET,
         "summary": summary,
-        "df_enrichi": df_enrichi,    # contient les colonnes *_BIN
-        "df_binned": df_binned,      # (optionnel) DF avec colonnes BIN renommées
-        "df_ohe": df_ohe,            # OHE final prêt pour le modèle
+        "df_enrichi": df_enrichi,
+        "df_binned": df_binned,
+        "df_ohe": df_ohe,
         "cat_results": out_cat["results"],
         "num_results": out_num["results"]
     }
@@ -806,45 +979,41 @@ def transform_with_learned_bins(df_raw_onehot, res, bin_col_suffix="__BIN",
     DF = deonehot_categoricals(
         df_raw_onehot,
         allow_singleton=False,
-        exclude_cols=[res["target"]]  # protège la colonne cible
+        exclude_cols=[res["target"]]
     )
 
-    # 1) catégorielles (mappings appris)
     for col, r in res["cat_results"].items():
         if col not in DF.columns:
             continue
         s = DF[col].astype("object").where(DF[col].notna(), "__MISSING__")
-        mapped = s.map(r["mapping"]).astype("Int64")
-        mapped = mapped.fillna(-2).astype("Int64")  # catégories jamais vues -> -2
+        mapped = s.map(r["mapping"]).astype("Int64").fillna(-2).astype("Int64")
         DF[col + bin_col_suffix] = mapped
 
-    # 2) numériques (edges appris)
     for col, r in res["num_results"].items():
         if col not in DF.columns:
             continue
         s = _to_float_series(DF[col])
         e = np.array(r["edges_for_cut"], dtype="float64")
-        b = pd.cut(s, bins=e, include_lowest=True, duplicates="drop")
-        b = b.cat.codes.astype("Int64")
+        b = pd.cut(s, bins=e, include_lowest=True, duplicates="drop").cat.codes.astype("Int64")
         if include_missing and s.isna().any():
             b = b.where(~s.isna(), -1).astype("Int64")
         DF[col + bin_col_suffix] = b
 
-    # 3) One-hot final des colonnes BIN
     cat_cols = list(res["cat_results"].keys())
     num_cols = list(res["num_results"].keys())
     bin_cols = [c + bin_col_suffix for c in cat_cols + num_cols if c + bin_col_suffix in DF.columns]
 
+    base = DF.drop(columns=cat_cols + num_cols, errors="ignore")
+    base = _ensure_sentinel_categories(base, bin_cols)
+
     df_model = pd.get_dummies(
-        DF.drop(columns=cat_cols + num_cols, errors="ignore"),
+        base,
         columns=bin_cols,
         prefix={c: c.replace(bin_col_suffix, "") for c in bin_cols},
         dummy_na=False,
         dtype=np.uint8
     )
-    # Option : ordre stable
     df_model = df_model.reindex(sorted(df_model.columns), axis=1)
-    # Retire IDs
     df_model = df_model.drop(columns=[c for c in exclude_ids if c in df_model.columns], errors="ignore")
     return df_model
 
@@ -880,10 +1049,8 @@ def _curve_from_binned(df, bcol, target):
     return df_cum, float(g)
 
 def plot_all_concentration_curves_from_binned(res, top_n=None, types=("categorical", "numeric")):
-    df_base = res["df_enrichi"]  # contient *_BIN
+    df_base = res["df_enrichi"]
     target = res["target"]
-
-    # calcul des courbes
     rows = []
     for t, store in (("categorical", res["cat_results"]), ("numeric", res["num_results"])):
         if t not in types:
@@ -897,12 +1064,10 @@ def plot_all_concentration_curves_from_binned(res, top_n=None, types=("categoric
     rows.sort(key=lambda x: x[2], reverse=True)
     if top_n is not None:
         rows = rows[:int(top_n)]
-
-    # plots
     for t, var, g, df_cum in rows:
         plt.figure(figsize=(6, 6))
         plt.plot(df_cum["good_client_share_cumsum"], df_cum["bad_client_share_cumsum"], marker="o")
-        plt.plot([0, 1], [0, 1], linestyle="--")  # pas de couleur spécifique
+        plt.plot([0, 1], [0, 1], linestyle="--")
         plt.title(f"{var} [{t}] — Gini = {g:.4f}")
         plt.xlabel("Cumulative good share")
         plt.ylabel("Cumulative bad share")
@@ -914,143 +1079,85 @@ def plot_all_concentration_curves_from_binned(res, top_n=None, types=("categoric
         print(f"{t} — {var}: Gini = {g:.6f}, nb_points={len(df_cum)}")
 
 # =======================
-# Exemple d'utilisation :
+# Fit + WOE + sélection
 # =======================
-
-# 1) Fit sur train (DF "one-hot" ou mélange)
 res = run_full_pipeline_on_onehot_df(
     df_onehot=df_train_imp,
-    target_col="default_24m",   # 👈 sera PROTÉGÉ du dé-one-hot
-    max_bins_categ=6, min_bin_size_categ=200,
-    max_bins_num=6,   min_bin_size_num=200, n_quantiles_num=50,
+    target_col=TARGET_NAME,
+    max_bins_categ=6, min_bin_size_categ=200, min_bin_frac_categ=None,
+    max_bins_num=6,   min_bin_size_num=200, min_bin_frac_num=None, n_quantiles_num=50,
     include_missing=True, missing_label="__MISSING__", bin_col_suffix="__BIN",
-    n_jobs_categ=-1, n_jobs_num=-1,  # ← utilise tous les cœurs disponibles
+    n_jobs_categ=-1, n_jobs_num=-1,
     verbose=10,
-    # min_gini_keep=1e-6,        # ← décommente pour exclure auto les variables trop faibles
 )
 
-# 2) Jeu final pour le modèle (X, y)
+# Jeu final OHE (dispo mais non utilisé ensuite)
 cols_id = ["loan_sequence_number", "postal_code", "seller_name", "servicer_name", "msa_md"]
 df_final = res["df_ohe"].drop(columns=[c for c in cols_id if c in res["df_ohe"].columns], errors="ignore")
 y_train = df_final.pop(res["target"]).astype(int)
 X_train = df_final
 
-# 3) Transformer validation/test avec les bins appris
-df_val_final = transform_with_learned_bins(df_val_imp, res)
-y_val = df_val_final.pop(res["target"]).astype(int) if res["target"] in df_val_final.columns else None
-X_val = df_val_final.reindex(columns=X_train.columns, fill_value=0)  # aligne les colonnes
-
-## 4) (Optionnel) Plots des 30 meilleures courbes
-# plot_all_concentration_curves_from_binned(res, top_n=30)
-
-
-
-# --- Imports (nettoyés) ---
-from itertools import zip_longest
-import numpy as np
-import pandas as pd
-from IPython.display import display  # pour les aperçus à la fin
-
-# --- WOE par colonne de bins ---
+# WOE à partir des BIN sur TRAIN
 def woe_from_bin(df, target, bcol, smooth=0.5):
-    """
-    Calcule le WOE par bin pour la colonne bcol (déjà en codes entiers),
-    avec lissage additif 'smooth' (>=0) pour éviter 0/0.
-    Renvoie une Series alignée sur df.index, contenant le WOE de chaque ligne.
-    """
     if bcol not in df.columns:
         raise KeyError(f"Colonne '{bcol}' absente du DataFrame.")
-
-    # Groupby sur le code de bin (les NaN sont ignorés par groupby -> WOE sera NaN sur ces lignes)
     tab = df.groupby(bcol, dropna=True)[target].agg(['sum', 'count'])
     tab['good'] = tab['count'] - tab['sum']
-
-    B = float(tab['sum'].sum())
-    G = float(tab['good'].sum())
-    K = int(len(tab))
-
-    # Lissage additif -> tout reste strictement > 0 si smooth > 0
+    B = float(tab['sum'].sum()); G = float(tab['good'].sum()); K = int(len(tab))
     tab['bad_share']  = (tab['sum']  + smooth) / (B + smooth * K if B + smooth * K > 0 else 1.0)
     tab['good_share'] = (tab['good'] + smooth) / (G + smooth * K if G + smooth * K > 0 else 1.0)
-
-    # WOE = ln(bad_share / good_share)
     tab['woe'] = np.log(tab['bad_share'] / tab['good_share']).replace([np.inf, -np.inf], np.nan)
-
-    # Map sur la colonne de bins (les lignes dont le bin n'est pas dans l'index -> NaN)
     return df[bcol].map(tab['woe']).astype(float)
 
-# 1) WOE train après le pipeline
 train_enrichi = res["df_enrichi"].copy()
 target = res["target"]
 bin_cols = [c for c in train_enrichi.columns if c.endswith("__BIN")]
+woe_train = pd.DataFrame({c.replace("__BIN", "_WOE"): woe_from_bin(train_enrichi, target, c) for c in bin_cols})
 
-# Construction du DataFrame des WOE (une colonne par variable)
-woe_train = pd.DataFrame({
-    c.replace("__BIN", "_WOE"): woe_from_bin(train_enrichi, target, c)
-    for c in bin_cols
-})
-
-# 2) Ordre par “qualité” (Gini train comme proxy ; idéalement Gini OOT)
+# Classement des WOE par gini_after
 order_woe = (res["summary"]
              .sort_values("gini_after", ascending=False)["variable"]
              .apply(lambda v: f"{v}_WOE")
              .tolist())
-# On garde seulement les colonnes effectivement présentes
 order_woe = [v for v in order_woe if v in woe_train.columns]
 
-# 3) Corrélation absolue entre WOE (colonnes constantes -> NaN -> 0)
+# Sélection anti-colinéarité
 if len(order_woe) == 0:
     raise RuntimeError("Aucune variable WOE disponible pour la sélection.")
 corr = woe_train[order_woe].corr().abs().fillna(0.0)
 
-# 4) Greedy : on garde une seule variable par groupe très corrélé
-threshold = 0.85   # ajuste 0.80–0.90 selon ta tolérance
+threshold_corr = 0.85
 selected = []
-
 for v in order_woe:
     if not selected:
-        selected.append(v)
-        continue
-    # max corr avec le set déjà retenu
-    # (utilise .reindex pour robustesse si certaines colonnes manquent)
+        selected.append(v); continue
     mc = corr.loc[v, corr.columns.intersection(selected)]
     max_corr = float(mc.max()) if len(mc) else 0.0
     if not np.isfinite(max_corr) or np.isnan(max_corr):
         max_corr = 0.0
-    if max_corr < threshold:
+    if max_corr < threshold_corr:
         selected.append(v)
 
-selected_woe_cols = selected                        # ex. ['credit_score_WOE', ...]
-selected_vars     = [c.removesuffix("_WOE") for c in selected_woe_cols]  # versions "brutes"
+selected_woe_cols = selected
+selected_vars     = [c.removesuffix("_WOE") for c in selected_woe_cols]
 print(f"{len(selected_woe_cols)} variables retenues sur {len(order_woe)}")
 
-# --- Récap + diagnostics ---
 def summarize_selection(order_woe, selected_woe_cols, corr, threshold=0.85, save_csv=True, csv_prefix="selection"):
-    # Listes WOE
     all_woe     = list(order_woe)
     kept_woe    = list(selected_woe_cols)
     dropped_woe = [v for v in all_woe if v not in set(kept_woe)]
-
-    # Versions "brutes" (sans suffixe _WOE)
     kept_raw    = [v.removesuffix("_WOE") for v in kept_woe]
     dropped_raw = [v.removesuffix("_WOE") for v in dropped_woe]
 
-    # --- Affichages simples
     print(f"\nRésumé sélection : {len(kept_woe)} retenues / {len(all_woe)} évaluées (seuil corr = {threshold})")
     print("\n— Variables retenues (WOE) —")
-    for v in kept_woe:
-        print("  •", v)
+    for v in kept_woe: print("  •", v)
     print("\n— Variables écartées (WOE) —")
-    for v in dropped_woe:
-        print("  •", v)
+    for v in dropped_woe: print("  •", v)
 
-    # --- Table récap (alignée)
-    df_vars = pd.DataFrame(
-        list(zip_longest(kept_raw, dropped_raw, fillvalue="")),
-        columns=["kept_raw", "dropped_raw"]
-    )
+    df_vars = pd.DataFrame(list(zip_longest(kept_raw, dropped_raw, fillvalue="")),
+                           columns=["kept_raw", "dropped_raw"])
 
-    # --- Diag : pour chaque variable écartée, la retenue la plus corrélée et |ρ|
     diag_rows = []
     if len(kept_woe) and len(dropped_woe):
         corr_f = corr.fillna(0.0)
@@ -1071,79 +1178,46 @@ def summarize_selection(order_woe, selected_woe_cols, corr, threshold=0.85, save
             })
     df_diag = pd.DataFrame(diag_rows).sort_values("abs_corr_with_kept", ascending=False, na_position="last")
 
-    # Sauvegardes optionnelles
     if save_csv:
         df_vars.to_csv(f"{csv_prefix}_kept_vs_dropped.csv", index=False)
         df_diag.to_csv(f"{csv_prefix}_dropped_diagnostics.csv", index=False)
         print(f"\nFichiers écrits :\n - {csv_prefix}_kept_vs_dropped.csv\n - {csv_prefix}_dropped_diagnostics.csv")
 
-    # Aperçu notebook
     display(df_vars.head(20))
     display(df_diag.head(20))
-
     return df_vars, df_diag
 
-# === Appel ===
-threshold = 0.85  # par exemple
-df_vars, df_diag = summarize_selection(order_woe, selected_woe_cols, corr,
-                                       threshold=threshold)
-# ==== 0) Utilitaires WOE sur les BIN appris ====
-import numpy as np
-import pandas as pd
+df_vars, df_diag = summarize_selection(order_woe, selected_woe_cols, corr, threshold=threshold_corr)
 
+# ----------------------------------------------------------
+# WOE pipeline (maps, application train/val)
+# ----------------------------------------------------------
 def build_woe_maps(df_enrichi, target, smooth=0.5):
-    """
-    Construit les mappings WOE à partir du TRAIN (df_enrichi contient déjà les *_BIN).
-    Retourne un dict: {bcol: {"map": {bin_id: woe}, "default": global_woe}}
-    - 'default' = WOE global basé sur y (utile pour bins inconnus en val/test, ex. -2).
-    """
     maps = {}
     y = df_enrichi[target].astype(int)
-    B_all = float(y.sum())
-    G_all = float(len(y) - y.sum())
-    # WOE global (avec smooth)
+    B_all = float(y.sum()); G_all = float(len(y) - y.sum())
     global_woe = np.log((B_all + smooth) / (G_all + smooth))
-
     for bcol in [c for c in df_enrichi.columns if c.endswith("__BIN")]:
-        if bcol not in df_enrichi.columns:
-            continue
         tab = df_enrichi.groupby(bcol, dropna=True)[target].agg(['sum','count'])
         tab['good'] = tab['count'] - tab['sum']
-
-        B = float(tab['sum'].sum())
-        G = float(tab['good'].sum())
-        K = int(len(tab)) if len(tab) > 0 else 1
-
-        # shares lissées
+        B = float(tab['sum'].sum()); G = float(tab['good'].sum()); K = int(len(tab)) if len(tab) > 0 else 1
         denom_bad  = (B + smooth * K) if (B + smooth * K) > 0 else 1.0
         denom_good = (G + smooth * K) if (G + smooth * K) > 0 else 1.0
-        tab['bad_share']  = (tab['sum']  + smooth) / denom_bad
-        tab['good_share'] = (tab['good'] + smooth) / denom_good
-
-        w = np.log(tab['bad_share'] / tab['good_share']).replace([np.inf, -np.inf], np.nan)
+        w = np.log(((tab['sum']+smooth)/denom_bad) / ((tab['good']+smooth)/denom_good)).replace([np.inf, -np.inf], np.nan)
         maps[bcol] = {"map": w.to_dict(), "default": global_woe}
     return maps
 
 def make_enriched_with_bins(df_raw_onehot, res, include_missing=True, bin_col_suffix="__BIN"):
-    """
-    Reconstruit les colonnes *_BIN sur un DF brut (train-like ou val/test) avec les binnings appris.
-    - catégorielles jamais vues -> -2
-    - numériques NaN -> -1
-    """
-    # 1) dé-one-hot (protège la cible si elle existe dans df_raw_onehot)
     DF = deonehot_categoricals(
         df_raw_onehot,
         allow_singleton=False,
         exclude_cols=[res["target"]] if res["target"] in df_raw_onehot.columns else None
     )
-    # 2) Catégorielles
     for col, r in res["cat_results"].items():
         if col not in DF.columns:
             continue
         s = DF[col].astype("object").where(DF[col].notna(), "__MISSING__")
-        mapped = s.map(r["mapping"]).astype("Int64")
-        DF[col + bin_col_suffix] = mapped.fillna(-2).astype("Int64")  # -2 = catégorie jamais vue
-    # 3) Numériques
+        DF[col + bin_col_suffix] = s.map(r["mapping"]).astype("Int64").fillna(-2).astype("Int64")
     for col, r in res["num_results"].items():
         if col not in DF.columns:
             continue
@@ -1151,58 +1225,43 @@ def make_enriched_with_bins(df_raw_onehot, res, include_missing=True, bin_col_su
         e = np.array(r["edges_for_cut"], dtype="float64")
         b = pd.cut(s, bins=e, include_lowest=True, duplicates="drop").cat.codes.astype("Int64")
         if include_missing and s.isna().any():
-            b = b.where(~s.isna(), -1).astype("Int64")  # -1 = NaN
+            b = b.where(~s.isna(), -1).astype("Int64")
         DF[col + bin_col_suffix] = b
     return DF
 
 def apply_woe(df_enrichi_with_bins, woe_maps, kept_vars_raw, bin_col_suffix="__BIN"):
-    """
-    Fabrique la matrice X WOE à partir des BIN + mappings WOE appris sur TRAIN.
-    Remplit les NaN / bins inconnus avec le WOE global appris (clé 'default').
-    """
     cols = []
     for v in kept_vars_raw:
         bcol = f"{v}{bin_col_suffix}"
         if bcol not in df_enrichi_with_bins.columns or bcol not in woe_maps:
             continue
         ser = df_enrichi_with_bins[bcol].astype("Int64")
-        wmap = woe_maps[bcol]["map"]
-        wdef = float(woe_maps[bcol]["default"])
+        wmap = woe_maps[bcol]["map"]; wdef = float(woe_maps[bcol]["default"])
         x = ser.map(wmap).astype(float).fillna(wdef)
         cols.append((f"{v}_WOE", x))
     if not cols:
-        # aucune variable conservée -> DataFrame vide avec bons index
         return pd.DataFrame(index=df_enrichi_with_bins.index)
     return pd.concat([s for _, s in cols], axis=1)
 
-# ==== 1) Figer la liste des variables retenues (noms bruts) ====
-if 'selected_woe_cols' not in globals() or len(selected_woe_cols) == 0:
-    raise RuntimeError("La sélection WOE est vide ou non définie. Exécute d'abord la cellule de sélection.")
-kept_woe = list(selected_woe_cols)  # ex. ['credit_score_WOE', ...]
+# Variables retenues
+kept_woe = list(selected_woe_cols)
 kept_vars_raw = [c.removesuffix("_WOE") for c in kept_woe]
 
-# ==== 2) Construire les mappings WOE sur TRAIN puis X/y WOE (train) ====
+# TRAIN / VAL WOE
 woe_maps = build_woe_maps(res["df_enrichi"], res["target"])
-X_train_woe = apply_woe(res["df_enrichi"], woe_maps, kept_vars_raw)
-y_train = res["df_enrichi"][res["target"]].astype(int)
+X_train_woe_full = apply_woe(res["df_enrichi"], woe_maps, kept_vars_raw)
+y_train_full = res["df_enrichi"][res["target"]].astype(int)
 
-if X_train_woe.shape[1] == 0:
-    raise RuntimeError("Aucune variable WOE disponible dans X_train_woe après application des mappings.")
-
-# ==== 3) Préparer la validation : BIN -> WOE en réutilisant les mappings du TRAIN ====
-df_val_enrichi = make_enriched_with_bins(df_val_imp, res)     # reconstruit *_BIN sur val/test
-X_val_woe = apply_woe(df_val_enrichi, woe_maps, kept_vars_raw)
+df_val_enrichi = make_enriched_with_bins(df_val_imp, res)
+X_val_woe_full = apply_woe(df_val_enrichi, woe_maps, kept_vars_raw)
 y_val = df_val_enrichi[res["target"]].astype(int) if res["target"] in df_val_enrichi.columns else None
 
-# Sanity check colonnes (aligne les features)
-X_val_woe = X_val_woe.reindex(columns=X_train_woe.columns, fill_value=0.0)
+# Aligne colonnes
+X_val_woe_full = X_val_woe_full.reindex(columns=X_train_woe_full.columns, fill_value=0.0)
 
-# ==== 4) Entraînement : logistique + tuning AUC + calibration isotonic ====
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, GridSearchCV
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
-
+# ----------------------------------------------------------
+# Entraînement : logistique + tuning AUC + calibration isotonic
+# ----------------------------------------------------------
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 grid = {
     "C": [0.03, 0.1, 0.3, 1, 3, 10],
@@ -1211,96 +1270,46 @@ grid = {
     "class_weight": [None, "balanced"],
     "max_iter": [2000],
 }
-base = LogisticRegression()
-gs = GridSearchCV(base, grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True)
-gs.fit(X_train_woe, y_train)
-best_lr = gs.best_estimator_
+gs = GridSearchCV(LogisticRegression(), grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True)
 
-# Calibration (isotonic sur folds internes)
-cal = CalibratedClassifierCV(best_lr, method="isotonic", cv=cv)
-cal.fit(X_train_woe, y_train)
+def fit_calibrate(Xtr, ytr, Xva):
+    gs.fit(Xtr, ytr)
+    lr = gs.best_estimator_
+    cal = CalibratedClassifierCV(lr, method="isotonic", cv=cv).fit(Xtr, ytr)
+    p_tr = cal.predict_proba(Xtr)[:,1]
+    p_va = cal.predict_proba(Xva)[:,1]
+    return cal, lr, p_tr, p_va
 
-# (optionnel) Prépare aussi p_train pour les cellules PSI/diagnostics ensuite
-p_train = cal.predict_proba(X_train_woe)[:, 1]
-
-# ==== 5) Évaluation validation ====
-if y_val is not None:
-    p_val = cal.predict_proba(X_val_woe)[:, 1]
-    auc = roc_auc_score(y_val, p_val)
-    gini = 2*auc - 1
-    brier = brier_score_loss(y_val, p_val)
-    ll = log_loss(y_val, p_val)
-    print(f"AUC_val={auc:.4f} | Gini_val={gini:.4f} | Brier={brier:.5f} | LogLoss={ll:.5f}")
-else:
-    print("Attention : la cible n'est pas présente sur le jeu de validation, métriques non calculées.")
-
-
-
-
-
-
-
-# === Diagnostics post-modèle (KS, déciles, calibration, PSI, importance) ===
-import numpy as np
-import pandas as pd
-from sklearn.metrics import roc_curve
-from sklearn.linear_model import LogisticRegression
-
-# ---------------------------
-# Fonctions utilitaires
-# ---------------------------
 def ks_best_threshold(y, p):
-    """
-    Renvoie (KS, seuil) basés sur max(TPR-FPR) du ROC.
-    Si y est monoclassé, retourne (np.nan, np.nan).
-    """
     y = pd.Series(y).astype(int).to_numpy()
     p = pd.Series(p).astype(float).to_numpy()
-    # Cas dégénéré : une seule classe
     if np.unique(y).size < 2:
         return np.nan, np.nan
-    fpr, tpr, thr = roc_curve(y, p)  # thresholds décroissants
+    fpr, tpr, thr = roc_curve(y, p)
     ks_arr = tpr - fpr
     i = int(np.nanargmax(ks_arr))
     return float(ks_arr[i]), float(thr[i])
 
 def decile_table(y, p, q=10):
-    """
-    Table déciles (lift, capture, KS cumulatif).
-    Robuste aux distributions peu variées (fallback si qcut échoue).
-    Déciles ordonnés du plus risqué (haut) au moins risqué (bas).
-    """
     df = pd.DataFrame({"y": pd.Series(y).astype(int), "p": pd.Series(p).astype(float)})
-
-    # Tentative principale: qcut (quantiles)
     try:
         df["decile"] = pd.qcut(df["p"], q=q, labels=False, duplicates="drop")
     except Exception:
-        # Fallback: découpe sur les rangs (utile si peu de valeurs distinctes)
-        # On crée des bornes sur le rang, puis on mappe vers des déciles 0..q-1
         n = len(df)
-        if n == 0:
-            return pd.DataFrame()
+        if n == 0: return pd.DataFrame()
         ranks = df["p"].rank(method="first") / max(n, 1)
         df["decile"] = pd.cut(ranks, bins=np.linspace(0, 1, q+1), labels=False, include_lowest=True)
-
-    # Agrégation par décile
     tab = (df.groupby("decile", dropna=True)
              .agg(events=("y", "sum"), count=("y", "size"), avg_p=("p", "mean"))
-             .sort_index(ascending=False))  # haut = probas élevées
-    if tab.empty:
-        return tab
-
+             .sort_index(ascending=False))
+    if tab.empty: return tab
     tab["rate"] = tab["events"] / tab["count"].where(tab["count"] > 0, 1)
     tab["cum_events"] = tab["events"].cumsum()
     tab["cum_count"]  = tab["count"].cumsum()
-
     total_events = float(tab["events"].sum())
     total_count  = float(tab["count"].sum())
     tab["capture"]   = tab["cum_events"] / (total_events if total_events > 0 else 1.0)
     tab["cum_share"] = tab["cum_count"]  / (total_count  if total_count  > 0 else 1.0)
-
-    # KS cumulatif (du haut vers le bas)
     cum_good = tab["count"] - tab["events"]
     denom_good = float(cum_good.sum()) if float(cum_good.sum()) > 0 else 1.0
     tab["TPR"] = tab["cum_events"] / (total_events if total_events > 0 else 1.0)
@@ -1309,111 +1318,220 @@ def decile_table(y, p, q=10):
     return tab
 
 def calibration_slope_intercept(y, p, eps=1e-9):
-    """
-    Estime a,b de : logit(E[y]) = a + b * logit(p).
-    Idéalement a≈0, b≈1 si la calibration est parfaite.
-    """
     p = np.asarray(p, dtype="float64")
     y = np.asarray(y, dtype=int)
     if np.unique(y).size < 2:
         return np.nan, np.nan
     p_clip = np.clip(p, eps, 1 - eps)
     logit_p = np.log(p_clip / (1 - p_clip)).reshape(-1, 1)
-    lr = LogisticRegression(penalty=None, solver="lbfgs", max_iter=2000)  # penalty=None (sklearn>=1.2)
-    lr.fit(logit_p, y)
-    a = float(lr.intercept_[0])   # idéal ~ 0
-    b = float(lr.coef_[0][0])     # idéal ~ 1
+    try:
+        lr = LogisticRegression(penalty="none", solver="lbfgs", max_iter=2000)
+        lr.fit(logit_p, y)
+    except Exception:
+        lr = LogisticRegression(penalty=None, solver="lbfgs", max_iter=2000)
+        lr.fit(logit_p, y)
+    a = float(lr.intercept_[0]); b = float(lr.coef_[0][0])
     return a, b
 
 def psi(a, b, bins=10, eps=1e-9):
-    """
-    Population Stability Index entre distributions a (réf: train) et b (ex: val),
-    avec bords fondés sur les quantiles de a.
-    """
-    a = np.asarray(a, dtype="float64")
-    b = np.asarray(b, dtype="float64")
-    a_f = a[np.isfinite(a)]
-    b_f = b[np.isfinite(b)]
-    if a_f.size == 0 or b_f.size == 0:
-        return np.nan
-
-    # Bords par quantiles de a
+    a = np.asarray(a, dtype="float64"); b = np.asarray(b, dtype="float64")
+    a_f = a[np.isfinite(a)]; b_f = b[np.isfinite(b)]
+    if a_f.size == 0 or b_f.size == 0: return np.nan
     q = np.quantile(a_f, np.linspace(0, 1, bins + 1))
     q = np.unique(q)
-    if q.size < 2:
-        return 0.0
+    if q.size < 2: return 0.0
     q[0], q[-1] = -np.inf, np.inf
     for i in range(1, len(q)):
-        if not (q[i] > q[i - 1]):
-            q[i] = np.nextafter(q[i - 1], np.inf)
+        if not (q[i] > q[i-1]): q[i] = np.nextafter(q[i-1], np.inf)
+    ca, _ = np.histogram(a_f, bins=q); cb, _ = np.histogram(b_f, bins=q)
+    pa = ca / max(ca.sum(), 1); pb = cb / max(cb.sum(), 1)
+    return float(np.sum((pa - pb) * np.log((pa + eps) / (pb + eps))))
 
-    ca, _ = np.histogram(a_f, bins=q)
-    cb, _ = np.histogram(b_f, bins=q)
-    pa = ca / max(ca.sum(), 1)
-    pb = cb / max(cb.sum(), 1)
+def psi_classes(y_tr, y_va, eps=1e-9):
+    y_tr = np.asarray(y_tr, int); y_va = np.asarray(y_va, int)
+    pa1 = np.mean(y_tr == 1); pa0 = 1 - pa1
+    pb1 = np.mean(y_va == 1); pb0 = 1 - pb1
+    return float((pa0 - pb0) * np.log((pa0 + eps) / (pb0 + eps)) +
+                 (pa1 - pb1) * np.log((pa1 + eps) / (pb1 + eps)))
 
-    ratio = (pa + eps) / (pb + eps)
-    return float(np.sum((pa - pb) * np.log(ratio)))
+# Fit initial (full WOE sélectionné)
+cal0, lr0, p_tr0, p_va0 = fit_calibrate(X_train_woe_full, y_train_full, X_val_woe_full)
+if y_val is not None:
+    auc0 = roc_auc_score(y_val, p_va0); gini0 = 2*auc0 - 1
+    brier0 = brier_score_loss(y_val, p_va0); ll0 = log_loss(y_val, p_va0)
+    ks0, thr0 = ks_best_threshold(y_val, p_va0)
+    psi0 = psi(p_tr0, p_va0, bins=10)
+    print(f"AUC_val={auc0:.4f} | Gini_val={gini0:.4f} | Brier={brier0:.5f} | LogLoss={ll0:.5f}")
+    print(f"KS_val={ks0:.4f} | seuil_KS={thr0:.4f}")
+    print(f"\nPSI (train→val, probas) = {psi0:.4f}  (≈ <0.10 faible, 0.10–0.25 modéré, >0.25 fort)")
+    print(f"PSI (distribution des classes TRAIN→VAL) = {psi_classes(y_train_full, y_val):.4f}")
 
-# ---------------------------
-# Prérequis
-# ---------------------------
-if not ('y_val' in globals() and 'p_val' in globals()):
-    raise RuntimeError("y_val et p_val doivent être définis (voir la cellule d'entraînement/calibration).")
+# ----------------------------------------------------------
+# PSI par feature (sur WOE) + drop des proxies temporels instables
+# ----------------------------------------------------------
+def psi_by_feature(a, b, bins=10, eps=1e-9):
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if a.size==0 or b.size==0: return np.nan
+    q = np.quantile(a, np.linspace(0,1,bins+1))
+    q = np.unique(q); q[0], q[-1] = -np.inf, np.inf
+    for i in range(1,len(q)):
+        if not (q[i] > q[i-1]): q[i] = np.nextafter(q[i-1], np.inf)
+    ca,_ = np.histogram(a, bins=q); cb,_ = np.histogram(b, bins=q)
+    pa, pb = ca/ca.sum(), cb/cb.sum()
+    return float(np.sum((pa-pb)*np.log((pa+eps)/(pb+eps))))
 
-# ---------------------------
-# 1) KS + seuil optimal
-# ---------------------------
-ks_val, thr_val = ks_best_threshold(y_val, p_val)
-if np.isnan(ks_val):
-    print("KS non calculable (y_val monoclassé).")
-else:
-    print(f"KS_val={ks_val:.4f} | seuil_KS={thr_val:.4f}")
+psi_feat = pd.Series({c: psi_by_feature(X_train_woe_full[c], X_val_woe_full[c]) for c in X_train_woe_full.columns}).sort_values(ascending=False)
+print("\nTop 15 PSI(feature):")
+print(psi_feat.head(15))
 
-# ---------------------------
-# 2) Table des déciles + KS (déciles)
-# ---------------------------
-dec_val = decile_table(y_val, p_val, q=10)
-if dec_val.empty:
-    print("Impossible de construire la table des déciles (distribution dégénérée).")
-else:
-    print(dec_val[["count","events","rate","avg_p","capture","KS"]])
-    print(f"KS_val (déciles) = {float(dec_val['KS'].max()):.4f}")
+# Drop automatique des proxys temporels si PSI(feature) > cutoff
+drop_conditional = []
+for raw in conditional_proxies:
+    c = f"{raw}_WOE"
+    if c in psi_feat.index and psi_feat.loc[c] > PSI_CUTOFF_PROXY:
+        drop_conditional.append(c)
 
-# ---------------------------
-# 3) Calibration (intercept/slope)
-# ---------------------------
-a_val, b_val = calibration_slope_intercept(y_val, p_val)
-if np.isnan(a_val) or np.isnan(b_val):
-    print("Calibration slope/intercept non calculable (y_val monoclassé).")
-else:
-    print(f"Calibration (val) : intercept={a_val:+.4f} | slope={b_val:.4f}")
+X_train_curr = X_train_woe_full.copy()
+X_val_curr   = X_val_woe_full.copy()
+if drop_conditional:
+    print("\nDrop proxies instables (PSI>cutoff):", drop_conditional)
+    X_train_curr = X_train_curr.drop(columns=drop_conditional, errors="ignore")
+    X_val_curr   = X_val_curr.drop(columns=drop_conditional, errors="ignore")
 
-# ---------------------------
-# 4) PSI train→val (probas)
-# ---------------------------
-if 'p_train' in globals():
-    psi_scores = psi(p_train, p_val, bins=10)
-    if np.isnan(psi_scores):
-        print("PSI non calculable (distributions vides).")
+# Refit après éventuel drop proxy
+cal_curr, lr_curr, p_tr_curr, p_va_curr = fit_calibrate(X_train_curr, y_train_full, X_val_curr)
+best_auc  = roc_auc_score(y_val, p_va_curr) if y_val is not None else np.nan
+best_psi  = psi(p_tr_curr, p_va_curr) if y_val is not None else np.nan
+keep_cols = list(X_train_curr.columns)
+print(f"\nStart ablation: AUC={best_auc:.4f} | PSI(probas)={best_psi:.4f}")
+
+# ----------------------------------------------------------
+# Ablation gloutonne (peut être désactivée en mettant ABLATION_MAX_STEPS=0)
+# ----------------------------------------------------------
+for step in range(min(ABLATION_MAX_STEPS, len(keep_cols))):
+    # recompute PSI(feature) sur l'ensemble courant
+    psi_feat_now = pd.Series({c: psi_by_feature(X_train_curr[c], X_val_curr[c]) for c in keep_cols}).sort_values(ascending=False)
+    cand = psi_feat_now.index[0]  # feature avec PSI max
+    Xtr_try = X_train_curr.drop(columns=[cand])
+    Xva_try = X_val_curr.drop(columns=[cand], errors="ignore")
+    cal2, lr2, p_tr2, p_va2 = fit_calibrate(Xtr_try, y_train_full, Xva_try)
+    auc2  = roc_auc_score(y_val, p_va2) if y_val is not None else np.nan
+    psi2  = psi(p_tr2, p_va2) if y_val is not None else np.nan
+    gain_psi = (best_psi - psi2) if (not np.isnan(best_psi) and not np.isnan(psi2)) else np.nan
+    loss_auc = (best_auc - auc2) if (not np.isnan(best_auc) and not np.isnan(auc2)) else np.nan
+    print(f"Try drop {cand:35s} | AUC={auc2:.4f} (Δ{loss_auc:+.4f}) | PSI={psi2:.4f} (Δ{gain_psi:+.4f})")
+
+    # garde la suppression si PSI baisse et perte AUC tolérée
+    if (not np.isnan(psi2)) and (psi2 + 1e-6) < best_psi and (np.isnan(loss_auc) or loss_auc <= ABLATION_MAX_AUC_LOSS):
+        X_train_curr, X_val_curr = Xtr_try, Xva_try
+        cal_curr, lr_curr, p_tr_curr, p_va_curr = cal2, lr2, p_tr2, p_va2
+        best_auc, best_psi = auc2, psi2
+        keep_cols.remove(cand)
+        print("  -> kept removal")
     else:
-        print(f"PSI (train→val, probas) = {psi_scores:.4f}  (≈ <0.1 faible, 0.1–0.25 modéré, >0.25 fort)")
-else:
-    print("PSI non calculé : variable 'p_train' non définie dans l'environnement.")
+        print("  -> revert")
+        break
 
-# ---------------------------
-# 5) Importance des variables (coeffs standardisés)
-# ---------------------------
-if 'best_lr' in globals() and 'X_train_woe' in globals():
-    if getattr(best_lr, "coef_", None) is None:
-        print("Importance non calculée : best_lr n'a pas d'attribut coef_.")
+# Scores finaux post-ablation
+if y_val is not None:
+    auc = roc_auc_score(y_val, p_va_curr); gini = 2*auc - 1
+    brier = brier_score_loss(y_val, p_va_curr); ll = log_loss(y_val, p_va_curr)
+    print(f"\nAfter ablation: AUC_val={auc:.4f} | Gini={gini:.4f} | Brier={brier:.5f} | LogLoss={ll:.5f} | PSI(probas)={best_psi:.4f}")
+    print("Features finales :", len(keep_cols))
+
+# ----------------------------------------------------------
+# Prior-shift adjust (correction d'intercept) + déciles APRÈS
+# ----------------------------------------------------------
+def prior_shift_adjust(p, base_train, base_val, eps=1e-9):
+    p = np.clip(np.asarray(p, float), eps, 1-eps)
+    logit = np.log(p/(1-p))
+    delta = np.log((base_val+eps)/(1-base_val+eps)) - np.log((base_train+eps)/(1-base_train+eps))
+    z = logit + delta
+    return 1 / (1 + np.exp(-z))
+
+if y_val is not None:
+    base_train = float(np.mean(y_train_full)); base_val = float(np.mean(y_val))
+    p_val_adj = prior_shift_adjust(p_va_curr, base_train, base_val)
+
+    auc_adj = roc_auc_score(y_val, p_val_adj); gini_adj = 2*auc_adj - 1
+    brier_adj = brier_score_loss(y_val, p_val_adj); ll_adj = log_loss(y_val, p_val_adj)
+    ks_adj, thr_adj = ks_best_threshold(y_val, p_val_adj)
+    psi_adj = psi(p_tr_curr, p_val_adj, bins=10)
+
+    print(f"\nAfter prior-shift adjust:")
+    print(f"AUC_val={auc_adj:.4f} | Gini_val={gini_adj:.4f} | Brier={brier_adj:.5f} | LogLoss={ll_adj:.5f}")
+    print(f"KS_val={ks_adj:.4f} | seuil_KS={thr_adj:.4f}")
+    print(f"PSI (train→val, probas) après ajustement = {psi_adj:.4f}")
+
+    dec_val_after = decile_table(y_val, p_val_adj, q=10)
+    if not dec_val_after.empty:
+        print("\nDéciles — APRÈS prior-shift :")
+        print(dec_val_after[["count","events","rate","avg_p","capture","KS"]])
+        print(f"KS_val (déciles, après) = {float(dec_val_after['KS'].max()):.4f}")
+
+# ----------------------------------------------------------
+# Importance des variables (coeffs standardisés) — ROBUSTE
+# ----------------------------------------------------------
+def compute_standardized_importance(estimator, X_ref, fallback_X=None, topn=15):
+    """
+    estimator : LogisticRegression déjà fit (le dernier utilisé)
+    X_ref     : DataFrame aligné avec le fit final (idéalement la matrice passée au dernier .fit())
+    fallback_X: DataFrame de secours si besoin (ex: X_train_woe_full)
+    """
+    if not hasattr(estimator, "coef_"):
+        print("Importance non calculée : l'estimateur n'a pas d'attribut coef_.")
+        return
+
+    beta = np.asarray(estimator.coef_).ravel()
+
+    # 1) Colonnes réellement utilisées pour le dernier fit
+    if X_ref is not None and isinstance(X_ref, pd.DataFrame):
+        feat_cols_used = list(X_ref.columns)
+    elif hasattr(estimator, "feature_names_in_"):
+        feat_cols_used = list(estimator.feature_names_in_)
+    elif fallback_X is not None:
+        feat_cols_used = list(fallback_X.columns[:len(beta)])
     else:
-        coefs = pd.Series(best_lr.coef_.ravel(), index=X_train_woe.columns)
-        stds  = X_train_woe.std(ddof=0).replace(0, np.nan)
-        std_coef = coefs * stds
-        imp = (pd.DataFrame({"coef": coefs, "std": stds, "std_coef": std_coef})
-               .sort_values("std_coef", key=lambda s: s.abs(), ascending=False))
-        print("\nTop 15 variables (|coef|*sd) :")
-        print(imp.head(15))
-else:
-    print("Importance non calculée : 'best_lr' ou 'X_train_woe' manquant.")
+        print("Impossible de déterminer les noms de variables utilisés.")
+        return
+
+    # 2) Alignement par troncature prudente si tailles décalées
+    if len(beta) != len(feat_cols_used):
+        logger.warning("Taille coef_ (%d) ≠ nb colonnes (%d). Alignement par troncature.",
+                       len(beta), len(feat_cols_used))
+        m = min(len(beta), len(feat_cols_used))
+        beta = beta[:m]
+        feat_cols_used = feat_cols_used[:m]
+
+    # 3) Construire le X pour std, en réindexant sur les features attendues
+    if X_ref is None and fallback_X is not None:
+        X_for_std = fallback_X.reindex(columns=feat_cols_used)
+    else:
+        X_for_std = X_ref.reindex(columns=feat_cols_used)
+
+    missing = [c for c in feat_cols_used if c not in (X_for_std.columns)]
+    if missing:
+        logger.warning("Features absentes pour std (ignorées): %s", missing)
+
+    coefs = pd.Series(beta, index=feat_cols_used)
+    stds  = X_for_std.std(ddof=0).replace(0, np.nan)
+    std_coef = coefs * stds
+
+    imp = (pd.DataFrame({"coef": coefs, "std": stds, "std_coef": std_coef})
+           .dropna(subset=["std_coef"])
+           .sort_values("std_coef", key=lambda s: s.abs(), ascending=False))
+
+    print("\nTop variables (|coef|*sd) :")
+    print(imp.head(topn))
+    return imp
+
+# Importance sur le modèle final
+lr_final   = lr_curr
+X_train_fit= X_train_curr
+_ = compute_standardized_importance(
+    estimator=lr_final,
+    X_ref=X_train_fit,
+    fallback_X=X_train_woe_full,
+    topn=15
+)
