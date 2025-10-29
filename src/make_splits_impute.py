@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 # Internal imports
-from src.features.impute import load_quarter_files, coerce_base_types, coerce_and_impute, READ_KW
+from features.impute import load_quarter_files, coerce_and_impute, READ_KW
 
 def main():
     ap = argparse.ArgumentParser()
@@ -12,9 +12,25 @@ def main():
     ap.add_argument("--subdir", default="default_labels", help="Subfolder with default_labels_{T}m_YYYYQ*.csv")
     ap.add_argument("--window", type=int, default=24, help="Label horizon (months) used in filenames")
     ap.add_argument("--out_dir", default="data/processed/default_labels_imputed", help="Output directory")
-    ap.add_argument("--format", choices=["parquet", "csv"], default="csv")
+    ap.add_argument("--format", choices=["parquet", "csv"], default="parquet")
     ap.add_argument("--imput_cohort", action="store_true",
                     help="Use cohort-aware medians (by vintage year / purpose / LTV bins)")
+
+    # ---- NEW: time-based split options ----
+    ap.add_argument("--train_range", type=str, default=None,
+                    help="Quarter range for train, e.g. '2018Q1:2021Q4' (open-ended ':2021Q4' or '2018Q1:' allowed)")
+    ap.add_argument("--val_range", type=str, default=None,
+                    help="Quarter range for validation, e.g. '2022Q1:2022Q4'")
+    ap.add_argument("--test_range", type=str, default=None,
+                    help="Quarter range for test, e.g. '2023Q1:'")
+
+    ap.add_argument("--train_years", type=str, default=None,
+                    help="Years for train if no quarter ranges provided, e.g. '2018-2020,2022'")
+    ap.add_argument("--val_years", type=str, default=None,
+                    help="Years for validation, e.g. '2021'")
+    ap.add_argument("--test_years", type=str, default=None,
+                    help="Years for test, e.g. '2022-2023'")
+
     args = ap.parse_args()
 
     in_dir = Path(args.in_dir) / args.subdir
@@ -28,8 +44,17 @@ def main():
         READ_KW.pop("engine", None)
         READ_KW.pop("dtype_backend", None)
 
-    # 1) Load and split quarters -> train/val/test
-    df_train, df_val, df_test = load_quarter_files(in_dir, window_months=args.window)
+    # 1) Load and split quarters with user rules
+    df_train, df_val, df_test = load_quarter_files(
+        in_dir,
+        window_months=args.window,
+        train_range=args.train_range,
+        val_range=args.val_range,
+        test_range=args.test_range,
+        train_years=args.train_years,
+        val_years=args.val_years,
+        test_years=args.test_years,
+    )
 
     # Basic report
     sizes = {"train": len(df_train), "validation": len(df_val), "test": len(df_test)}
