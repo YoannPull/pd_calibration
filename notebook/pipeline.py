@@ -2,7 +2,7 @@
 # ============================================================
 # Binning max |Gini| (cat + num), WOE + sélection, logit + isotonic,
 # diagnostics (KS, déciles, calibration, PSI, importance, ablation, prior-shift)
-# Version complète, corrigée & optimisée + OPTION SUBSET
+# + Reporting trimestriel (métriques & classes de risque)
 # ============================================================
 
 import warnings
@@ -38,6 +38,7 @@ import json
 import math
 import logging
 from itertools import zip_longest
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -85,8 +86,16 @@ no_flag_missing = True  # supprimer les *_missing auto-générées ?
 # ================================
 # Chargement des données (adapter les chemins)
 # ================================
-df_train_imp = pd.read_parquet("../data/processed/merged/imputed/train.parquet")
-df_val_imp   = pd.read_parquet("../data/processed/merged/imputed/validation.parquet")
+df_train_imp = pd.read_parquet("data/processed/merged/imputed/train.parquet")
+df_val_imp   = pd.read_parquet("data/processed/merged/imputed/validation.parquet")
+
+# --- (NOUVEAU) identifie la colonne trimestre et en garde une copie pour le reporting ---
+QUARTER_COL_CANDIDATES = ["vintage", "as_of_quarter", "quarter", "origination_quarter"]
+QUARTER_COL = next((c for c in QUARTER_COL_CANDIDATES if c in df_train_imp.columns), None)
+if QUARTER_COL is None:
+    raise RuntimeError("Aucune colonne de trimestre trouvée (essayé: vintage/as_of_quarter/quarter/origination_quarter).")
+df_train_quarter = df_train_imp[QUARTER_COL].copy()
+df_val_quarter   = df_val_imp[QUARTER_COL].copy()
 
 # --- 0) Sous-échantillonnage (facultatif, très utile pour itérer vite) ---
 def stratified_sample(df, y_col, frac=None, max_rows=None, random_state=42, min_per_class=50):
@@ -1142,7 +1151,7 @@ selected_woe_cols = selected
 selected_vars     = [c.removesuffix("_WOE") for c in selected_woe_cols]
 print(f"{len(selected_woe_cols)} variables retenues sur {len(order_woe)}")
 
-def summarize_selection(order_woe, selected_woe_cols, corr, threshold=0.85, save_csv=True, csv_prefix="selection"):
+def summarize_selection(order_woe, selected_woe_cols, corr, threshold=0.85, save_csv=False, csv_prefix="selection"):
     all_woe     = list(order_woe)
     kept_woe    = list(selected_woe_cols)
     dropped_woe = [v for v in all_woe if v not in set(kept_woe)]
@@ -1534,4 +1543,204 @@ _ = compute_standardized_importance(
     X_ref=X_train_fit,
     fallback_X=X_train_woe_full,
     topn=15
+)
+
+# ================================
+# Reporting trimestriel complet
+# ================================
+OUT_DIR = Path("artifacts/pipeline")
+(OUT_DIR / "quarterly").mkdir(parents=True, exist_ok=True)
+
+def _safe_monotonic_edges(v, q=10):
+    """Déciles robustes + bornes -inf/+inf, monotones strictes."""
+    v = np.asarray(v, float)
+    qs = np.linspace(0, 1, q + 1)
+    raw = np.quantile(v[np.isfinite(v)], qs)
+    raw = np.unique(raw)
+    if raw.size < 2:
+        # cas dégénéré
+        lo = np.nanmin(v) if np.isfinite(v).any() else 0.0
+        hi = np.nanmax(v) if np.isfinite(v).any() else 1.0
+        raw = np.array([lo, hi], float)
+    # étends aux infinis et force la stricte augmentation
+    edges = np.r_[-np.inf, raw[1:-1], np.inf].astype(float)
+    for i in range(1, len(edges)):
+        if not (edges[i] > edges[i-1]):
+            edges[i] = np.nextafter(edges[i-1], np.inf)
+    return edges
+
+def _risk_classes_from_train(p_train, q=10):
+    """Construit les classes sur TRAIN + stats min/max/mean train par classe."""
+    edges = _safe_monotonic_edges(p_train, q=q)
+    bins_train = pd.cut(p_train, bins=edges, include_lowest=True, duplicates="drop")
+    tab_train = (pd.DataFrame({
+                    "class": bins_train.cat.codes.astype("Int64"),
+                    "p": p_train
+                 })
+                 .groupby("class", dropna=True)
+                 .agg(pd_min_train=("p", "min"),
+                      pd_max_train=("p", "max"),
+                      pd_ttc_train=("p", "mean"),
+                      n_train=("p", "size"))
+                 .reset_index()
+                 .sort_values("class", ascending=False))
+    tab_train["class_label"] = tab_train["class"].apply(lambda c: f"C{int(c)}")
+    return edges, tab_train
+
+def _classify_with_edges(p, edges):
+    return pd.cut(p, bins=edges, include_lowest=True, duplicates="drop").cat.codes.astype("Int64")
+
+def _metrics_for_group(y_true, p_pred, p_train_baseline):
+    has_y = y_true is not None and pd.Series(y_true).dropna().nunique() >= 2
+    auc = gini = brier = ll = ks = ks_thr = np.nan
+    a_cal = b_cal = np.nan
+    if has_y:
+        auc = float(roc_auc_score(y_true, p_pred))
+        gini = 2*auc - 1
+        brier = float(brier_score_loss(y_true, p_pred))
+        ll = float(log_loss(y_true, p_pred))
+        ks, ks_thr = ks_best_threshold(y_true, p_pred)
+        a_cal, b_cal = calibration_slope_intercept(y_true, p_pred)
+    # drift proba vs TRAIN
+    psi_prob = float(psi(p_train_baseline, p_pred))
+    # drift classes vs TRAIN si y dispo
+    psi_cls = float(psi_classes(y_train_full, y_true)) if has_y else np.nan
+    return {
+        "auc": auc, "gini": gini, "brier": brier, "logloss": ll,
+        "ks": ks, "ks_thr": ks_thr, "cal_intercept": a_cal, "cal_slope": b_cal,
+        "psi_prob": psi_prob, "psi_classes": psi_cls
+    }
+
+def _woe_for(df_enrichi, keep_vars_raw):
+    return apply_woe(df_enrichi, woe_maps, keep_vars_raw).reindex(columns=X_train_curr.columns, fill_value=0.0)
+
+def _psi_feat_summary(X_train_ref, X_group):
+    vals = {c: psi_by_feature(X_train_ref[c], X_group[c]) for c in X_train_ref.columns}
+    s = pd.Series(vals, dtype="float64").sort_values(ascending=False)
+    top_feat = s.index[0] if len(s) else None
+    top_val = float(s.iloc[0]) if len(s) else np.nan
+    mean_val = float(s.replace([np.inf, -np.inf], np.nan).dropna().mean()) if len(s) else np.nan
+    return top_feat, top_val, mean_val, s
+
+def _quarter_series_to_str(s):
+    if pd.api.types.is_period_dtype(s.dtype):
+        return s.astype(str)
+    try:
+        return s.astype(str)
+    except Exception:
+        return s
+
+def make_quarterly_reports(
+    train_enrichi, train_quarter,
+    val_enrichi,   val_quarter,
+    model_calibrated,   # cal_curr
+    p_train_baseline,   # p_tr_curr
+    risk_q=10,
+    out_dir=OUT_DIR
+):
+    # 1) Edges + table train (bornes)
+    edges, tab_train_bins = _risk_classes_from_train(pd.Series(p_train_baseline, dtype="float64"), q=risk_q)
+    (out_dir / "quarterly").mkdir(parents=True, exist_ok=True)
+    tab_train_bins.to_csv(out_dir / "quarterly" / "risk_classes_train.csv", index=False)
+
+    # 2) Construit un DF "all" pour scorer par trimestre
+    tr = train_enrichi.copy()
+    tr["_quarter"] = _quarter_series_to_str(train_quarter).values
+    tr["_split"] = "train"
+    va = val_enrichi.copy()
+    va["_quarter"] = _quarter_series_to_str(val_quarter).values
+    va["_split"] = "val"
+    all_enrichi = pd.concat([tr, va], ignore_index=True)
+
+    # 3) Score + WOE aligné
+    X_all = _woe_for(all_enrichi, kept_vars_raw)
+    p_all = model_calibrated.predict_proba(X_all)[:, 1]
+    y_all = all_enrichi[res["target"]] if res["target"] in all_enrichi.columns else None
+
+    # 4) Assemble pour groupby trimestre
+    df_score = pd.DataFrame({
+        "_quarter": all_enrichi["_quarter"],
+        "_split": all_enrichi["_split"],
+        "p": p_all
+    })
+    if y_all is not None:
+        df_score["y"] = y_all.astype(int).to_numpy()
+
+    # 5) métriques par trimestre
+    rows_metrics = []
+    risk_tables = []
+    deciles_tables = []
+
+    for qk, g in df_score.groupby("_quarter", dropna=False):
+        idx = g.index
+        p = g["p"].to_numpy()
+        y = g["y"].to_numpy() if "y" in g.columns else None
+
+        # WOE group pour PSI(feature)
+        Xg = X_all.loc[idx]
+        top_feat, top_val, mean_val, s_feat = _psi_feat_summary(X_train_curr, Xg)
+
+        # métriques globales
+        m = _metrics_for_group(y, p, p_train_baseline)
+        base_rate = float(np.mean(y)) if y is not None else np.nan
+
+        rows_metrics.append({
+            "quarter": str(qk),
+            "n": int(len(g)),
+            "base_rate": base_rate,
+            **m,
+            "psi_feat_top_name": top_feat,
+            "psi_feat_top_value": top_val,
+            "psi_feat_mean": mean_val
+        })
+
+        # déciles (sur le trimestre, juste descriptif)
+        deci = decile_table(y, p, q=10) if y is not None else pd.DataFrame()
+        if not deci.empty:
+            deci = deci.reset_index().rename(columns={"decile": "decile_rank"})
+            deci.insert(0, "quarter", str(qk))
+            deciles_tables.append(deci)
+
+        # table de classes (avec bornes train)
+        cls = _classify_with_edges(pd.Series(p, dtype="float64"), edges)
+        tab = (pd.DataFrame({"class": cls, "y": y if y is not None else np.nan})
+               .groupby("class", dropna=True)
+               .agg(n=("class","size"),
+                    defaults=("y","sum"))
+               .reset_index())
+        if "defaults" in tab.columns:
+            tab["defaults"] = tab["defaults"].fillna(0).astype("Int64")
+            tab["rate"] = (tab["defaults"] / tab["n"].where(tab["n"] > 0, 1)).astype(float)
+        else:
+            tab["defaults"] = pd.NA
+            tab["rate"] = np.nan
+
+        # joint la table train pour les bornes et la PD TTC de classe
+        tab = tab.merge(tab_train_bins[["class","pd_min_train","pd_max_train","pd_ttc_train"]],
+                        on="class", how="right").sort_values("class", ascending=False)
+        tab.insert(0, "quarter", str(qk))
+        risk_tables.append(tab)
+
+    # 6) Sauvegardes
+    met = pd.DataFrame(rows_metrics).sort_values("quarter")
+    met.to_csv(out_dir / "quarterly" / "metrics_by_quarter.csv", index=False)
+    if deciles_tables:
+        pd.concat(deciles_tables, ignore_index=True).to_csv(out_dir / "quarterly" / "deciles_by_quarter.csv", index=False)
+    if risk_tables:
+        pd.concat(risk_tables, ignore_index=True).to_csv(out_dir / "quarterly" / "risk_table_by_quarter.csv", index=False)
+
+    print(f"[OK] Quarterly reports écrits dans {out_dir/'quarterly'}")
+    return met
+
+# ===== Lance le reporting sur train+val =====
+train_enrichi_with_q = res["df_enrichi"].copy()
+val_enrichi_with_q   = df_val_enrichi.copy()
+
+_ = make_quarterly_reports(
+    train_enrichi=train_enrichi_with_q, train_quarter=df_train_quarter,
+    val_enrichi=val_enrichi_with_q,     val_quarter=df_val_quarter,
+    model_calibrated=cal_curr,
+    p_train_baseline=pd.Series(p_tr_curr, dtype="float64"),
+    risk_q=10,
+    out_dir=OUT_DIR
 )
