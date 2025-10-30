@@ -239,15 +239,17 @@ class DataImputer(BaseEstimator, TransformerMixin):
             cltv = pd.Series(cltv, index=df.index).fillna(self.stats_.get('cltv_global', float(np.nan)))
             df['original_cltv'] = cltv.astype('Float32')
 
-        # 6) Small ordinal → mode
+        # 6) Small ordinal → mode (cast explicite en numérique pour éviter FutureWarning de downcast object)
         for col in ['original_loan_term', 'number_of_borrowers']:
             if col in df.columns:
                 df[col + '_missing'] = df[col].isna().astype('int8')
                 mode_val = self.stats_.get(f'{col}_mode', np.nan)
-                df[col] = df[col].fillna(mode_val)
-                # si tout était NaN dans le train, sécurité
-                if df[col].isna().any():
-                    df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
+                ser_num = pd.to_numeric(df[col], errors='coerce')
+                mode_num = pd.to_numeric(pd.Series([mode_val]), errors='coerce').iloc[0]
+                ser_num = ser_num.fillna(mode_num)
+                if ser_num.isna().any():
+                    ser_num = ser_num.fillna(method='ffill').fillna(method='bfill')
+                df[col] = pd.Series(ser_num.round(), index=df.index).astype('Int16')
 
         # 7) Filet de sécurité générique (pour TOUTES les colonnes restantes)
         #    - Numériques: médiane globale apprise sur le train
@@ -292,7 +294,6 @@ class DataImputer(BaseEstimator, TransformerMixin):
                         if pd.isna(try_conv):
                             fill_val = cats[0] if len(cats) > 0 else None
                         else:
-                            # caster via le "type" du dtype (gère Int64Dtype -> numpy.int64)
                             if hasattr(cats_dtype, "type"):
                                 fill_val = cats_dtype.type(try_conv)
                             elif len(cats) > 0:
