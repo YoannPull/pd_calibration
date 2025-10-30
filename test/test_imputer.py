@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from pandas.api.types import CategoricalDtype, is_integer_dtype
-from features.impute2 import DataImputer
+from features.impute import DataImputer
 
 
 def make_train_df() -> pd.DataFrame:
