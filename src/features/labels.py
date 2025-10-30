@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 from typing import Iterable, Tuple
 
-# ---- Column name constants (order must match file spec) ----
 COLS_ORIG = [
     "credit_score","first_payment_date","first_time_homebuyer_flag","maturity_date",
     "msa_md","mi_percent","number_of_units","occupancy_status","original_cltv","original_dti",
@@ -28,7 +27,6 @@ COLS_PERF = [
     "interest_bearing_upb"
 ]
 
-# ---- Memory-friendly dtypes (tweak if needed) ----
 DTYPES_ORIG = {
     "credit_score":"float32","first_payment_date":"string","maturity_date":"string",
     "msa_md":"float32","mi_percent":"float32","number_of_units":"float32","occupancy_status":"string",
@@ -57,25 +55,19 @@ DTYPES_PERF = {
     "current_month_modification_cost":"float64","interest_bearing_upb":"float64"
 }
 
-# ---- Helpers ----
 def _parse_yyyymm(series: pd.Series) -> pd.PeriodIndex:
-    """Parse YYYYMM into monthly Periods quickly & robustly."""
     s = pd.to_datetime(series.astype("string"), format="%Y%m", errors="coerce")
     return s.dt.to_period("M")
 
 def _month_diff(mpr: pd.Series, fpd: pd.Series) -> pd.Series:
-    # Ensure period[M] dtype even if input are strings/datetimes by accident
     if not pd.api.types.is_period_dtype(mpr):
         mpr = pd.PeriodIndex(mpr.astype("string"), freq="M").to_series(index=mpr.index)
     if not pd.api.types.is_period_dtype(fpd):
         fpd = pd.PeriodIndex(fpd.astype("string"), freq="M").to_series(index=fpd.index)
     return (mpr.dt.year - fpd.dt.year) * 12 + (mpr.dt.month - fpd.dt.month)
 
-
 def _normalize_zb_code(z: pd.Series) -> pd.Series:
-    """Zero-balance codes as 2-digit strings ('02','03','09',...)."""
     z = z.astype("string").str.strip()
-    # if numeric-like, left-pad to 2
     mask_num = z.str.fullmatch(r"\d+")
     z.loc[mask_num] = z.loc[mask_num].str.zfill(2)
     return z
@@ -87,24 +79,15 @@ def _make_default_row_flag(
     liquidation_codes: Iterable[str],
     include_ra: bool
 ) -> pd.Series:
-    """
-    Row-level default:
-      - delinquency >= threshold (e.g., 3 -> 90+ DPD) OR RA (if include_ra)
-      - OR zero_balance_code in liquidation_codes
-    """
     s = delinquency_status.astype("string").str.strip().str.upper()
     is_ra = s.eq("RA") if include_ra else pd.Series(False, index=s.index)
-    # numeric delinquency where possible
     s_num = pd.to_numeric(s.where(~is_ra), errors="coerce")
     is_90dpd = s_num.ge(delinquency_threshold)
-
     z = _normalize_zb_code(zero_balance_code)
     is_liq = z.isin(list(liquidation_codes))
-
     default_row = (is_90dpd | is_ra | is_liq).astype("int8")
     return default_row
 
-# ---- Public API ----
 def build_default_labels(
     path_orig: str,
     path_perf: str,
@@ -114,24 +97,6 @@ def build_default_labels(
     include_ra: bool = True,
     require_full_window: bool = False,
 ) -> pd.DataFrame:
-    """
-    Build a loan-level dataset with a 'default_{T}m' column joined onto Origination.
-
-    Args:
-        path_orig: path to origination file (pipe-delimited, no header, 32 cols).
-        path_perf: path to performance file (pipe-delimited, no header, 32 cols).
-        window_months: label horizon in months (typical: 12/24/36).
-        delinquency_threshold: integer delinquency bucket as default (3 => 90+ DPD).
-        liquidation_codes: zero-balance codes considered default events.
-        include_ra: treat 'RA' (REO acquisition) in delinquency status as default.
-        require_full_window:
-            - If True, keep only loans whose performance history covers >= T months after FPD
-              (avoids right-censoring). This requires having rows up to FPD+T for the loan.
-
-    Returns:
-        df_orig_with_label: Origination columns + 'default_{T}m' (int8).
-    """
-    # --- Read files with explicit schema (fast & predictable) ---
     df_orig = pd.read_csv(
         path_orig, sep="|", header=None, names=COLS_ORIG, dtype=DTYPES_ORIG, engine="c"
     )
@@ -139,14 +104,11 @@ def build_default_labels(
         path_perf, sep="|", header=None, names=COLS_PERF, dtype=DTYPES_PERF, engine="c"
     )
 
-    # --- Parse dates to monthly Periods ---
     fpd = _parse_yyyymm(df_orig["first_payment_date"])
     df_orig["first_payment_date"] = fpd
-
     mpr = _parse_yyyymm(df_perf["monthly_reporting_period"])
     df_perf["monthly_reporting_period"] = mpr
 
-    # --- Join FPD onto performance for month arithmetic ---
     df_perf = df_perf.merge(
         df_orig[["loan_sequence_number", "first_payment_date"]],
         on="loan_sequence_number",
@@ -155,18 +117,15 @@ def build_default_labels(
         validate="m:1"
     )
 
-    # --- Compute months since origination (vectorized) ---
     df_perf["months_since_orig"] = _month_diff(
         df_perf["monthly_reporting_period"], df_perf["first_payment_date"]
     ).astype("Int32")
 
-    # --- Restrict to the first T months (inclusive) ---
     within = df_perf["months_since_orig"].le(window_months)
     dfw = df_perf.loc[within, ["loan_sequence_number",
                                "current_loan_delinquency_status",
                                "zero_balance_code"]].copy()
 
-    # --- Row-level default flag (in-window) ---
     dfw["default_row"] = _make_default_row_flag(
         dfw["current_loan_delinquency_status"],
         dfw["zero_balance_code"],
@@ -175,7 +134,6 @@ def build_default_labels(
         include_ra=include_ra
     )
 
-    # --- Aggregate to loan-level default (any default within T months) ---
     loan_level = (
         dfw.groupby("loan_sequence_number", observed=True)["default_row"]
            .max()
@@ -184,9 +142,7 @@ def build_default_labels(
            .reset_index()
     )
 
-    # --- Optional: enforce "full observation window" (censoring control) ---
     if require_full_window:
-        # A loan has full window if it has at least one perf row at exactly T months since FPD
         has_T = (
             df_perf.loc[df_perf["months_since_orig"].eq(window_months), "loan_sequence_number"]
                   .dropna()
@@ -197,13 +153,7 @@ def build_default_labels(
             on="loan_sequence_number", how="inner"
         ).drop(columns="_ok")
 
-    # --- Merge back to origination (loan-level, features-only) ---
     df_out = df_orig.merge(loan_level, on="loan_sequence_number", how="left")
-
-    # No default observed in window => 0
     label_col = f"default_{window_months}m"
     df_out[label_col] = df_out[label_col].fillna(0).astype("Int8")
-    
     return df_out
-    
-

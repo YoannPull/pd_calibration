@@ -20,7 +20,7 @@ from joblib import dump
 # Rendez le package importable depuis ./src
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
-from features.impute2 import DataImputer  # si ta classe est dans features/impute.py, remplace par impute
+from features.impute import DataImputer  # si ta classe est dans features/impute.py, remplace par impute
 
 
 def parse_args():
