@@ -1,7 +1,13 @@
 import numpy as np
 import pandas as pd
-from pandas.api.types import CategoricalDtype, is_datetime64_any_dtype
+from pandas.api.types import (
+    CategoricalDtype,
+    is_datetime64_any_dtype,
+    is_integer_dtype,
+    is_float_dtype,
+)
 from sklearn.base import BaseEstimator, TransformerMixin
+
 
 class DataImputer(BaseEstimator, TransformerMixin):
     def __init__(self, use_cohort=True, missing_flag=False, ltv_bins=(0, 80, 90, 95, 100, np.inf)):
@@ -37,7 +43,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
 
         # Colonnes de référence (exclure la colonne drop future)
         self.columns_fit_ = [c for c in df.columns if c != 'pre_relief_refi_loan_seq_number']
-        self.dtypes_ = df.dtypes.to_dict()  # utile si besoin de debug/trace
+        self.dtypes_ = df.dtypes.to_dict()
 
         # Precompute year if present
         vyear = self._to_year(df['vintage']) if 'vintage' in df.columns else None
@@ -53,13 +59,14 @@ class DataImputer(BaseEstimator, TransformerMixin):
             self.stats_['credit_score_by_year_lp'] = None
 
             if self.use_cohort and 'loan_purpose' in df.columns:
-                med_lp = cs.groupby(df['loan_purpose']).median()
+                med_lp = cs.groupby(df['loan_purpose'], observed=True).median()
                 self.stats_['credit_score_by_lp'] = med_lp.to_dict()
 
                 if vyear is not None:
-                    med_y_lp = pd.Series(cs.values,
-                                         index=pd.MultiIndex.from_arrays([vyear, df['loan_purpose']])
-                                         ).groupby(level=[0, 1]).median()
+                    med_y_lp = pd.Series(
+                        cs.values,
+                        index=pd.MultiIndex.from_arrays([vyear, df['loan_purpose']])
+                    ).groupby(level=[0, 1], observed=True).median()
                     self.stats_['credit_score_by_year_lp'] = {k: float(v) for k, v in med_y_lp.items()}
 
         # ---- MI% medians by LTV bins (and year)
@@ -68,11 +75,11 @@ class DataImputer(BaseEstimator, TransformerMixin):
             ltv = pd.to_numeric(df['original_ltv'], errors='coerce').clip(lower=0)
             ltv_bins = pd.cut(ltv, self.ltv_bins, include_lowest=True, right=True)
 
-            self.stats_['mi_by_bin'] = mi.groupby(ltv_bins).median().to_dict()
+            self.stats_['mi_by_bin'] = mi.groupby(ltv_bins, observed=True).median().to_dict()
             self.stats_['mi_by_year_bin'] = None
             if self.use_cohort and vyear is not None:
                 idx = pd.MultiIndex.from_arrays([vyear, ltv_bins])
-                med = pd.Series(mi.values, index=idx).groupby(level=[0, 1]).median()
+                med = pd.Series(mi.values, index=idx).groupby(level=[0, 1], observed=True).median()
                 self.stats_['mi_by_year_bin'] = {k: float(v) for k, v in med.items()}
 
         # ---- DTI medians
@@ -83,11 +90,12 @@ class DataImputer(BaseEstimator, TransformerMixin):
             self.stats_['dti_by_year_lp'] = None
 
             if self.use_cohort and 'loan_purpose' in df.columns:
-                self.stats_['dti_by_lp'] = dti.groupby(df['loan_purpose']).median().to_dict()
+                self.stats_['dti_by_lp'] = dti.groupby(df['loan_purpose'], observed=True).median().to_dict()
                 if vyear is not None:
-                    med = pd.Series(dti.values,
-                                    index=pd.MultiIndex.from_arrays([vyear, df['loan_purpose']])
-                                    ).groupby(level=[0, 1]).median()
+                    med = pd.Series(
+                        dti.values,
+                        index=pd.MultiIndex.from_arrays([vyear, df['loan_purpose']])
+                    ).groupby(level=[0, 1], observed=True).median()
                     self.stats_['dti_by_year_lp'] = {k: float(v) for k, v in med.items()}
 
         # ---- CLTV medians by year (fallback global)
@@ -104,8 +112,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
             if col in df.columns:
                 self.stats_[f'{col}_mode'] = self._mode(df[col])
 
-        # ---- NEW: Fallbacks génériques appris sur le train
-        # Numériques -> médiane globale ; Non-numériques -> mode global
+        # ---- Fallbacks génériques appris sur le train
         num_cols = df.select_dtypes(include='number').columns.tolist()
         self.stats_['global_num_median'] = {
             c: float(pd.to_numeric(df[c], errors='coerce').median()) for c in num_cols
@@ -242,7 +249,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                 if df[col].isna().any():
                     df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
 
-        # 7) NEW: Filet de sécurité générique (pour TOUTES les colonnes restantes)
+        # 7) Filet de sécurité générique (pour TOUTES les colonnes restantes)
         #    - Numériques: médiane globale apprise sur le train
         #    - Non-numériques: mode global; si pas dispo -> 'Unknown' (sauf datetime qu'on laisse si pas de mode)
         num_meds = self.stats_.get('global_num_median', {})
@@ -252,21 +259,62 @@ class DataImputer(BaseEstimator, TransformerMixin):
                 if pd.notna(med):
                     df[c] = s.fillna(med)
                 else:
-                    df[c] = s  # pas de médiane dispo (colonne 100% NaN au train)
+                    df[c] = s  # colonne peut-être 100% NaN au train
 
         non_modes = self.stats_.get('global_nonnum_mode', {})
         for c, mode_val in non_modes.items():
-            if c in df.columns:
-                if is_datetime64_any_dtype(df[c]):
-                    # Datetime: on remplit avec le mode si dispo, sinon on laisse NaT
-                    if pd.notna(mode_val):
-                        df[c] = pd.to_datetime(df[c], errors='coerce').fillna(mode_val)
-                elif isinstance(df[c].dtype, CategoricalDtype):
-                    fill_val = mode_val if pd.notna(mode_val) else 'Unknown'
-                    df[c] = df[c].cat.add_categories([fill_val]).fillna(fill_val)
+            if c not in df.columns:
+                continue
+
+            # Datetime
+            if is_datetime64_any_dtype(df[c]):
+                ser_dt = pd.to_datetime(df[c], errors='coerce')
+                if pd.notna(mode_val):
+                    df[c] = ser_dt.fillna(mode_val)
                 else:
+                    df[c] = ser_dt
+                continue
+
+            # Catégories
+            if isinstance(df[c].dtype, CategoricalDtype):
+                cat = df[c]
+                cats = cat.cat.categories
+                cats_dtype = cats.dtype
+
+                if is_integer_dtype(cats_dtype) or is_float_dtype(cats_dtype):
+                    # catégories numériques (y compris extensions Int64/Float64)
+                    if pd.isna(mode_val):
+                        if len(cats) == 0:
+                            continue
+                        fill_val = cats[0]
+                    else:
+                        try_conv = pd.to_numeric(pd.Series([mode_val]), errors='coerce').iloc[0]
+                        if pd.isna(try_conv):
+                            fill_val = cats[0] if len(cats) > 0 else None
+                        else:
+                            # caster via le "type" du dtype (gère Int64Dtype -> numpy.int64)
+                            if hasattr(cats_dtype, "type"):
+                                fill_val = cats_dtype.type(try_conv)
+                            elif len(cats) > 0:
+                                fill_val = type(cats[0])(try_conv)
+                            else:
+                                fill_val = try_conv
+                    if fill_val is None:
+                        continue
+                    if fill_val not in cats:
+                        cat = cat.cat.add_categories([fill_val])
+                    df[c] = cat.fillna(fill_val)
+                else:
+                    # catégories textuelles
                     fill_val = mode_val if pd.notna(mode_val) else 'Unknown'
-                    df[c] = df[c].fillna(fill_val)
+                    if fill_val not in cats:
+                        cat = cat.cat.add_categories([fill_val])
+                    df[c] = cat.fillna(fill_val)
+                continue
+
+            # Autres non-numériques (object/string)
+            fill_val = mode_val if pd.notna(mode_val) else 'Unknown'
+            df[c] = df[c].fillna(fill_val)
 
         # Added missing flag
         if self.missing_flag:

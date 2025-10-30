@@ -20,24 +20,37 @@ from joblib import dump
 # Rendez le package importable depuis ./src
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
-from features.impute2 import DataImputer
+from features.impute2 import DataImputer  # si ta classe est dans features/impute.py, remplace par impute
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Impute & save datasets + persist imputer")
-    p.add_argument("--train-csv", required=True, help="Chemin vers le CSV d'entraînement")
-    p.add_argument("--validation-csv", required=True, help="Chemin vers le CSV de validation")
+    p.add_argument("--train-csv", required=True, help="Chemin vers le fichier d'entraînement (CSV ou Parquet)")
+    p.add_argument("--validation-csv", required=True, help="Chemin vers le fichier de validation (CSV ou Parquet)")
     p.add_argument("--target", default=None, help="Nom de la colonne cible à conserver (optionnel)")
     p.add_argument("--outdir", default="data/processed/merged/imputed", help="Dossier de sortie")
     p.add_argument("--artifacts", default="artifacts", help="Dossier où sauvegarder l'imputer")
-    p.add_argument("--format", choices=["parquet", "csv"], default="parquet",
-                   help="Format de sauvegarde des jeux imputés")
+    p.add_argument(
+        "--format", choices=["parquet", "csv"], default="parquet",
+        help="Format de sauvegarde des jeux imputés"
+    )
     p.add_argument("--use-cohort", action="store_true", help="Imputation par cohortes")
     p.add_argument("--missing-flag", action="store_true", help="Ajouter les indicateurs was_missing_")
+    p.add_argument("--fail-on-nan", action="store_true", help="Échouer si des NaN subsistent après imputation")
     return p.parse_args()
 
 
-def save_parquet(df_train_imp, df_val_imp, outdir: Path):
+def load_any(path: str) -> pd.DataFrame:
+    """Charge un DataFrame depuis un CSV ou un Parquet en se basant sur l'extension."""
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext in (".parquet", ".pq"):
+        return pd.read_parquet(p)
+    # Fallback CSV
+    return pd.read_csv(p)
+
+
+def save_parquet(df_train_imp: pd.DataFrame, df_val_imp: pd.DataFrame, outdir: Path):
     try:
         outdir.mkdir(parents=True, exist_ok=True)
         (outdir / "train.parquet").unlink(missing_ok=True)
@@ -52,7 +65,7 @@ def save_parquet(df_train_imp, df_val_imp, outdir: Path):
         )
 
 
-def save_csv_with_dtypes(df_train_imp, df_val_imp, outdir: Path):
+def save_csv_with_dtypes(df_train_imp: pd.DataFrame, df_val_imp: pd.DataFrame, outdir: Path):
     from pandas.api.types import CategoricalDtype  # import local pour cohérence avec pickles
 
     outdir.mkdir(parents=True, exist_ok=True)
@@ -88,9 +101,9 @@ def main():
     artifacts = Path(args.artifacts)
     artifacts.mkdir(parents=True, exist_ok=True)
 
-    # Chargement
-    df_train = pd.read_parquet(args.train_csv)
-    df_val = pd.read_parquet(args.validation_csv)
+    # Chargement (CSV ou Parquet auto)
+    df_train = load_any(args.train_csv)
+    df_val = load_any(args.validation_csv)
 
     # Séparer la cible si demandée (et la ré-attacher ensuite inchangée)
     y_train = y_val = None
@@ -113,6 +126,16 @@ def main():
     if y_val is not None:
         df_val_imp[args.target] = y_val.values
 
+    # Optionnel : garde-fou qualité (échoue si des NaN restent)
+    if args.fail_on_nan:
+        bad_train = df_train_imp.columns[df_train_imp.isna().any()].tolist()
+        bad_val = df_val_imp.columns[df_val_imp.isna().any()].tolist()
+        if bad_train or bad_val:
+            raise SystemExit(
+                f"NaN résiduels après imputation.\n"
+                f"Train: {bad_train}\nValidation: {bad_val}"
+            )
+
     # Sauvegarde des datasets imputés
     if args.format == "parquet":
         save_parquet(df_train_imp, df_val_imp, outdir)
@@ -128,6 +151,8 @@ def main():
         "features": list(df_train_imp.drop(columns=[args.target]).columns) if args.target else list(df_train_imp.columns),
         "output_dir": str(outdir.resolve()),
         "format": args.format,
+        "train_path": str(Path(args.train_csv).resolve()),
+        "validation_path": str(Path(args.validation_csv).resolve()),
     }
     (artifacts / "imputer_meta.json").write_text(json.dumps(meta, indent=2, default=str))
     print(f"✔ Imputer sauvegardé dans {artifacts / 'imputer.joblib'}")
