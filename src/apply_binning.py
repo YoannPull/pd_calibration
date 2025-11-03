@@ -7,7 +7,7 @@ import pandas as pd
 
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
-from features.binning_maxgini import load_bins_json, transform_with_learned_bins
+from features.binning import load_bins_json, transform_with_learned_bins
 
 def parse_args():
     p = argparse.ArgumentParser(description="Apply learned max|Gini| bins (bins.json) to a new dataset")
