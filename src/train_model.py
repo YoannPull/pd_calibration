@@ -1,364 +1,397 @@
+# src/train_model.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Train + select best model with least score drift (PSI / JS) under an AUC constraint.
-- Loads TRAIN/VALIDATION (binned) datasets
-- Builds candidates (LogReg, RandomForest, HistGBDT)
-- Gets OOF predictions on train for drift baseline
-- Evaluates metrics on validation (AUC, Brier, LogLoss)
-- Computes score drift between OOF(train) and VAL predictions (PSI + JS)
-- Selects model with minimal drift (optionally subject to min AUC)
-- Optionally calibrates the best model (sigmoid|isotonic) via CV on TRAIN
-- Saves best model + metrics + drift reports
-"""
-
-import argparse
-import json
+from __future__ import annotations
+import argparse, json
 from pathlib import Path
-import os
-import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 from joblib import dump
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, roc_curve
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
 
-
-# -----------------------------------------
-# Utils: loading / saving
-# -----------------------------------------
+# -----------------------------
+# I/O helpers
+# -----------------------------
 def load_any(path: str) -> pd.DataFrame:
     p = Path(path)
-    if p.suffix.lower() in (".parquet", ".pq"):
-        return pd.read_parquet(p)
+    if p.suffix.lower() in (".parquet",".pq"): return pd.read_parquet(p)
     return pd.read_csv(p)
-
 
 def save_json(obj, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, default=float))
+    path.write_text(json.dumps(obj, indent=2, default=float), encoding="utf-8")
 
+# -----------------------------
+# Metrics & utils
+# -----------------------------
+def ks_best_threshold(y, p):
+    y = pd.Series(y).astype(int).to_numpy(); p = pd.Series(p).astype(float).to_numpy()
+    if np.unique(y).size < 2: return np.nan, np.nan
+    fpr, tpr, thr = roc_curve(y, p); ks_arr = tpr - fpr; i = int(np.nanargmax(ks_arr))
+    return float(ks_arr[i]), float(thr[i])
 
-# -----------------------------------------
-# Drift metrics (PSI / JS) on score distributions
-# -----------------------------------------
-def make_quantile_bins(base_scores: np.ndarray, n_bins: int = 10) -> np.ndarray:
-    """Quantile cutpoints based on base distribution (e.g. OOF train)."""
-    qs = np.linspace(0, 1, n_bins + 1) * 100
-    edges = np.unique(np.percentile(base_scores, qs))
-    # ensure at least 2 edges
-    if len(edges) < 2:
-        edges = np.array([0.0, 1.0])
-    # stretch bounds to cover [0,1] safely
-    edges[0] = min(edges[0], 0.0)
-    edges[-1] = max(edges[-1], 1.0)
-    return edges
+def decile_table(y, p, q=10):
+    df = pd.DataFrame({"y": pd.Series(y).astype(int), "p": pd.Series(p).astype(float)})
+    try: df["decile"] = pd.qcut(df["p"], q=q, labels=False, duplicates="drop")
+    except Exception:
+        n = len(df); ranks = df["p"].rank(method="first")/max(n,1)
+        df["decile"] = pd.cut(ranks, bins=np.linspace(0,1,q+1), labels=False, include_lowest=True)
+    tab = (df.groupby("decile", dropna=True)
+             .agg(events=("y","sum"), count=("y","size"), avg_p=("p","mean"))
+             .sort_index(ascending=False))
+    if tab.empty: return tab
+    tab["rate"] = tab["events"]/tab["count"].where(tab["count"]>0, 1)
+    tab["cum_events"] = tab["events"].cumsum(); tab["cum_count"]=tab["count"].cumsum()
+    tot_e=float(tab["events"].sum()); tot_c=float(tab["count"].sum())
+    tab["capture"]=tab["cum_events"]/(tot_e if tot_e>0 else 1.0)
+    cum_good = tab["count"]-tab["events"]; denom_good = float(cum_good.sum()) if float(cum_good.sum())>0 else 1.0
+    tab["TPR"]=tab["cum_events"]/(tot_e if tot_e>0 else 1.0)
+    tab["FPR"]=cum_good.cumsum()/denom_good; tab["KS"]=tab["TPR"]-tab["FPR"]
+    return tab
 
+def psi(a, b, bins=10, eps=1e-9):
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if a.size==0 or b.size==0: return np.nan
+    q = np.quantile(a, np.linspace(0,1,bins+1)); q = np.unique(q)
+    if q.size<2: return 0.0
+    q[0],q[-1] = -np.inf, np.inf
+    for i in range(1,len(q)):
+        if not (q[i] > q[i-1]): q[i] = np.nextafter(q[i-1], np.inf)
+    ca,_ = np.histogram(a, bins=q); cb,_ = np.histogram(b, bins=q)
+    pa, pb = ca/max(ca.sum(),1), cb/max(cb.sum(),1)
+    return float(np.sum((pa-pb)*np.log((pa+eps)/(pb+eps))))
 
-def hist_proportions(x: np.ndarray, edges: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    counts, _ = np.histogram(x, bins=edges)
-    p = counts.astype(float)
-    p = (p + eps) / (p.sum() + eps * len(p))
-    return p
+def psi_by_feature(a, b, bins=10, eps=1e-9):
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if a.size==0 or b.size==0: return np.nan
+    q = np.quantile(a, np.linspace(0,1,bins+1)); q = np.unique(q); q[0],q[-1] = -np.inf, np.inf
+    for i in range(1,len(q)):
+        if not (q[i] > q[i-1]): q[i] = np.nextafter(q[i-1], np.inf)
+    ca,_ = np.histogram(a, bins=q); cb,_ = np.histogram(b, bins=q)
+    pa, pb = ca/max(ca.sum(),1), cb/max(cb.sum(),1)
+    return float(np.sum((pa-pb)*np.log((pa+eps)/(pb+eps))))
 
+def prior_shift_adjust(p, base_train, base_val, eps=1e-9):
+    p = np.clip(np.asarray(p, float), eps, 1-eps); logit = np.log(p/(1-p))
+    delta = np.log((base_val+eps)/(1-base_val+eps)) - np.log((base_train+eps)/(1-base_train+eps))
+    z = logit + delta; return 1/(1+np.exp(-z))
 
-def psi(p: np.ndarray, q: np.ndarray) -> float:
-    """Population Stability Index between distributions p and q."""
-    return float(np.sum((p - q) * np.log(p / q)))
+# -----------------------------
+# BIN helpers (préfixe/suffixe)
+# -----------------------------
+def find_bin_columns(df: pd.DataFrame, tag: str) -> List[str]:
+    cols = []
+    for c in df.columns:
+        if c.startswith(tag) or c.endswith(tag): cols.append(c)
+    return sorted(cols)
 
+def raw_name_from_bin(col: str, tag: str) -> str:
+    if col.startswith(tag): return col[len(tag):]
+    if col.endswith(tag):  return col[:-len(tag)]
+    return col
 
-def js_divergence(p: np.ndarray, q: np.ndarray) -> float:
-    """Jensen-Shannon divergence between distributions p and q."""
-    m = 0.5 * (p + q)
-    kl_pm = np.sum(p * np.log(p / m))
-    kl_qm = np.sum(q * np.log(q / m))
-    return float(0.5 * (kl_pm + kl_qm))
+def resolve_bin_col(df: pd.DataFrame, raw: str, tag: str) -> Optional[str]:
+    cand_prefix = f"{tag}{raw}"; cand_suffix = f"{raw}{tag}"
+    if cand_prefix in df.columns: return cand_prefix
+    if cand_suffix in df.columns: return cand_suffix
+    return None
 
+# -----------------------------
+# WOE from BIN
+# -----------------------------
+def build_woe_maps_from_bins(df_enrichi: pd.DataFrame, target: str,
+                             raw_to_bin: Dict[str, str], smooth: float = 0.5) -> Dict[str, Dict]:
+    maps = {}; y = df_enrichi[target].astype(int)
+    B_all = float(y.sum()); G_all = float(len(y)-y.sum()); global_woe = float(np.log((B_all+smooth)/(G_all+smooth)))
+    for raw, bcol in raw_to_bin.items():
+        tab = df_enrichi.groupby(bcol, dropna=True)[target].agg(['sum','count'])
+        if tab.empty:
+            maps[raw] = {"map": {}, "default": global_woe}; continue
+        tab['good'] = tab['count']-tab['sum']
+        B = float(tab['sum'].sum()); G = float(tab['good'].sum()); K = max(int(len(tab)),1)
+        denom_bad  = (B + smooth*K) if (B + smooth*K) > 0 else 1.0
+        denom_good = (G + smooth*K) if (G + smooth*K) > 0 else 1.0
+        w = np.log(((tab['sum']+smooth)/denom_bad)/((tab['good']+smooth)/denom_good)).replace([np.inf,-np.inf], np.nan)
+        maps[raw] = {"map": {int(k) if pd.notna(k) else -9999: float(v) for k,v in w.items()}, "default": global_woe}
+    return maps
 
-def score_drift(oof_scores: np.ndarray, val_scores: np.ndarray, n_bins: int = 10) -> Dict[str, float]:
-    edges = make_quantile_bins(oof_scores, n_bins=n_bins)
-    p = hist_proportions(oof_scores, edges)
-    q = hist_proportions(val_scores, edges)
-    return {
-        "psi": psi(p, q),
-        "js": js_divergence(p, q),
-        "bins": len(p),
+def apply_woe_with_maps(df_any: pd.DataFrame, maps: Dict[str, Dict],
+                        kept_vars_raw: List[str], bin_tag: str) -> pd.DataFrame:
+    cols = []
+    for raw in kept_vars_raw:
+        bcol = resolve_bin_col(df_any, raw, bin_tag)
+        if bcol is None or raw not in maps: continue
+        ser = df_any[bcol].astype("Int64"); wmap = maps[raw]["map"]; wdef=float(maps[raw]["default"])
+        x = ser.map(wmap).astype(float).fillna(wdef); cols.append((f"{raw}_WOE", x))
+    if not cols: return pd.DataFrame(index=df_any.index)
+    return pd.concat([s for _,s in cols], axis=1)
+
+# -----------------------------
+# Feature selection
+# -----------------------------
+def select_woe_columns(X_woe: pd.DataFrame, order_hint: List[str], corr_thr: float = 0.85) -> List[str]:
+    cols = [c for c in order_hint if c in X_woe.columns] or list(X_woe.columns)
+    corr = X_woe[cols].corr().abs().fillna(0.0); selected=[]
+    for c in cols:
+        if not selected: selected.append(c); continue
+        mc = corr.loc[c, corr.columns.intersection(selected)]
+        max_corr = float(mc.max()) if len(mc) else 0.0
+        if not np.isfinite(max_corr) or np.isnan(max_corr): max_corr = 0.0
+        if max_corr < corr_thr: selected.append(c)
+    return selected
+
+# -----------------------------
+# Entraînement principal + ablation gloutonne
+# -----------------------------
+def train_from_binned(
+    df_tr: pd.DataFrame, df_va: pd.DataFrame, target: str,
+    use_existing_woe_prefixes: Tuple[str, ...] = ("woe__",),
+    bin_suffix: str = "__BIN",
+    corr_threshold: float = 0.85,
+    cv_folds: int = 5,
+    isotonic: bool = True,
+    # options PSI/ablation
+    drop_proxy_cutoff: Optional[float] = None,           # PSI(feature) cutoff
+    conditional_proxies: Optional[List[str]] = None,     # raw var names
+    do_prior_shift_adjust: bool = True,
+    ablation_max_steps: int = 10,
+    ablation_max_auc_loss: float = 0.02
+):
+    # 1) WOE existants ?
+    y_tr = df_tr[target].astype(int).values
+    y_va = df_va[target].astype(int).values if target in df_va.columns else None
+
+    woe_cols = [c for c in df_tr.columns if any(c.startswith(p) for p in use_existing_woe_prefixes if p)]
+    woe_cols += [c for c in df_tr.columns if c.endswith("_WOE")]
+    woe_cols = sorted(set(woe_cols) - {target})
+
+    computed_woe = False; woe_maps=None
+
+    if not woe_cols:
+        # 2) Sinon BIN -> WOE
+        bin_cols = find_bin_columns(df_tr, bin_suffix)
+        if not bin_cols:
+            raise SystemExit("Aucune colonne WOE ni BIN détectée. Données attendues (__BIN ou préfixe) ou WOE.")
+        raw_to_bin = {raw_name_from_bin(c, bin_suffix): c for c in bin_cols}
+        keep_raw = sorted(raw_to_bin.keys())
+        woe_maps = build_woe_maps_from_bins(df_tr, target, raw_to_bin, smooth=0.5)
+        Xtr_woe_full = apply_woe_with_maps(df_tr, woe_maps, keep_raw, bin_tag=bin_suffix)
+        Xva_woe_full = apply_woe_with_maps(df_va, woe_maps, keep_raw, bin_tag=bin_suffix) if y_va is not None else None
+        if Xva_woe_full is not None:
+            Xva_woe_full = Xva_woe_full.reindex(columns=Xtr_woe_full.columns, fill_value=0.0)
+        computed_woe = True
+    else:
+        Xtr_woe_full = df_tr[woe_cols].astype(float).copy()
+        Xva_woe_full = df_va.reindex(columns=woe_cols).astype(float).fillna(0.0) if y_va is not None else None
+
+    # 3) Drop proxies instables via PSI(feature)
+    if drop_proxy_cutoff is not None and conditional_proxies and Xva_woe_full is not None:
+        to_drop = []
+        for raw in conditional_proxies:
+            c = f"{raw}_WOE"
+            if c in Xtr_woe_full.columns and c in Xva_woe_full.columns:
+                v = psi_by_feature(Xtr_woe_full[c], Xva_woe_full[c])
+                if v is not None and np.isfinite(v) and v > float(drop_proxy_cutoff):
+                    to_drop.append(c)
+        if to_drop:
+            Xtr_woe_full = Xtr_woe_full.drop(columns=to_drop, errors="ignore")
+            Xva_woe_full = Xva_woe_full.drop(columns=to_drop, errors="ignore")
+
+    # 4) Sélection anti-colinéarité (ordre = variance décroissante)
+    order_hint = list(Xtr_woe_full.var().sort_values(ascending=False).index)
+    kept_woe = select_woe_columns(Xtr_woe_full, order_hint, corr_thr=corr_threshold)
+    Xtr = Xtr_woe_full[kept_woe].copy()
+    Xva = Xva_woe_full[kept_woe].copy() if Xva_woe_full is not None else None
+
+    # 5) GridSearch + calibration
+    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    grid = {"C":[0.1,0.3,1.0,3.0,10.0], "penalty":["l2"], "solver":["lbfgs"], "class_weight":[None], "max_iter":[2000]}
+    base_lr = LogisticRegression()
+    gs = GridSearchCV(base_lr, grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True).fit(Xtr, y_tr)
+    best_lr = gs.best_estimator_
+    model = CalibratedClassifierCV(best_lr, method=("isotonic" if isotonic else "sigmoid"), cv=cv).fit(Xtr, y_tr)
+
+    p_tr = model.predict_proba(Xtr)[:,1]
+    metrics = {
+        "train_auc": float(roc_auc_score(y_tr, p_tr)),
+        "train_brier": float(brier_score_loss(y_tr, p_tr)),
+        "train_logloss": float(log_loss(y_tr, p_tr)),
+        "n_kept_features": int(len(kept_woe)),
     }
 
+    dec = pd.DataFrame()
 
-# -----------------------------------------
-# Candidates
-# -----------------------------------------
-def build_candidates(
-    standardize: bool = True,
-) -> Dict[str, Pipeline]:
-    """
-    Retourne un dict de modèles candidats (pipelines sklearn).
-    - LogReg L2 + StandardScaler (optionnel)
-    - RandomForest
-    - HistGradientBoosting
-    """
-    models = {}
+    if Xva is not None and y_va is not None:
+        p_va = model.predict_proba(Xva)[:,1]
+        ks, thr = ks_best_threshold(y_va, p_va)
+        metrics.update({
+            "val_auc": float(roc_auc_score(y_va, p_va)),
+            "val_brier": float(brier_score_loss(y_va, p_va)),
+            "val_logloss": float(log_loss(y_va, p_va)),
+            "val_ks": float(ks),
+            "val_ks_threshold": float(thr),
+            "psi_train_to_val_proba": float(psi(p_tr, p_va, bins=10))
+        })
+        dec = decile_table(y_va, p_va, q=10)
 
-    # Logistic Regression (class_weight balanced)
-    steps_lr = []
-    if standardize:
-        steps_lr.append(("scaler", StandardScaler(with_mean=True, with_std=True)))
-    steps_lr.append(("clf",
-        LogisticRegression(
-            C=1.0,
-            penalty="l2",
-            solver="lbfgs",
-            max_iter=1000,
-            class_weight="balanced",
-            n_jobs=None
-        )
-    ))
-    models["logreg_l2"] = Pipeline(steps_lr)
+    # 6) Ablation gloutonne (PSI(probas) ↓, perte AUC ≤ seuil)
+    X_train_curr, X_val_curr = Xtr.copy(), (Xva.copy() if Xva is not None else None)
+    model_curr, p_tr_curr, p_va_curr = model, p_tr, (model.predict_proba(Xva)[:,1] if Xva is not None else None)
+    best_auc = float(roc_auc_score(y_va, p_va_curr)) if p_va_curr is not None else np.nan
+    best_psi = float(psi(p_tr_curr, p_va_curr)) if p_va_curr is not None else np.nan
+    keep_cols = list(X_train_curr.columns)
 
-    # Random Forest
-    models["rf"] = RandomForestClassifier(
-        n_estimators=400,
-        max_depth=None,
-        min_samples_leaf=2,
-        n_jobs=-1,
-        class_weight="balanced_subsample",
-        random_state=42
-    )
+    if ablation_max_steps>0 and p_va_curr is not None:
+        for step in range(min(ablation_max_steps, len(keep_cols))):
+            # feature au PSI(feature) max
+            psi_feat_now = pd.Series({c: psi_by_feature(X_train_curr[c], X_val_curr[c]) for c in keep_cols}).sort_values(ascending=False)
+            cand = psi_feat_now.index[0]
+            Xtr_try = X_train_curr.drop(columns=[cand]); Xva_try = X_val_curr.drop(columns=[cand], errors="ignore")
+            gs2 = GridSearchCV(base_lr, grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True).fit(Xtr_try, y_tr)
+            lr2 = gs2.best_estimator_; cal2 = CalibratedClassifierCV(lr2, method=("isotonic" if isotonic else "sigmoid"), cv=cv).fit(Xtr_try, y_tr)
+            p_tr2 = cal2.predict_proba(Xtr_try)[:,1]; p_va2 = cal2.predict_proba(Xva_try)[:,1]
+            auc2 = float(roc_auc_score(y_va, p_va2)); psi2 = float(psi(p_tr2, p_va2))
+            loss_auc = best_auc - auc2; gain_psi = best_psi - psi2
+            if (psi2 + 1e-6) < best_psi and (np.isnan(loss_auc) or loss_auc <= ablation_max_auc_loss):
+                # on garde la suppression
+                X_train_curr, X_val_curr = Xtr_try, Xva_try
+                model_curr, p_tr_curr, p_va_curr = cal2, p_tr2, p_va2
+                best_auc, best_psi = auc2, psi2
+                keep_cols.remove(cand)
+            else:
+                break
 
-    # HistGradientBoosting (robuste et rapide)
-    models["hgbdt"] = HistGradientBoostingClassifier(
-        max_depth=None,
-        max_iter=300,
-        learning_rate=0.05,
-        l2_regularization=0.0,
-        random_state=42
-    )
+    # 7) Prior-shift adjust + metrics adj
+    if p_va_curr is not None and do_prior_shift_adjust:
+        base_train = float(np.mean(y_tr)); base_val = float(np.mean(y_va))
+        p_va_adj = prior_shift_adjust(p_va_curr, base_train, base_val)
+        ks_adj, thr_adj = ks_best_threshold(y_va, p_va_adj)
+        metrics.update({
+            "val_auc_adj": float(roc_auc_score(y_va, p_va_adj)),
+            "val_brier_adj": float(brier_score_loss(y_va, p_va_adj)),
+            "val_logloss_adj": float(log_loss(y_va, p_va_adj)),
+            "val_ks_adj": float(ks_adj),
+            "val_ks_threshold_adj": float(thr_adj),
+            "psi_train_to_val_proba_adj": float(psi(p_tr_curr, p_va_adj, bins=10))
+        })
+        dec = decile_table(y_va, p_va_adj, q=10) if dec.empty else dec
 
-    return models
+    # 8) Importance standardisée
+    imp_df = None
+    lr_final = getattr(model_curr, "base_estimator", None) or getattr(model_curr, "estimator", None) or best_lr
+    if hasattr(lr_final, "coef_"):
+        beta = np.asarray(lr_final.coef_).ravel()
+        feat_cols = list(X_train_curr.columns)
+        if len(beta) != len(feat_cols):
+            m = min(len(beta), len(feat_cols)); beta = beta[:m]; feat_cols = feat_cols[:m]
+        stds = X_train_curr[feat_cols].std(ddof=0).replace(0, np.nan)
+        std_coef = pd.Series(beta, index=feat_cols) * stds
+        imp_df = (pd.DataFrame({"feature": feat_cols, "coef": beta, "std": stds.values, "std_coef": std_coef.values})
+                  .dropna(subset=["std_coef"]).sort_values("std_coef", key=lambda s: s.abs(), ascending=False))
 
-
-# -----------------------------------------
-# OOF predictions
-# -----------------------------------------
-def get_oof_predictions(
-    model,
-    X: pd.DataFrame,
-    y: np.ndarray,
-    n_splits: int = 5,
-    random_state: int = 42,
-) -> np.ndarray:
-    """Renvoie les prédictions OOF (proba classe 1) pour X."""
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    oof = np.full(shape=(len(X),), fill_value=np.nan, dtype=float)
-    for train_idx, valid_idx in skf.split(X, y):
-        X_tr, X_va = X.iloc[train_idx], X.iloc[valid_idx]
-        y_tr = y[train_idx]
-        mdl = model
-        # re-clone léger (sklearn clone pas obligatoire si on reconstruit build_candidates à chaque boucle externe)
-        mdl.fit(X_tr, y_tr)
-        proba = mdl.predict_proba(X_va)[:, 1]
-        oof[valid_idx] = proba
-    # sécurité
-    if np.isnan(oof).any():
-        raise RuntimeError("NaN in OOF predictions.")
-    return oof
-
-
-# -----------------------------------------
-# Metrics
-# -----------------------------------------
-def compute_metrics(y_true: np.ndarray, proba: np.ndarray) -> Dict[str, float]:
-    return {
-        "auc": float(roc_auc_score(y_true, proba)),
-        "brier": float(brier_score_loss(y_true, proba)),
-        "logloss": float(log_loss(y_true, np.clip(proba, 1e-15, 1 - 1e-15))),
-        "mean": float(np.mean(proba)),
-        "std": float(np.std(proba)),
+    out = {
+        "model": model_curr,            # calibré après ablation (si faite)
+        "best_lr": lr_final,
+        "kept_woe": list(X_train_curr.columns),
+        "computed_woe": bool(computed_woe),
+        "woe_maps": woe_maps,           # None si WOE déjà fournis
+        "metrics": metrics,
+        "deciles_val": dec,
+        "importance": imp_df
     }
+    return out
 
-
-# -----------------------------------------
-# Feature selection utility (default: WOE features if present)
-# -----------------------------------------
-def default_feature_list(df: pd.DataFrame, target: str) -> List[str]:
-    cols = [c for c in df.columns if c != target]
-    woe = [c for c in cols if c.startswith("woe__")]
-    if woe:
-        return woe
-    # sinon, toutes numériques
-    return [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-
-
-# -----------------------------------------
-# Training routine
-# -----------------------------------------
-def train_and_select(
-    X_train: pd.DataFrame, y_train: np.ndarray,
-    X_val: pd.DataFrame, y_val: np.ndarray,
-    min_auc: float = 0.60,
-    drift_bins: int = 10,
-    calibrate: str = "none",  # "none" | "sigmoid" | "isotonic"
-) -> Tuple[str, object, Dict[str, dict]]:
-    """
-    Retourne: (best_name, best_model_fitted_on_train, reports_per_model)
-    """
-    reports = {}
-    candidates = build_candidates(standardize=True)
-
-    best_name = None
-    best_model = None
-    best_key = None  # (drift_psi, -auc, logloss)
-
-    for name, model in candidates.items():
-        # OOF for drift baseline
-        oof = get_oof_predictions(model, X_train, y_train, n_splits=5, random_state=42)
-
-        # Fit on full train, evaluate on validation
-        model.fit(X_train, y_train)
-        val_proba = model.predict_proba(X_val)[:, 1]
-
-        metr_val = compute_metrics(y_val, val_proba)
-        drift = score_drift(oof, val_proba, n_bins=drift_bins)
-
-        rep = {
-            "metrics_val": metr_val,
-            "drift": drift,
-            "oof_mean": float(oof.mean()),
-            "oof_std": float(oof.std()),
-            "model_name": name,
-        }
-        reports[name] = rep
-
-        # skip if AUC below threshold
-        if metr_val["auc"] < min_auc:
-            continue
-
-        # selection key: minimize drift PSI, then maximize AUC (=> minimize -AUC), then minimize logloss
-        sel_key = (drift["psi"], -metr_val["auc"], metr_val["logloss"])
-        if (best_key is None) or (sel_key < best_key):
-            best_key = sel_key
-            best_name = name
-            best_model = model
-
-    if best_model is None:
-        # si aucun ne passe le seuil AUC: on prend le moins de drift, point
-        for name, rep in reports.items():
-            metr_val = rep["metrics_val"]
-            drift = rep["drift"]
-            sel_key = (drift["psi"], -metr_val["auc"], metr_val["logloss"])
-            if (best_key is None) or (sel_key < best_key):
-                best_key = sel_key
-                best_name = name
-                best_model = candidates[name]
-
-        # refit best on full train
-        best_model.fit(X_train, y_train)
-
-    # Optional calibration on TRAIN via CV
-    if calibrate in ("sigmoid", "isotonic"):
-        best_model = CalibratedClassifierCV(
-            estimator=best_model, method=calibrate, cv=5, n_jobs=None
-        )
-        best_model.fit(X_train, y_train)
-        # update metrics with calibrated proba
-        val_proba = best_model.predict_proba(X_val)[:, 1]
-        reports[best_name]["metrics_val_calibrated"] = compute_metrics(y_val, val_proba)
-
-    return best_name, best_model, reports
-
-
-# -----------------------------------------
+# -----------------------------
 # CLI
-# -----------------------------------------
+# -----------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Train models and select the one with least drift")
-    p.add_argument("--train", required=True, help="Train (CSV/Parquet) — already imputed + binned")
-    p.add_argument("--validation", required=True, help="Validation (CSV/Parquet) — already imputed + binned")
-    p.add_argument("--target", required=True, help="Target column (0/1)")
-    p.add_argument("--artifacts", default="artifacts", help="Artifacts dir to save model + reports")
-    p.add_argument("--min-auc", type=float, default=0.60, help="Minimum AUC to be eligible")
-    p.add_argument("--drift-bins", type=int, default=10, help="Number of quantile bins for PSI")
-    p.add_argument("--calibration", choices=["none", "sigmoid", "isotonic"], default="none")
-    p.add_argument("--features", default=None, help="Comma-separated list of features to use (default: auto WOE or numeric)")
+    p = argparse.ArgumentParser("Train depuis données binners (ou WOE) + calibration isotonic + ablation + prior-shift.")
+    p.add_argument("--train", required=True)
+    p.add_argument("--validation", required=True)
+    p.add_argument("--target", required=True)
+    p.add_argument("--artifacts", default="artifacts/model_from_binned")
+    p.add_argument("--bin-suffix", default="__BIN")     # tag (préfixe OU suffixe)
+    p.add_argument("--woe-prefixes", default="woe__")   # séparés par virgule si plusieurs
+    p.add_argument("--corr-threshold", type=float, default=0.85)
+    p.add_argument("--cv-folds", type=int, default=5)
+    p.add_argument("--no-isotonic", action="store_true")
+    # PSI / ablation / prior-shift
+    p.add_argument("--drop-proxy-cutoff", type=float, default=None)
+    p.add_argument("--conditional-proxies", default="")
+    p.add_argument("--no-prior-shift-adjust", action="store_true")
+    p.add_argument("--ablation-max-steps", type=int, default=10)
+    p.add_argument("--ablation-max-auc-loss", type=float, default=0.02)
     return p.parse_args()
-
 
 def main():
     args = parse_args()
-    artifacts = Path(args.artifacts)
-    artifacts.mkdir(parents=True, exist_ok=True)
-
-    df_tr = load_any(args.train)
-    df_va = load_any(args.validation)
-
+    artifacts = Path(args.artifacts); artifacts.mkdir(parents=True, exist_ok=True)
+    df_tr = load_any(args.train); df_va = load_any(args.validation)
     if args.target not in df_tr.columns or args.target not in df_va.columns:
-        raise SystemExit(f"Target '{args.target}' not found in train/validation.")
+        raise SystemExit(f"Target '{args.target}' absente de train/validation.")
 
-    y_tr = df_tr[args.target].astype(int).values
-    y_va = df_va[args.target].astype(int).values
-    if args.features:
-        feats = [c.strip() for c in args.features.split(",") if c.strip()]
-    else:
-        feats = default_feature_list(df_tr, args.target)
+    prefixes = tuple([s.strip() for s in args.woe_prefixes.split(",") if s.strip()])
+    cond_proxies = [s.strip() for s in args.conditional_proxies.split(",") if s.strip()] if args.conditional_proxies else None
 
-    X_tr = df_tr[feats].copy()
-    X_va = df_va[feats].copy()
-
-    best_name, best_model, reports = train_and_select(
-        X_tr, y_tr, X_va, y_va,
-        min_auc=args.min_auc,
-        drift_bins=args.drift_bins,
-        calibrate=args.calibration,
+    out = train_from_binned(
+        df_tr=df_tr, df_va=df_va, target=args.target,
+        use_existing_woe_prefixes=prefixes, bin_suffix=args.bin_suffix,
+        corr_threshold=args.corr_threshold, cv_folds=args.cv_folds, isotonic=(not args.no_isotonic),
+        drop_proxy_cutoff=args.drop_proxy_cutoff, conditional_proxies=cond_proxies,
+        do_prior_shift_adjust=not args.no_prior_shift_adjust,
+        ablation_max_steps=int(args.ablation_max_steps), ablation_max_auc_loss=float(args.ablation_max_auc_loss)
     )
 
-    # Save artifacts
-    model_path = artifacts / "model_best.joblib"
-    dump({"model": best_model, "features": feats, "target": args.target}, model_path)
+    # Sauvegardes
+    dump({
+        "model": out["model"],
+        "kept_woe": out["kept_woe"],
+        "computed_woe": out["computed_woe"],
+        "woe_maps": out["woe_maps"],
+        "target": args.target
+    }, artifacts / "model_best.joblib")
 
-    # Flat metrics
-    flat_reports = []
-    for name, rep in reports.items():
-        row = {
-            "model": name,
-            **{f"val_{k}": v for k, v in rep["metrics_val"].items()},
-            "drift_psi": rep["drift"]["psi"],
-            "drift_js": rep["drift"]["js"],
-            "drift_bins": rep["drift"]["bins"],
-            "oof_mean": rep["oof_mean"],
-            "oof_std": rep["oof_std"],
-        }
-        if "metrics_val_calibrated" in rep:
-            for k, v in rep["metrics_val_calibrated"].items():
-                row[f"val_cal_{k}"] = v
-        flat_reports.append(row)
+    pd.DataFrame([out["metrics"]]).to_csv(artifacts / "reports.csv", index=False)
 
-    rep_df = pd.DataFrame(flat_reports).sort_values(["drift_psi", "val_auc"], ascending=[True, False])
-    rep_df.to_csv(artifacts / "model_reports.csv", index=False)
-
-    meta = {
-        "selected_model": best_name,
-        "model_path": str(model_path.resolve()),
-        "features": feats,
-        "target": args.target,
-        "min_auc": args.min_auc,
-        "calibration": args.calibration,
+    save_json({
         "train_path": str(Path(args.train).resolve()),
         "validation_path": str(Path(args.validation).resolve()),
-    }
-    save_json(meta, artifacts / "model_meta.json")
-    print(f"✔ Best model: {best_name}")
-    print(f"✔ Saved: {model_path}")
-    print(f"✔ Reports: {(artifacts / 'model_reports.csv')}")
+        "artifacts_dir": str(artifacts.resolve()),
+        "target": args.target,
+        "bin_suffix": args.bin_suffix,
+        "woe_prefixes": prefixes,
+        "cv_folds": int(args.cv_folds),
+        "corr_threshold": float(args.corr_threshold),
+        "isotonic": bool(not args.no_isotonic),
+        "kept_woe": out["kept_woe"],
+        "computed_woe": bool(out["computed_woe"]),
+        "drop_proxy_cutoff": args.drop_proxy_cutoff,
+        "conditional_proxies": cond_proxies,
+        "prior_shift_adjust": bool(not args.no_prior_shift_adjust),
+        "ablation_max_steps": int(args.ablation_max_steps),
+        "ablation_max_auc_loss": float(args.ablation_max_auc_loss),
+        "metrics": out["metrics"]
+    }, artifacts / "meta.json")
 
+    if isinstance(out["deciles_val"], pd.DataFrame) and not out["deciles_val"].empty:
+        out["deciles_val"].to_csv(artifacts / "deciles_val.csv", index=False)
+    if isinstance(out["importance"], pd.DataFrame) and not out["importance"].empty:
+        out["importance"].to_csv(artifacts / "importance.csv", index=False)
+
+    print("✔ Saved:", artifacts / "model_best.joblib")
+    print("✔ Saved:", artifacts / "reports.csv")
+    print("✔ Saved:", artifacts / "meta.json")
+    if (artifacts / "deciles_val.csv").exists(): print("✔ Saved:", artifacts / "deciles_val.csv")
+    if (artifacts / "importance.csv").exists(): print("✔ Saved:", artifacts / "importance.csv")
 
 if __name__ == "__main__":
     main()

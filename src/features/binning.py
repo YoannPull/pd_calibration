@@ -1,276 +1,570 @@
 # src/features/binning.py
-import math
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+import json, math, warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_numeric_dtype, CategoricalDtype
-from sklearn.base import BaseEstimator, TransformerMixin
+
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*is_period_dtype is deprecated.*")
 
 
-@dataclass
-class VarBinningInfo:
-    kind: str  # "numeric" | "categorical"
-    iv: float
-    # numeric
-    edges: Optional[List[float]] = None     # len = nbins+1
-    woe_per_interval: Optional[Dict[pd.Interval, float]] = None
-    # categorical
-    woe_per_category: Optional[Dict[Union[str, int, float], float]] = None
-    # specials
-    woe_nan: float = 0.0
-    woe_unknown: float = 0.0
+# -----------------------------
+# Utilitaires généraux
+# -----------------------------
+def gini_trapz(df_cum, y_col="bad_client_share_cumsum", x_col="good_client_share_cumsum", signed=False):
+    df = df_cum[[x_col, y_col]].astype(float).copy().sort_values(x_col)
+    df[x_col] = df[x_col].clip(0, 1)
+    df[y_col] = df[y_col].clip(0, 1)
+    if df[x_col].iloc[0] > 0 or df[y_col].iloc[0] > 0:
+        df = pd.concat([pd.DataFrame({x_col: [0.0], y_col: [0.0]}), df], ignore_index=True)
+    if df[x_col].iloc[-1] < 1 - 1e-12 or df[y_col].iloc[-1] < 1 - 1e-12:
+        df = pd.concat([df, pd.DataFrame({x_col: [1.0], y_col: [1.0]})], ignore_index=True)
+    # np.trapz est aliasé vers numpy.trapezoid sur nouvelles versions
+    area = np.trapezoid(df[y_col].to_numpy(), df[x_col].to_numpy()) if hasattr(np, "trapezoid") else np.trapz(df[y_col].to_numpy(), df[x_col].to_numpy())
+    g = 1 - 2 * area
+    return g if signed else abs(g)
 
 
-class BinningTransformer(BaseEstimator, TransformerMixin):
-    """
-    Binning + WOE pour variables num (qcut) & cat (woe catégorie).
-    - fit(X, y): apprend edges / woe / iv
-    - transform(X): renvoie DataFrame WOE-encodé pour les variables ciblées
-    """
-    def __init__(
-        self,
-        variables: Optional[List[str]] = None,
-        n_bins: int = 10,
-        output: str = "woe",            # "woe" | "bin_index" | "both"
-        min_unique: int = 2,           # min de modalités/valeurs pour tenter un binning
-        smoothing: float = 0.5,        # lissage add-eps pour woe
-        include_categorical: bool = True,
-        drop_original: bool = False,    # True -> ne garder que les features encodées
-        prefix: str = "woe__",          # préfixe des colonnes de sortie
-    ):
-        self.variables = variables
-        self.n_bins = n_bins
-        self.output = output
-        self.min_unique = min_unique
-        self.smoothing = smoothing
-        self.include_categorical = include_categorical
-        self.drop_original = drop_original
-        self.prefix = prefix
+def _is_period_dtype(dt):  # compat
+    try:
+        return pd.api.types.is_period_dtype(dt)
+    except Exception:
+        return False
 
-        # learned
-        self.vars_: List[str] = []
-        self.info_: Dict[str, VarBinningInfo] = {}
-        self.target_rate_: Optional[float] = None
-        self.classes_: Optional[np.ndarray] = None
 
-    # --- utils ---
-    @staticmethod
-    def _safe_qcut(x, q, duplicates="drop"):
-        # qcut peut échouer si beaucoup de doublons: on catch et on degrade en cut
+def to_float_series(s: pd.Series) -> pd.Series:
+    if _is_period_dtype(s.dtype):
+        ts = s.dt.to_timestamp(how="start")
+        days = (ts.astype("int64") // 86_400_000_000_000)
+        return days.astype("float64")
+    if pd.api.types.is_datetime64_any_dtype(s):
+        s_dt = s
         try:
-            return pd.qcut(x, q=q, duplicates=duplicates)
+            if getattr(s_dt.dt, "tz", None) is not None:
+                s_dt = s_dt.dt.tz_convert(None)
         except Exception:
-            # fallback: bins égaux (si distrib très plate)
-            try:
-                return pd.cut(x, bins=q, duplicates=duplicates)
-            except Exception:
-                return pd.Series(pd.IntervalIndex([], closed="right"), index=x.index, dtype="category")
+            pass
+        s_dt = s_dt.astype("datetime64[ns]")
+        days = (s_dt.astype("int64") // 86_400_000_000_000)
+        return days.astype("float64")
+    return pd.to_numeric(s, errors="coerce").astype("float64")
 
-    @staticmethod
-    def _woe_iv(event, non_event, tot_event, tot_non_event, eps):
-        # distributions
-        pe = (event + eps) / (tot_event + eps * 2)
-        pne = (non_event + eps) / (tot_non_event + eps * 2)
-        w = np.log(pe / pne)
-        iv = (pe - pne) * w
-        return float(w), float(iv)
 
-    def _fit_numeric(self, x: pd.Series, y: pd.Series, name: str, tot_event: int, tot_non_event: int) -> VarBinningInfo:
-        # bins (qcut -> fréquences ~ égales)
-        bins = self._safe_qcut(x, q=self.n_bins, duplicates="drop")
-        if bins.dtype == "category" and len(bins.cat.categories) == 0:
-            # variable quasi-constante -> pas de binning
-            # WOE unique = WOE global
-            eps = self.smoothing
-            info = VarBinningInfo(kind="numeric", iv=0.0, edges=None, woe_per_interval={})
-            pe = (y.sum() + eps) / (tot_event + eps * 2)
-            pne = ((y.shape[0]-y.sum()) + eps) / (tot_non_event + eps * 2)
-            w_global = float(np.log(pe / pne))
-            info.woe_nan = w_global
-            info.woe_unknown = w_global
-            info.iv = 0.0
-            return info
+# -----------------------------
+# Dé-one-hot + denylist
+# -----------------------------
+def detect_onehot_groups(df, exclude_cols=None, exclusivity_thr=0.95):
+    exclude = set(exclude_cols or [])
+    groups = {}
+    for c in df.columns:
+        if c in exclude or "_" not in c:
+            continue
+        base, lab = c.rsplit("_", 1)
+        s = df[c]
+        is_ohe = (pd.api.types.is_bool_dtype(s) or (pd.api.types.is_numeric_dtype(s) and s.dropna().isin([0, 1]).all()))
+        if is_ohe:
+            groups.setdefault(base, []).append((c, lab))
+    clean = {}
+    for base, items in groups.items():
+        cols = [c for c, _ in items]
+        vals = df[cols].apply(pd.to_numeric, errors="coerce")
+        row_sum = vals.fillna(0).astype("Int64").sum(axis=1)
+        excl_rate = float(((row_sum <= 1) | row_sum.isna()).mean())
+        if excl_rate >= exclusivity_thr:
+            clean[base] = items
+    return clean
 
-        # stats par intervalle
-        df = pd.DataFrame({"bin": bins, "y": y})
-        grp = df.groupby("bin", observed=True)
-        cnt = grp["y"].count()
-        ev = grp["y"].sum()
-        ne = cnt - ev
 
-        eps = self.smoothing
-        iv_total = 0.0
-        w_map = {}
-        for interval in cnt.index:
-            w, iv = self._woe_iv(ev.loc[interval], ne.loc[interval], tot_event, tot_non_event, eps)
-            w_map[interval] = w
-            iv_total += iv
+def deonehot(df, exclude_cols=None, ambiguous_label=None):
+    groups = detect_onehot_groups(df, exclude_cols=exclude_cols)
+    out = df.copy()
+    for base, items in groups.items():
+        cols = [c for c, _ in items]
+        labels = [lab for _, lab in items]
+        gvals = df[cols].apply(pd.to_numeric, errors="coerce")
+        row_sum = gvals.fillna(0).astype("Int64").sum(axis=1)
+        ser = pd.Series(pd.NA, index=df.index, dtype="object")
+        for c, lab in zip(cols, labels):
+            ser[df[c] == 1] = (pd.NA if lab == "<NA>" else lab)
+        amb = row_sum > 1
+        if amb.any():
+            ser[amb] = ambiguous_label if ambiguous_label is not None else pd.NA
+        out[base] = ser.astype("category")
+        out.drop(columns=cols, inplace=True, errors="ignore")
+    return out
 
-        edges = [c.left for c in cnt.index] + [cnt.index[-1].right]
 
-        # woe pour NaN / unknown = woe global
-        pe = (y.sum() + eps) / (tot_event + eps * 2)
-        pne = ((y.shape[0]-y.sum()) + eps) / (tot_non_event + eps * 2)
-        w_global = float(np.log(pe / pne))
+# -----------------------------
+# Catégorielles : max |Gini| par fusion
+# -----------------------------
+def _cat_stats(df, col, target_col, include_missing=True, missing_label="__MISSING__"):
+    y = df[target_col].astype(int)
+    s = df[col]
+    if include_missing:
+        s = s.astype("object").where(s.notna(), missing_label)
+    tmp = pd.DataFrame({col: s, target_col: y})
+    agg = tmp.groupby(col, dropna=not include_missing)[target_col].agg(["sum", "count"])
+    agg.rename(columns={"sum": "n_bad", "count": "n_total"}, inplace=True)
+    agg["n_good"] = agg["n_total"] - agg["n_bad"]
+    n_bad = int(y.sum())
+    n_good = int(len(y) - y.sum())
+    denom_bad = n_bad if n_bad > 0 else 1
+    denom_good = n_good if n_good > 0 else 1
+    agg["bad_rate"] = agg["n_bad"] / agg["n_total"].where(agg["n_total"] > 0, 1)
+    agg["bad_share"] = agg["n_bad"] / denom_bad
+    agg["good_share"] = agg["n_good"] / denom_good
+    return agg.reset_index().rename(columns={col: "modality"})
 
-        return VarBinningInfo(
-            kind="numeric",
-            iv=float(iv_total),
-            edges=[float(e) if pd.notna(e) else -np.inf for e in edges],
-            woe_per_interval=w_map,
-            woe_nan=w_global,
-            woe_unknown=w_global,
+
+def _groups_df_from_bins(stats_df, bins):
+    rows = []
+    for i, mods in enumerate(bins):
+        sub = stats_df[stats_df["modality"].isin(mods)]
+        n_bad = int(sub["n_bad"].sum())
+        n_good = int(sub["n_good"].sum())
+        n_tot = int(sub["n_total"].sum())
+        br = n_bad / n_tot if n_tot > 0 else 0.0
+        rows.append(
+            {
+                "bin_id": i,
+                "modalities": tuple(mods),
+                "n_total": n_tot,
+                "n_bad": n_bad,
+                "n_good": n_good,
+                "bad_rate": br,
+                "bad_share": sub["bad_share"].sum(),
+                "good_share": sub["good_share"].sum(),
+            }
         )
+    gdf = pd.DataFrame(rows).sort_values("bad_rate", ascending=True, kind="mergesort").reset_index(drop=True)
+    gdf["bad_cum"] = gdf["bad_share"].cumsum()
+    gdf["good_cum"] = gdf["good_share"].cumsum()
+    return gdf
 
-    def _fit_categorical(self, x: pd.Series, y: pd.Series, name: str, tot_event: int, tot_non_event: int) -> VarBinningInfo:
-        df = pd.DataFrame({"cat": x.astype("object"), "y": y})
-        grp = df.groupby("cat", dropna=False)
-        cnt = grp["y"].count()
-        ev = grp["y"].sum()
-        ne = cnt - ev
 
-        eps = self.smoothing
-        iv_total = 0.0
-        w_map = {}
-        for cat in cnt.index:
-            # cat peut être NaN -> on traite séparément
-            e = ev.loc[cat]
-            n = ne.loc[cat]
-            w, iv = self._woe_iv(e, n, tot_event, tot_non_event, eps)
-            if pd.isna(cat):
-                nan_woe = w
+def _gini_from_bins(stats_df, bins):
+    gdf = _groups_df_from_bins(stats_df, bins)
+    df_cum = gdf.rename(
+        columns={"good_cum": "good_client_share_cumsum", "bad_cum": "bad_client_share_cumsum"}
+    )[["good_client_share_cumsum", "bad_client_share_cumsum"]]
+    return gini_trapz(df_cum)
+
+
+def maximize_gini_categorical(
+    df,
+    col,
+    target_col,
+    include_missing=True,
+    missing_label="__MISSING__",
+    max_bins=6,
+    min_bin_size=200,
+    min_bin_frac=None,
+    ordered=False,
+    explicit_order=None,
+):
+    stats_df = _cat_stats(df, col, target_col, include_missing, missing_label)
+    if ordered and explicit_order is not None:
+        order = [m for m in explicit_order if m in set(stats_df["modality"])]
+        order += [m for m in stats_df["modality"] if m not in set(order)]
+    else:
+        order = list(stats_df.sort_values("bad_rate")["modality"])
+    groups = [[m] for m in order]
+    if len(groups) <= 1:
+        mapping = {m: 0 for m in order}
+        g = _gini_from_bins(stats_df, groups)
+        return {
+            "mapping": mapping,
+            "gini_before": float(g),
+            "gini_after": float(g),
+            "bins": [tuple(grp) for grp in groups],
+        }
+
+    n_total = int(stats_df["n_total"].sum())
+    need = 0
+    if min_bin_frac is not None:
+        need = max(need, math.ceil(float(min_bin_frac) * max(n_total, 1)))
+    if min_bin_size is not None:
+        need = max(need, int(min_bin_size))
+
+    def ok(gs):
+        if max_bins is not None and len(gs) > max_bins:
+            return False
+        if need:
+            for mods in gs:
+                if int(stats_df[stats_df["modality"].isin(mods)]["n_total"].sum()) < need:
+                    return False
+        return True
+
+    def reorder(gs):
+        if ordered:
+            return gs
+
+        def br(mods):
+            sub = stats_df[stats_df["modality"].isin(mods)]
+            nb, nt = sub["n_bad"].sum(), sub["n_total"].sum()
+            return (nb / nt) if nt > 0 else 0.0
+
+        return sorted(gs, key=br)
+
+    while not ok(groups):
+        best_g, best_i = -np.inf, None
+        for i in range(len(groups) - 1):
+            merged = groups[:i] + [groups[i] + groups[i + 1]] + groups[i + 2 :]
+            merged = reorder(merged)
+            g_try = _gini_from_bins(stats_df, merged)
+            if g_try > best_g:
+                best_g, best_i = g_try, i
+        if best_i is None:
+            best_i = 0
+        groups = groups[:best_i] + [groups[best_i] + groups[best_i + 1]] + groups[best_i + 2 :]
+        groups = reorder(groups)
+
+    g_before = _gini_from_bins(stats_df, [[m] for m in order])
+    g_after = _gini_from_bins(stats_df, groups)
+    bins = [tuple(mods) for mods in groups]
+    mapping = {m: i for i, mods in enumerate(bins) for m in mods}
+    return {"mapping": mapping, "gini_before": float(g_before), "gini_after": float(g_after), "bins": bins}
+
+
+# -----------------------------
+# Numériques : seuils quantiles (candidats) pour max |Gini|
+# -----------------------------
+def _safe_edges_for_cut(edges, s_float):
+    e = np.array(edges, dtype="float64")
+    for i in range(1, len(e)):
+        if not (e[i] > e[i - 1]):
+            e[i] = np.nextafter(e[i - 1], np.inf)
+    arr = s_float.to_numpy()
+    if arr.size == 0:
+        return e
+    s_min = float(np.nanmin(arr)) if np.isfinite(arr).any() else -1.0
+    s_max = float(np.nanmax(arr)) if np.isfinite(arr).any() else 1.0
+    if len(e) >= 2:
+        e[0] = min(e[1] - 1e-6 * (abs(e[1]) + 1.0), s_min - 1e-6 * (abs(e[1]) + 1.0))
+        e[-1] = max(e[-2] + 1e-6 * (abs(e[-2]) + 1.0), s_max + 1e-6 * (abs(e[-2]) + 1.0))
+    return e
+
+
+def _gini_from_numeric_bins(y_int, x_float, edges, include_missing=True):
+    y = y_int.astype(int).to_numpy()
+    x = x_float.to_numpy()
+    K = len(edges) - 1
+    idx = np.digitize(x, edges[1:-1], right=True)
+    n_bad = int(y.sum())
+    n_good = int(len(y) - y.sum())
+    denom_bad = n_bad if n_bad > 0 else 1
+    denom_good = n_good if n_good > 0 else 1
+    rows = []
+    for k in range(K):
+        m = (idx == k) & ~np.isnan(x)
+        nk = int(m.sum())
+        nb = int(y[m].sum())
+        ng = nk - nb
+        br = nb / nk if nk > 0 else 0.0
+        rows.append({"bin": k, "n_total": nk, "n_bad": nb, "n_good": ng, "bad_rate": br})
+    if include_missing and np.isnan(x).any():
+        m = np.isnan(x)
+        nk = int(m.sum())
+        nb = int(y[m].sum())
+        ng = nk - nb
+        br = nb / nk if nk > 0 else 0.0
+        rows.append({"bin": K, "n_total": nk, "n_bad": nb, "n_good": ng, "bad_rate": br})
+    gdf = pd.DataFrame(rows)
+    if gdf.empty:
+        return 0.0, gdf
+    gdf["bad_share"] = gdf["n_bad"] / denom_bad
+    gdf["good_share"] = gdf["n_good"] / denom_good
+    gdf = gdf.sort_values("bad_rate").reset_index(drop=True)
+    gdf["bad_cum"] = gdf["bad_share"].cumsum()
+    gdf["good_cum"] = gdf["good_share"].cumsum()
+    df_cum = gdf.rename(
+        columns={"good_cum": "good_client_share_cumsum", "bad_cum": "bad_client_share_cumsum"}
+    )[["good_client_share_cumsum", "bad_client_share_cumsum"]]
+    return gini_trapz(df_cum), gdf
+
+
+def maximize_gini_numeric(
+    df,
+    col,
+    target_col,
+    max_bins=6,
+    min_bin_size=200,
+    min_bin_frac=None,
+    n_quantiles=50,
+    q_low=0.02,
+    q_high=0.98,
+    include_missing=True,
+    min_gain=1e-5,
+):
+    s = to_float_series(df[col])
+    y = df[target_col].astype(int)
+    if s.dropna().nunique() < 2:
+        s_f = s[np.isfinite(s)]
+        if s_f.empty:
+            e_cut = np.array([-1.0, 1.0], dtype="float64")
+        else:
+            lo, hi = float(np.nanmin(s_f)), float(np.nanmax(s_f))
+            eps = 1e-6 * (abs(lo) + abs(hi) + 1.0)
+            e_cut = np.array([lo - eps, hi + eps], dtype="float64")
+        g0, _ = _gini_from_numeric_bins(y, s, [-np.inf, np.inf], include_missing)
+        return {"edges": [-np.inf, np.inf], "edges_for_cut": e_cut, "gini_before": float(g0), "gini_after": float(g0)}
+
+    qs = np.linspace(q_low, q_high, n_quantiles)
+    cand_vals = s.quantile(qs).dropna().unique()
+    cand_vals = np.unique(cand_vals)
+    edges = [-np.inf, np.inf]
+
+    n = len(s)
+    need = 0
+    if min_bin_frac is not None:
+        need = max(need, math.ceil(float(min_bin_frac) * max(n, 1)))
+    if min_bin_size is not None:
+        need = max(need, int(min_bin_size))
+
+    def edges_ok(e):
+        arr = s.to_numpy()
+        idx = np.digitize(arr, e[1:-1], right=True)
+        for k in range(len(e) - 1):
+            if int(((idx == k) & ~np.isnan(arr)).sum()) < need:
+                return False
+        return True
+
+    best_g, _ = _gini_from_numeric_bins(y, s, edges, include_missing)
+    improved = True
+    while improved and (len(edges) - 1) < max_bins:
+        improved = False
+        best_gain = min_gain
+        best_t = None
+        g_best = best_g
+        for t in cand_vals:
+            if t in edges:
                 continue
-            w_map[cat] = w
-            iv_total += iv
+            new_e = sorted([*edges, t])
+            if any(np.isclose(new_e[i], new_e[i + 1]) for i in range(len(new_e) - 1)):
+                continue
+            if not edges_ok(new_e):
+                continue
+            g_try, _ = _gini_from_numeric_bins(y, s, new_e, include_missing)
+            gain = g_try - best_g
+            if gain > best_gain:
+                best_gain, best_t, g_best = gain, t, g_try
+        if best_t is not None:
+            edges = sorted([*edges, best_t])
+            best_g = g_best
+            improved = True
 
-        # woe global comme fallback unknown
-        pe = (y.sum() + eps) / (tot_event + eps * 2)
-        pne = ((y.shape[0]-y.sum()) + eps) / (tot_non_event + eps * 2)
-        w_global = float(np.log(pe / pne))
+    g_after, _ = _gini_from_numeric_bins(y, s, edges, include_missing)
+    e = sorted(edges)
+    e_cut = _safe_edges_for_cut(e, s)
+    return {"edges": e, "edges_for_cut": e_cut, "gini_before": float(best_g), "gini_after": float(g_after)}
 
-        return VarBinningInfo(
-            kind="categorical",
-            iv=float(iv_total),
-            edges=None,
-            woe_per_interval=None,
-            woe_per_category=w_map,
-            woe_nan=nan_woe if "nan_woe" in locals() else w_global,
-            woe_unknown=w_global,
+
+# -----------------------------
+# Pipeline binning complet (train) + transform (val/test)
+# -----------------------------
+@dataclass
+class LearnedBins:
+    target: str
+    include_missing: bool
+    missing_label: str
+    bin_col_suffix: str
+    cat_results: Dict[str, dict]
+    num_results: Dict[str, dict]
+
+
+def run_binning_maxgini_on_df(
+    df: pd.DataFrame,
+    target_col: str,
+    include_missing: bool = True,
+    missing_label: str = "__MISSING__",
+    max_bins_categ: int = 6,
+    min_bin_size_categ: int = 200,
+    min_bin_frac_categ: Optional[float] = None,
+    max_bins_num: int = 6,
+    min_bin_size_num: int = 200,
+    min_bin_frac_num: Optional[float] = None,
+    n_quantiles_num: int = 50,
+    bin_col_suffix: str = "__BIN",
+    exclude_ids: Tuple[str, ...] = ("loan_sequence_number", "postal_code", "seller_name", "servicer_name", "msa_md"),
+    min_gini_keep: Optional[float] = None,
+):
+    DF = deonehot(df, exclude_cols=[target_col])
+    target = target_col
+
+    # détecte les catégorielles raisonnables
+    cat_cols = []
+    for c in DF.columns:
+        if c == target:
+            continue
+        s = DF[c]
+        if isinstance(s.dtype, pd.CategoricalDtype) or pd.api.types.is_bool_dtype(s):
+            cat_cols.append(c)
+        elif pd.api.types.is_object_dtype(s) and s.nunique(dropna=True) <= 50:
+            cat_cols.append(c)
+        elif (pd.api.types.is_integer_dtype(s) and s.nunique(dropna=True) <= 8 and not any(k in c.lower() for k in ["id", "sequence"])):
+            cat_cols.append(c)
+
+    # numériques
+    num_cols = []
+    for c in DF.columns:
+        if c in (cat_cols + [target]):
+            continue
+        s = DF[c]
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            if s.dropna().isin([0, 1]).all():
+                continue
+            if pd.api.types.is_integer_dtype(s) and s.dropna().nunique() <= 8:
+                continue
+            if any(k in c.lower() for k in ["id", "sequence", "postal", "zip", "msa", "code", "seller", "servicer"]):
+                continue
+            num_cols.append(c)
+        elif _is_period_dtype(s.dtype) or pd.api.types.is_datetime64_any_dtype(s):
+            num_cols.append(c)
+
+    cat_results = {}
+    for c in cat_cols:
+        res = maximize_gini_categorical(
+            DF[[c, target]].copy(),
+            c,
+            target,
+            include_missing=include_missing,
+            missing_label=missing_label,
+            max_bins=max_bins_categ,
+            min_bin_size=min_bin_size_categ,
+            min_bin_frac=min_bin_frac_categ,
         )
+        cat_results[c] = res
 
-    def fit(self, X: pd.DataFrame, y: pd.Series):
-        X = X.copy()
-        y = pd.Series(y).astype(int)
-        self.classes_ = np.unique(y.values)
+    num_results = {}
+    for c in num_cols:
+        res = maximize_gini_numeric(
+            DF[[c, target]].copy(),
+            c,
+            target,
+            max_bins=max_bins_num,
+            min_bin_size=min_bin_size_num,
+            min_bin_frac=min_bin_frac_num,
+            n_quantiles=n_quantiles_num,
+            include_missing=include_missing,
+        )
+        num_results[c] = res
 
-        tot_event = int(y.sum())
-        tot_non_event = int((y == 0).sum())
-        self.target_rate_ = float(tot_event / max(len(y), 1))
+    # Ajoute colonnes __BIN
+    enriched = DF.copy()
+    for c, r in cat_results.items():
+        s = enriched[c].astype("object").where(enriched[c].notna(), missing_label)
+        enriched[c + bin_col_suffix] = s.map(r["mapping"]).astype("Int64")
+    for c, r in num_results.items():
+        s = to_float_series(enriched[c])
+        e = np.array(r["edges_for_cut"], dtype="float64")
+        b = pd.cut(s, bins=e, include_lowest=True, duplicates="drop").cat.codes.astype("Int64")
+        if include_missing and s.isna().any():
+            b = b.where(~s.isna(), -1).astype("Int64")
+        enriched[c + bin_col_suffix] = b
 
-        # variables cibles
-        if self.variables is None:
-            # par défaut: num + cat (si include_categorical)
-            vars_num = [c for c in X.columns if is_numeric_dtype(X[c]) and X[c].nunique(dropna=True) >= self.min_unique]
-            vars_cat = []
-            if self.include_categorical:
-                vars_cat = [c for c in X.columns if (not is_numeric_dtype(X[c])) and X[c].nunique(dropna=True) >= self.min_unique]
-            variables = vars_num + vars_cat
-        else:
-            variables = [c for c in self.variables if c in X.columns]
-
-        self.vars_ = variables
-        self.info_ = {}
-
-        for name in variables:
-            s = X[name]
-            if is_numeric_dtype(s):
-                info = self._fit_numeric(pd.to_numeric(s, errors="coerce"), y, name, tot_event, tot_non_event)
-            else:
-                info = self._fit_categorical(s, y, name, tot_event, tot_non_event)
-            self.info_[name] = info
-
-        return self
-
-    def _transform_numeric(self, s: pd.Series, info: VarBinningInfo):
-        # si pas d'edges => constante: woe global
-        if info.edges is None or info.woe_per_interval is None:
-            w = pd.Series(info.woe_unknown, index=s.index)
-            w[s.isna()] = info.woe_nan
-            return w, pd.Series(-1, index=s.index, dtype="Int16")
-
-        # couper selon edges appris
-        edges = info.edges
-        # assurer bornes infinies
-        edges = [(-np.inf if i == 0 else edges[i]) for i in range(len(edges))]  # on gardera -inf via cut anyway
-        cat = pd.cut(s, bins=info.edges, include_lowest=True)
-
-        # map WOE
-        w_map = info.woe_per_interval
-        w = cat.map(w_map)
-        # NaN (valeur manquante initiale)
-        w[s.isna()] = info.woe_nan
-        # hors bornes (très rare si edges couvrent tout)
-        w = w.fillna(info.woe_unknown)
-
-        # indice de bin (optionnel)
-        if cat.dtype == "category":
-            bin_idx = pd.Series(cat.cat.codes, index=s.index).astype("Int16")
-        else:
-            bin_idx = pd.Series(-1, index=s.index, dtype="Int16")
-
-        return w, bin_idx
-
-    def _transform_categorical(self, s: pd.Series, info: VarBinningInfo):
-        w = s.map(info.woe_per_category)
-        w[s.isna()] = info.woe_nan
-        w = w.fillna(info.woe_unknown)
-        # Pas de notion d'index de bin pour cat -> codes de catégorie si besoin
-        bin_idx = pd.Series(s.astype("category").cat.codes, index=s.index).astype("Int16")
-        return w, bin_idx
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X = X.copy()
-        out = pd.DataFrame(index=X.index)
-
-        for name in self.vars_:
-            if name not in X.columns:
-                # colonne absente -> woe unknown
-                info = self.info_[name]
-                w = pd.Series(info.woe_unknown, index=X.index)
-                b = pd.Series(-1, index=X.index, dtype="Int16")
-            else:
-                s = X[name]
-                info = self.info_[name]
-                if info.kind == "numeric":
-                    w, b = self._transform_numeric(pd.to_numeric(s, errors="coerce"), info)
-                else:
-                    w, b = self._transform_categorical(s, info)
-
-            if self.output in ("woe", "both"):
-                out[f"{self.prefix}{name}"] = w.astype("float32")
-            if self.output in ("bin_index", "both"):
-                out[f"bin__{name}"] = b
-
-        if not self.drop_original:
-            # concaténer avec X
-            out = pd.concat([X, out], axis=1)
-
-        return out
-
-    # Qualité / reporting
-    def iv_summary_(self) -> pd.DataFrame:
+    # option min_gini_keep
+    keep_vars = None
+    if min_gini_keep is not None:
         rows = []
-        for name, info in self.info_.items():
-            rows.append({"variable": name, "kind": info.kind, "iv": info.iv})
-        return pd.DataFrame(rows).sort_values("iv", ascending=False)
+        for v, info in cat_results.items():
+            rows.append((v, "categorical", info["gini_after"]))
+        for v, info in num_results.items():
+            rows.append((v, "numeric", info["gini_after"]))
+        summary = pd.DataFrame(rows, columns=["variable", "type", "gini_after"])
+        keep_vars = set(summary.loc[summary["gini_after"] >= float(min_gini_keep), "variable"].tolist())
 
-    # Compat Pipeline
-    def get_feature_names_out(self, input_features=None):
-        if self.output == "woe":
-            return np.array([f"{self.prefix}{v}" for v in self.vars_], dtype=object)
-        if self.output == "bin_index":
-            return np.array([f"bin__{v}" for v in self.vars_], dtype=object)
-        both = [f"{self.prefix}{v}" for v in self.vars_] + [f"bin__{v}" for v in self.vars_]
-        return np.array(both, dtype=object)
+    if keep_vars is None:
+        keep_vars = set(list(cat_results.keys()) + list(num_results.keys()))
+    bin_cols = [v + bin_col_suffix for v in keep_vars if v + bin_col_suffix in enriched.columns]
+    drop_cols = list(cat_results.keys()) + list(num_results.keys())
+    df_binned = (
+        enriched.drop(columns=drop_cols, errors="ignore").rename(columns={c: c.replace(bin_col_suffix, "") for c in bin_cols})
+    )
+
+    learned = LearnedBins(
+        target=target,
+        include_missing=include_missing,
+        missing_label=missing_label,
+        bin_col_suffix=bin_col_suffix,
+        cat_results=cat_results,
+        num_results=num_results,
+    )
+    return learned, enriched, df_binned
+
+
+def transform_with_learned_bins(df, learned: LearnedBins) -> pd.DataFrame:
+    DF = deonehot(df, exclude_cols=[learned.target] if learned.target in df.columns else None)
+    suffix = learned.bin_col_suffix
+    # applique
+    for c, r in learned.cat_results.items():
+        if c not in DF.columns:
+            continue
+        s = DF[c].astype("object").where(DF[c].notna(), learned.missing_label)
+        DF[c + suffix] = s.map(r["mapping"]).astype("Int64").fillna(-2).astype("Int64")
+    for c, r in learned.num_results.items():
+        if c not in DF.columns:
+            continue
+        s = to_float_series(DF[c])
+        e = np.array(r["edges_for_cut"], dtype="float64")
+        b = pd.cut(s, bins=e, include_lowest=True, duplicates="drop").cat.codes.astype("Int64")
+        if learned.include_missing and s.isna().any():
+            b = b.where(~s.isna(), -1).astype("Int64")
+        DF[c + suffix] = b
+    # sortie modèle: seulement les __BIN renommés en colonnes brutes
+    bin_cols = [c for c in DF.columns if c.endswith(suffix)]
+    base = DF.drop(columns=[c[:-len(suffix)] for c in bin_cols if c[:-len(suffix)] in DF.columns], errors="ignore")
+    model_df = base.copy()
+    for c in bin_cols:
+        model_df[c.replace(suffix, "")] = model_df[c]
+    return model_df
+
+
+# -----------------------------
+# Sérialisation (robuste JSON)
+# -----------------------------
+def _json_default(o):
+    """Convertit proprement les objets numpy/pandas pour JSON."""
+    import numpy as _np
+    import pandas as _pd
+    if isinstance(o, (_np.floating, _np.integer)):
+        return o.item()
+    if isinstance(o, _np.ndarray):
+        return o.tolist()
+    if isinstance(o, _pd.Interval):
+        # encode un intervalle comme [left, right]
+        try:
+            return [float(o.left), float(o.right)]
+        except Exception:
+            return [o.left, o.right]
+    # fallback: string
+    return str(o)
+
+
+def save_bins_json(learned: LearnedBins, path: str):
+    d = {
+        "target": learned.target,
+        "include_missing": bool(learned.include_missing),
+        "missing_label": str(learned.missing_label),
+        "bin_col_suffix": str(learned.bin_col_suffix),
+        "cat_results": learned.cat_results,
+        "num_results": learned.num_results,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2, default=_json_default)
+
+
+def load_bins_json(path: str) -> LearnedBins:
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    return LearnedBins(
+        target=d["target"],
+        include_missing=bool(d["include_missing"]),
+        missing_label=str(d["missing_label"]),
+        bin_col_suffix=str(d["bin_col_suffix"]),
+        cat_results=d["cat_results"],
+        num_results=d["num_results"],
+    )
