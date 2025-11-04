@@ -7,7 +7,10 @@ import pandas as pd
 
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
-from features.binning import run_binning_maxgini_on_df, save_bins_json
+from features.binning import (
+    run_binning_maxgini_on_df, save_bins_json,
+    DENYLIST_STRICT_DEFAULT, EXCLUDE_IDS_DEFAULT
+)
 
 def parse_args():
     p = argparse.ArgumentParser(description="Fit max|Gini| bins on TRAIN and apply to VALIDATION; save datasets + bins.json")
@@ -27,6 +30,11 @@ def parse_args():
     p.add_argument("--min-bin-size-num", type=int, default=200)
     p.add_argument("--n-quantiles-num", type=int, default=50)
     p.add_argument("--min-gini-keep", type=float, default=None)
+    # nouveautés : denylist + drop flags + parallélisme
+    p.add_argument("--no-denylist", action="store_true", help="Ne pas appliquer la denylist stricte")
+    p.add_argument("--drop-missing-flags", action="store_true", help="Supprimer les colonnes *_missing / was_missing_*")
+    p.add_argument("--n-jobs-categ", type=int, default=-1, help="Nombre de jobs pour le binning catégoriel (joblib)")
+    p.add_argument("--n-jobs-num", type=int, default=-1, help="Nombre de jobs pour le binning numérique (joblib)")
     return p.parse_args()
 
 def load_any(path: str) -> pd.DataFrame:
@@ -55,7 +63,13 @@ def main():
         max_bins_num=args.max_bins_num,   min_bin_size_num=args.min_bin_size_num,
         n_quantiles_num=args.n_quantiles_num,
         bin_col_suffix=args.bin_col_suffix,
-        min_gini_keep=args.min_gini_keep
+        min_gini_keep=args.min_gini_keep,
+        # nouveautés
+        denylist_strict=([] if args.no_denylist else list(DENYLIST_STRICT_DEFAULT)),
+        drop_missing_flags=bool(args.drop_missing_flags),
+        n_jobs_categ=int(args.n_jobs_categ if args.n_jobs_categ != 0 else 1),
+        n_jobs_num=int(args.n_jobs_num if args.n_jobs_num != 0 else 1),
+        exclude_ids=EXCLUDE_IDS_DEFAULT
     )
 
     # Applique aux données de validation

@@ -2,15 +2,35 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import json, math, warnings
+import json, math, warnings, os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+# Parallélisation
+try:
+    from joblib import Parallel, delayed
+except Exception:
+    Parallel = None
+    def delayed(f): return f
+
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*is_period_dtype is deprecated.*")
 
+# =============================
+# Réglages "pipeline.py"-like
+# =============================
+DENYLIST_STRICT_DEFAULT = [
+    "first_payment_date",       # proxy temporel
+    "maturity_date",            # proxy temporel redondant
+    "vintage",                  # proxy temporel
+    "mi_cancellation_indicator" # post-événement → fuite
+]
+
+EXCLUDE_IDS_DEFAULT: Tuple[str, ...] = (
+    "loan_sequence_number", "postal_code", "seller_name", "servicer_name", "msa_md"
+)
 
 # -----------------------------
 # Utilitaires généraux
@@ -23,18 +43,15 @@ def gini_trapz(df_cum, y_col="bad_client_share_cumsum", x_col="good_client_share
         df = pd.concat([pd.DataFrame({x_col: [0.0], y_col: [0.0]}), df], ignore_index=True)
     if df[x_col].iloc[-1] < 1 - 1e-12 or df[y_col].iloc[-1] < 1 - 1e-12:
         df = pd.concat([df, pd.DataFrame({x_col: [1.0], y_col: [1.0]})], ignore_index=True)
-    # np.trapz est aliasé vers numpy.trapezoid sur nouvelles versions
     area = np.trapezoid(df[y_col].to_numpy(), df[x_col].to_numpy()) if hasattr(np, "trapezoid") else np.trapz(df[y_col].to_numpy(), df[x_col].to_numpy())
     g = 1 - 2 * area
     return g if signed else abs(g)
-
 
 def _is_period_dtype(dt):  # compat
     try:
         return pd.api.types.is_period_dtype(dt)
     except Exception:
         return False
-
 
 def to_float_series(s: pd.Series) -> pd.Series:
     if _is_period_dtype(s.dtype):
@@ -48,11 +65,27 @@ def to_float_series(s: pd.Series) -> pd.Series:
                 s_dt = s_dt.dt.tz_convert(None)
         except Exception:
             pass
+    #   s_dt = s_dt.astype("datetime64[ns]")  # convert not necessary if already ns
         s_dt = s_dt.astype("datetime64[ns]")
         days = (s_dt.astype("int64") // 86_400_000_000_000)
         return days.astype("float64")
     return pd.to_numeric(s, errors="coerce").astype("float64")
 
+# -----------------------------
+# Helpers pré-traitements
+# -----------------------------
+def drop_missing_flag_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = df.columns
+    mask = cols.str.startswith("was_missing_") | cols.str.endswith("_missing")
+    to_drop = cols[mask].tolist()
+    if to_drop:
+        return df.drop(columns=to_drop, errors="ignore")
+    return df
+
+def apply_denylist(df: pd.DataFrame, denylist: List[str]) -> pd.DataFrame:
+    if not denylist:
+        return df
+    return df.drop(columns=[c for c in denylist if c in df.columns], errors="ignore")
 
 # -----------------------------
 # Dé-one-hot + denylist
@@ -78,7 +111,6 @@ def detect_onehot_groups(df, exclude_cols=None, exclusivity_thr=0.95):
             clean[base] = items
     return clean
 
-
 def deonehot(df, exclude_cols=None, ambiguous_label=None):
     groups = detect_onehot_groups(df, exclude_cols=exclude_cols)
     out = df.copy()
@@ -96,7 +128,6 @@ def deonehot(df, exclude_cols=None, ambiguous_label=None):
         out[base] = ser.astype("category")
         out.drop(columns=cols, inplace=True, errors="ignore")
     return out
-
 
 # -----------------------------
 # Catégorielles : max |Gini| par fusion
@@ -118,7 +149,6 @@ def _cat_stats(df, col, target_col, include_missing=True, missing_label="__MISSI
     agg["bad_share"] = agg["n_bad"] / denom_bad
     agg["good_share"] = agg["n_good"] / denom_good
     return agg.reset_index().rename(columns={col: "modality"})
-
 
 def _groups_df_from_bins(stats_df, bins):
     rows = []
@@ -145,14 +175,12 @@ def _groups_df_from_bins(stats_df, bins):
     gdf["good_cum"] = gdf["good_share"].cumsum()
     return gdf
 
-
 def _gini_from_bins(stats_df, bins):
     gdf = _groups_df_from_bins(stats_df, bins)
     df_cum = gdf.rename(
         columns={"good_cum": "good_client_share_cumsum", "bad_cum": "bad_client_share_cumsum"}
     )[["good_client_share_cumsum", "bad_client_share_cumsum"]]
     return gini_trapz(df_cum)
-
 
 def maximize_gini_categorical(
     df,
@@ -229,7 +257,6 @@ def maximize_gini_categorical(
     mapping = {m: i for i, mods in enumerate(bins) for m in mods}
     return {"mapping": mapping, "gini_before": float(g_before), "gini_after": float(g_after), "bins": bins}
 
-
 # -----------------------------
 # Numériques : seuils quantiles (candidats) pour max |Gini|
 # -----------------------------
@@ -247,7 +274,6 @@ def _safe_edges_for_cut(edges, s_float):
         e[0] = min(e[1] - 1e-6 * (abs(e[1]) + 1.0), s_min - 1e-6 * (abs(e[1]) + 1.0))
         e[-1] = max(e[-2] + 1e-6 * (abs(e[-2]) + 1.0), s_max + 1e-6 * (abs(e[-2]) + 1.0))
     return e
-
 
 def _gini_from_numeric_bins(y_int, x_float, edges, include_missing=True):
     y = y_int.astype(int).to_numpy()
@@ -285,7 +311,6 @@ def _gini_from_numeric_bins(y_int, x_float, edges, include_missing=True):
         columns={"good_cum": "good_client_share_cumsum", "bad_cum": "bad_client_share_cumsum"}
     )[["good_client_share_cumsum", "bad_client_share_cumsum"]]
     return gini_trapz(df_cum), gdf
-
 
 def maximize_gini_numeric(
     df,
@@ -362,7 +387,6 @@ def maximize_gini_numeric(
     e_cut = _safe_edges_for_cut(e, s)
     return {"edges": e, "edges_for_cut": e_cut, "gini_before": float(best_g), "gini_after": float(g_after)}
 
-
 # -----------------------------
 # Pipeline binning complet (train) + transform (val/test)
 # -----------------------------
@@ -375,6 +399,24 @@ class LearnedBins:
     cat_results: Dict[str, dict]
     num_results: Dict[str, dict]
 
+# --- workers parallélisés
+def _compute_cat_result(df_small, col, target_col, include_missing, missing_label,
+                        max_bins_categ, min_bin_size_categ, min_bin_frac_categ):
+    res = maximize_gini_categorical(
+        df_small, col, target_col,
+        include_missing=include_missing, missing_label=missing_label,
+        max_bins=max_bins_categ, min_bin_size=min_bin_size_categ, min_bin_frac=min_bin_frac_categ
+    )
+    return col, res
+
+def _compute_num_result(df_small, col, target_col, max_bins_num, min_bin_size_num, min_bin_frac_num,
+                        n_quantiles_num, include_missing):
+    res = maximize_gini_numeric(
+        df_small, col, target_col,
+        max_bins=max_bins_num, min_bin_size=min_bin_size_num, min_bin_frac=min_bin_frac_num,
+        n_quantiles=n_quantiles_num, include_missing=include_missing
+    )
+    return col, res
 
 def run_binning_maxgini_on_df(
     df: pd.DataFrame,
@@ -389,29 +431,42 @@ def run_binning_maxgini_on_df(
     min_bin_frac_num: Optional[float] = None,
     n_quantiles_num: int = 50,
     bin_col_suffix: str = "__BIN",
-    exclude_ids: Tuple[str, ...] = ("loan_sequence_number", "postal_code", "seller_name", "servicer_name", "msa_md"),
+    exclude_ids: Tuple[str, ...] = EXCLUDE_IDS_DEFAULT,
     min_gini_keep: Optional[float] = None,
+    # nouveautés
+    denylist_strict: Optional[List[str]] = None,
+    drop_missing_flags: bool = False,
+    n_jobs_categ: int = 1,
+    n_jobs_num: int = 1,
 ):
-    DF = deonehot(df, exclude_cols=[target_col])
+    # pré-traitements "pipeline.py"-like
+    DF = df.copy()
+    if drop_missing_flags:
+        DF = drop_missing_flag_columns(DF)
+    if denylist_strict:
+        DF = apply_denylist(DF, denylist_strict)
+
+    DF = deonehot(DF, exclude_cols=[target_col])
     target = target_col
 
-    # détecte les catégorielles raisonnables
+    # détecte les catégorielles raisonnables (en appliquant exclude_ids aux objets aussi)
+    exclude_ids_set = set(exclude_ids or [])
     cat_cols = []
     for c in DF.columns:
-        if c == target:
+        if c == target or c in exclude_ids_set:
             continue
         s = DF[c]
         if isinstance(s.dtype, pd.CategoricalDtype) or pd.api.types.is_bool_dtype(s):
             cat_cols.append(c)
-        elif pd.api.types.is_object_dtype(s) and s.nunique(dropna=True) <= 50:
+        elif (pd.api.types.is_object_dtype(s) or str(s.dtype).startswith("string")) and s.nunique(dropna=True) <= 50:
             cat_cols.append(c)
         elif (pd.api.types.is_integer_dtype(s) and s.nunique(dropna=True) <= 8 and not any(k in c.lower() for k in ["id", "sequence"])):
             cat_cols.append(c)
 
-    # numériques
+    # numériques (mêmes exclusions — IDs, binaires, petits entiers, clés commerciales)
     num_cols = []
     for c in DF.columns:
-        if c in (cat_cols + [target]):
+        if c in (cat_cols + [target]) or c in exclude_ids_set:
             continue
         s = DF[c]
         if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
@@ -425,33 +480,51 @@ def run_binning_maxgini_on_df(
         elif _is_period_dtype(s.dtype) or pd.api.types.is_datetime64_any_dtype(s):
             num_cols.append(c)
 
+    # --- binning catégoriel (parallélisé)
     cat_results = {}
-    for c in cat_cols:
-        res = maximize_gini_categorical(
-            DF[[c, target]].copy(),
-            c,
-            target,
-            include_missing=include_missing,
-            missing_label=missing_label,
-            max_bins=max_bins_categ,
-            min_bin_size=min_bin_size_categ,
-            min_bin_frac=min_bin_frac_categ,
-        )
-        cat_results[c] = res
+    if cat_cols:
+        if n_jobs_categ != 1 and Parallel is not None:
+            tasks = (
+                delayed(_compute_cat_result)(
+                    DF[[c, target]].copy(), c, target, include_missing, missing_label,
+                    max_bins_categ, min_bin_size_categ, min_bin_frac_categ
+                )
+                for c in cat_cols
+            )
+            out = Parallel(n_jobs=n_jobs_categ, backend="loky", verbose=0)(list(tasks))
+            for c, res in out:
+                cat_results[c] = res
+        else:
+            for c in cat_cols:
+                res = maximize_gini_categorical(
+                    DF[[c, target]].copy(), c, target,
+                    include_missing=include_missing, missing_label=missing_label,
+                    max_bins=max_bins_categ, min_bin_size=min_bin_size_categ, min_bin_frac=min_bin_frac_categ
+                )
+                cat_results[c] = res
 
+    # --- binning numérique (parallélisé)
     num_results = {}
-    for c in num_cols:
-        res = maximize_gini_numeric(
-            DF[[c, target]].copy(),
-            c,
-            target,
-            max_bins=max_bins_num,
-            min_bin_size=min_bin_size_num,
-            min_bin_frac=min_bin_frac_num,
-            n_quantiles=n_quantiles_num,
-            include_missing=include_missing,
-        )
-        num_results[c] = res
+    if num_cols:
+        if n_jobs_num != 1 and Parallel is not None:
+            tasks = (
+                delayed(_compute_num_result)(
+                    DF[[c, target]].copy(), c, target,
+                    max_bins_num, min_bin_size_num, min_bin_frac_num, n_quantiles_num, include_missing
+                )
+                for c in num_cols
+            )
+            out = Parallel(n_jobs=n_jobs_num, backend="loky", verbose=0)(list(tasks))
+            for c, res in out:
+                num_results[c] = res
+        else:
+            for c in num_cols:
+                res = maximize_gini_numeric(
+                    DF[[c, target]].copy(), c, target,
+                    max_bins=max_bins_num, min_bin_size=min_bin_size_num, min_bin_frac=min_bin_frac_num,
+                    n_quantiles=n_quantiles_num, include_missing=include_missing
+                )
+                num_results[c] = res
 
     # Ajoute colonnes __BIN
     enriched = DF.copy()
@@ -481,9 +554,8 @@ def run_binning_maxgini_on_df(
         keep_vars = set(list(cat_results.keys()) + list(num_results.keys()))
     bin_cols = [v + bin_col_suffix for v in keep_vars if v + bin_col_suffix in enriched.columns]
     drop_cols = list(cat_results.keys()) + list(num_results.keys())
-    df_binned = (
-        enriched.drop(columns=drop_cols, errors="ignore").rename(columns={c: c.replace(bin_col_suffix, "") for c in bin_cols})
-    )
+    df_binned = enriched.drop(columns=drop_cols, errors="ignore").copy()
+
 
     learned = LearnedBins(
         target=target,
@@ -495,16 +567,18 @@ def run_binning_maxgini_on_df(
     )
     return learned, enriched, df_binned
 
-
 def transform_with_learned_bins(df, learned: LearnedBins) -> pd.DataFrame:
     DF = deonehot(df, exclude_cols=[learned.target] if learned.target in df.columns else None)
     suffix = learned.bin_col_suffix
-    # applique
+
+    # applique bins catégoriels
     for c, r in learned.cat_results.items():
         if c not in DF.columns:
             continue
         s = DF[c].astype("object").where(DF[c].notna(), learned.missing_label)
         DF[c + suffix] = s.map(r["mapping"]).astype("Int64").fillna(-2).astype("Int64")
+
+    # applique bins numériques
     for c, r in learned.num_results.items():
         if c not in DF.columns:
             continue
@@ -514,12 +588,11 @@ def transform_with_learned_bins(df, learned: LearnedBins) -> pd.DataFrame:
         if learned.include_missing and s.isna().any():
             b = b.where(~s.isna(), -1).astype("Int64")
         DF[c + suffix] = b
-    # sortie modèle: seulement les __BIN renommés en colonnes brutes
+
+    # >>> Nouveau : on sort un DF pour le modèle avec SEULEMENT les colonnes __BIN (et la cible si présente)
     bin_cols = [c for c in DF.columns if c.endswith(suffix)]
-    base = DF.drop(columns=[c[:-len(suffix)] for c in bin_cols if c[:-len(suffix)] in DF.columns], errors="ignore")
-    model_df = base.copy()
-    for c in bin_cols:
-        model_df[c.replace(suffix, "")] = model_df[c]
+    keep = bin_cols + ([learned.target] if learned.target in DF.columns else [])
+    model_df = DF[keep].copy()
     return model_df
 
 
@@ -535,14 +608,11 @@ def _json_default(o):
     if isinstance(o, _np.ndarray):
         return o.tolist()
     if isinstance(o, _pd.Interval):
-        # encode un intervalle comme [left, right]
         try:
             return [float(o.left), float(o.right)]
         except Exception:
             return [o.left, o.right]
-    # fallback: string
     return str(o)
-
 
 def save_bins_json(learned: LearnedBins, path: str):
     d = {
@@ -555,7 +625,6 @@ def save_bins_json(learned: LearnedBins, path: str):
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2, default=_json_default)
-
 
 def load_bins_json(path: str) -> LearnedBins:
     with open(path, "r", encoding="utf-8") as f:

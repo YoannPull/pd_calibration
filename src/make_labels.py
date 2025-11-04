@@ -2,29 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Build default labels (default_{T}m) per quarter, in parallel, with EXPLICIT splits only.
-
-Sorties:
-  data/processed/default_labels/
-    └── window=<T>m/
-        ├── quarter=<YYYYQn>/data.parquet
-        ├── pooled.parquet              # concat des quarters design_explicit
-        ├── oos.parquet                 # concat des quarters oos_explicit
-        ├── _summary.csv
-        ├── _manifest.json
-        └── _splits.json                # copie fidèle des splits explicites (avec liste de validations)
-
-Config (obligatoire) : config.yml
-  data.root, data.quarters[]                    # liste globale de tous les quarters à produire
-  labels.*                                      # règles de labeling
-  output.dir, output.format
-  splits:
-    mode: explicit
-    explicit:
-      design_quarters: [ ... ]                  # pooled
-      oos_quarters:    [ ... ]                  # hold-out final
-      default_val_quarters: ["YYYYQn", ...]     # (optionnel) liste; doit être dans design_quarters
-      # rétrocompat: default_val_quarter: "YYYYQn" (string) -> converti en liste d'un élément
+Build default labels (default_{T}m) per quarter, in parallel.
+- Lit TOUTE la config dans config.yml (data.*, labels.*, output.*, splits.*)
+- Écrit : quarter=YYYYQn/data.{fmt}, pooled.{fmt} (design), oos.{fmt} (hold-out)
+- 'vintage' est calculé selon labels.vintage_basis :
+    * "first_payment_date" (par défaut historique, FPD → Quarter)
+    * "origination_quarter" (RECOMMANDÉ ici : le quarter du fichier source)
 """
 
 from __future__ import annotations
@@ -33,28 +16,26 @@ import json
 import os
 import time
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import yaml
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
+# ------------------------------------------------------------------
+# Import du builder de labels
+# ------------------------------------------------------------------
 from features.labels import build_default_labels
 
 
-# ------------------------- Helpers -------------------------
+# ========================= Helpers I/O ============================
 def qpaths(root: Path, q: str) -> Tuple[Path, Path]:
     d = root / f"historical_data_{q}"
     return d / f"historical_data_{q}.txt", d / f"historical_data_time_{q}.txt"
 
 
-def _infer_vintage(df: pd.DataFrame) -> pd.Series:
-    fpd = df["first_payment_date"]
-    qnum = ((fpd.dt.month - 1) // 3 + 1).astype("int")
-    return fpd.dt.year.astype("string") + "Q" + qnum.astype("string")
-
-
 def _to_parquet_safe(df: pd.DataFrame, path: Path):
+    """Parquet ne supporte pas Period → cast en timestamps fin de mois."""
     path.parent.mkdir(parents=True, exist_ok=True)
     out = df.copy()
     for c in out.columns:
@@ -68,65 +49,106 @@ def _to_csv(df: pd.DataFrame, path: Path):
     df.to_csv(path, index=False)
 
 
-def _save_df(df: pd.DataFrame, path: Path, fmt: str):
+def _save_df(df: pd.DataFrame, path: Path, fmt: str = "parquet"):
     if fmt == "parquet":
         _to_parquet_safe(df, path)
     else:
         _to_csv(df, path)
 
 
-def _concat_parquet(outputs: List[Path], out_path: Path):
+def _concat_parquet(paths: List[Path], out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         import pyarrow.parquet as pq
+        import pyarrow as pa
         writer = None
         schema = None
-        for p in outputs:
+        wrote = False
+        for p in paths:
             if not p.exists():
                 continue
-            table = pq.read_table(p)
+            tbl = pq.read_table(p)
             if writer is None:
-                schema = table.schema
+                schema = tbl.schema
                 writer = pq.ParquetWriter(str(out_path), schema)
             else:
-                if table.schema != schema:
-                    table = table.cast(schema)
-            writer.write_table(table)
+                if tbl.schema != schema:
+                    tbl = tbl.cast(schema)
+            writer.write_table(tbl)
+            wrote = True
         if writer is not None:
             writer.close()
-        else:
+        if not wrote:
             pd.DataFrame().to_parquet(out_path, index=False)
     except Exception:
-        dfs = [pd.read_parquet(p) for p in outputs if p.exists()]
+        # Fallback concat Pandas
+        dfs = [pd.read_parquet(p) for p in paths if p.exists()]
         if dfs:
             pd.concat(dfs, ignore_index=True).to_parquet(out_path, index=False)
         else:
             pd.DataFrame().to_parquet(out_path, index=False)
 
 
-def _concat_csv(outputs: List[Path], out_path: Path):
+def _concat_csv(paths: List[Path], out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    wrote = False
+    wrote_header = False
     with open(out_path, "w", newline="") as fout:
-        for p in outputs:
+        for p in paths:
             if not p.exists():
                 continue
             with open(p, "r") as fin:
-                if wrote:
-                    next(fin, None)
+                if wrote_header:
+                    next(fin, None)  # skip header
                 for line in fin:
                     fout.write(line)
-            wrote = True
+            wrote_header = True
 
 
-def concat_outputs(outputs: List[Path], out_path: Path, fmt: str):
+def concat_outputs(paths: List[Path], out_path: Path, fmt: str):
     if fmt == "parquet":
-        _concat_parquet(outputs, out_path)
+        _concat_parquet(paths, out_path)
     else:
-        _concat_csv(outputs, out_path)
+        _concat_csv(paths, out_path)
 
 
-# ------------------------- Worker -------------------------
+# ===================== Vintage computation =======================
+def _infer_vintage_fpd(df: pd.DataFrame) -> pd.Series:
+    """
+    Vintage basé sur first_payment_date (FPD).
+    """
+    fpd = df["first_payment_date"]
+    qnum = ((fpd.dt.month - 1) // 3 + 1).astype("int")
+    return fpd.dt.year.astype("string") + "Q" + qnum.astype("string")
+
+
+def _infer_vintage_orig(df: pd.DataFrame) -> pd.Series:
+    """
+    Vintage = quarter d'ORIGINATION. On utilise la colonne __file_quarter,
+    ajoutée par le worker en fonction du dossier source.
+    """
+    if "__file_quarter" not in df.columns:
+        # Safety net: si absent, tenter origination_date si dispo
+        if "origination_date" in df.columns and pd.api.types.is_datetime64_any_dtype(df["origination_date"]):
+            od = df["origination_date"]
+            qnum = ((od.dt.month - 1) // 3 + 1).astype("int")
+            return od.dt.year.astype("string") + "Q" + qnum.astype("string")
+        # Sinon, fallback FPD
+        return _infer_vintage_fpd(df)
+    return df["__file_quarter"].astype("string")
+
+
+def compute_vintage(df: pd.DataFrame, basis: str) -> pd.Series:
+    basis = (basis or "first_payment_date").lower().strip()
+    if basis in ("first_payment_date", "fpd"):
+        return _infer_vintage_fpd(df)
+    elif basis in ("origination_quarter", "orig", "origination"):
+        return _infer_vintage_orig(df)
+    else:
+        # fallback sûr
+        return _infer_vintage_fpd(df)
+
+
+# ========================= Worker ================================
 def quarter_worker(
     q: str,
     root: str,
@@ -137,7 +159,11 @@ def quarter_worker(
     liquidation_codes: Tuple[str, ...],
     include_ra: bool,
     require_full_window: bool,
+    vintage_basis: str,
 ) -> Dict[str, Any]:
+    """
+    Calcule les labels pour un quarter, sauvegarde le fichier, et renvoie un récap.
+    """
     try:
         root_p = Path(root)
         window_dir_p = Path(window_dir)
@@ -154,9 +180,14 @@ def quarter_worker(
             include_ra=include_ra,
             require_full_window=require_full_window,
         )
-        df["vintage"] = _infer_vintage(df)
 
-        q_dir = Path(window_dir) / f"quarter={q}"
+        # Trace du quarter source pour retrouver "vintage=origination_quarter"
+        df["__file_quarter"] = q
+
+        # Vintage selon la base demandée
+        df["vintage"] = compute_vintage(df, vintage_basis)
+
+        q_dir = window_dir_p / f"quarter={q}"
         out_path = q_dir / f"data.{fmt}"
         _save_df(df, out_path, fmt)
 
@@ -166,162 +197,173 @@ def quarter_worker(
             "ok": True,
             "path": str(out_path),
             "n_rows": int(len(df)),
-            "n_unique_loans": int(df["loan_sequence_number"].nunique()),
+            "n_unique_loans": int(df["loan_sequence_number"].nunique()) if "loan_sequence_number" in df.columns else None,
             "default_rate": float(df[lbl_col].mean()) if lbl_col in df.columns and len(df) > 0 else None,
         }
     except Exception as e:
         return {"quarter": q, "ok": False, "error": repr(e)}
 
 
-# ------------------------- CLI -------------------------
+# ========================= CLI / MAIN ============================
 def parse_args():
-    p = argparse.ArgumentParser(description="Build labels per quarter with explicit splits (supports multiple validation quarters).")
-    p.add_argument("--config", default="config.yml", help="YAML with data.*, labels.*, output.*, splits.explicit.*")
-    p.add_argument("--workers", type=int, default=None, help="Number of parallel workers (default: CPU count)")
+    p = argparse.ArgumentParser(description="Build default labels per quarter (parallel), splits via YAML.")
+    p.add_argument("--config", default="config.yml", help="Chemin du YAML (data.*, labels.*, output.*, splits.*)")
+    p.add_argument("--workers", type=int, default=None, help="Nombre de workers (défaut = CPU-1)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    cfg = yaml.safe_load(open(args.config))
+    cfg = yaml.safe_load(open(args.config, "r"))
 
-    # ---- Mandatory sections
-    if cfg.get("splits", {}).get("mode", "") != "explicit":
-        raise SystemExit("[ERR] config.splits.mode must be 'explicit' (no legacy/boundary mode).")
-    explicit = cfg["splits"].get("explicit") or {}
-    design_quarters = list(explicit.get("design_quarters", []))
-    oos_quarters = list(explicit.get("oos_quarters", []))
+    # ------------- Lecture config -------------
+    data_cfg = cfg.get("data", {})
+    labels_cfg = cfg.get("labels", {})
+    output_cfg = cfg.get("output", {})
+    splits_cfg = cfg.get("splits", {})
 
-    # Accept single string OR list for default validation
-    dvq_single = explicit.get("default_val_quarter")
-    dvq_list = explicit.get("default_val_quarters")
-    if dvq_list is not None and not isinstance(dvq_list, list):
-        raise SystemExit("[ERR] splits.explicit.default_val_quarters must be a list if provided.")
-    if dvq_list is None and dvq_single:
-        default_val_quarters: List[str] = [dvq_single]
-    else:
-        default_val_quarters = list(dvq_list or [])
+    root = Path(data_cfg["root"])
+    quarters_all: List[str] = list(data_cfg.get("quarters", []))
 
-    # ---- Data / output / labels
-    root = Path(cfg["data"]["root"])
-    all_quarters: List[str] = list(cfg["data"].get("quarters", []))
-    if not all_quarters:
-        raise SystemExit("[ERR] data.quarters must list ALL quarters to build (explicit mode).")
+    window_months = int(labels_cfg.get("window_months", 24))
+    delinquency_threshold = int(labels_cfg.get("delinquency_threshold", 3))
+    liquidation_codes = tuple(labels_cfg.get("liquidation_codes", ["02", "03", "09"]))
+    include_ra = bool(labels_cfg.get("include_ra", True))
+    require_full_window = bool(labels_cfg.get("require_full_window", False))
+    vintage_basis = str(labels_cfg.get("vintage_basis", "origination_quarter"))
 
-    out_dir = Path(cfg.get("output", {}).get("dir", "data/processed/default_labels"))
+    out_dir = Path(output_cfg.get("dir", "data/processed/default_labels"))
+    out_fmt = str(output_cfg.get("format", "parquet")).lower()
     out_dir.mkdir(parents=True, exist_ok=True)
-    fmt = (cfg.get("output", {}).get("format", "parquet")).lower()
-    if fmt not in ("parquet", "csv"):
-        raise SystemExit("[ERR] output.format must be 'parquet' or 'csv'.")
 
-    label_cfg = cfg["labels"]
-    window_months = int(label_cfg["window_months"])
-    delinquency_threshold = int(label_cfg.get("delinquency_threshold", 3))
-    liquidation_codes = tuple(label_cfg.get("liquidation_codes", ["02", "03", "09"]))
-    include_ra = bool(label_cfg.get("include_ra", True))
-    require_full_window = bool(label_cfg.get("require_full_window", False))
+    mode = (splits_cfg.get("mode", "explicit") or "explicit").lower()
+    explicit_cfg = splits_cfg.get("explicit", {}) if mode == "explicit" else {}
+
+    design_quarters: List[str] = list(explicit_cfg.get("design_quarters", []))
+    default_val_quarters: List[str] = list(explicit_cfg.get("default_val_quarters", []))
+    # rétrocompat single string
+    if not default_val_quarters and explicit_cfg.get("default_val_quarter"):
+        default_val_quarters = [explicit_cfg["default_val_quarter"]]
+    oos_quarters: List[str] = list(explicit_cfg.get("oos_quarters", []))
+
+    # ------------- Sanity checks -------------
+    def _warn(msg: str):
+        print(f"[WARN] {msg}")
+
+    # Construire la liste des quarters à produire = union(design, oos) ∩ quarters_all (si listée)
+    requested = sorted(set(design_quarters) | set(oos_quarters))
+    if quarters_all:
+        missing = [q for q in requested if q not in quarters_all]
+        if missing:
+            _warn(f"Les quarters {missing} sont demandés par splits.explicit mais absents de data.quarters.")
+        quarters_to_build = [q for q in requested if q in (quarters_all or requested)]
+    else:
+        quarters_to_build = requested
+
+    # Vérifs d’inclusion
+    if any(q not in design_quarters for q in default_val_quarters):
+        diff = [q for q in default_val_quarters if q not in design_quarters]
+        _warn(f"default_val_quarters contient des quarters hors design_quarters: {diff}")
+    # Rappel utile
+    if not design_quarters:
+        _warn("design_quarters est vide → pooled sera vide.")
+    if not oos_quarters:
+        print("[INFO] Aucun oos_quarters renseigné (oos.{fmt} sera vide).")
 
     window_dir = out_dir / f"window={window_months}m"
     window_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Validate explicit splits against all_quarters
-    missing_d = [q for q in design_quarters if q not in all_quarters]
-    missing_o = [q for q in oos_quarters if q not in all_quarters]
-    if missing_d or missing_o:
-        raise SystemExit(f"[ERR] splits.explicit contains quarters not in data.quarters. "
-                         f"missing_in_all (design={missing_d}, oos={missing_o})")
-
-    inter = set(design_quarters).intersection(oos_quarters)
-    if inter:
-        raise SystemExit(f"[ERR] A quarter cannot be in both design and oos: {sorted(inter)}")
-
-    # default_val_quarters ⊆ design_quarters
-    invalid_val = [q for q in default_val_quarters if q not in design_quarters]
-    if invalid_val:
-        raise SystemExit(f"[ERR] default_val_quarters must be subset of design_quarters. Offenders: {invalid_val}")
-
-    # ---- Produce all quarters requested (build once)
-    workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
-    print(f"→ Building {len(all_quarters)} quarters with {workers} workers...")
-    from functools import partial
-    worker = partial(
-        quarter_worker,
-        root=str(root),
-        window_dir=str(window_dir),
-        fmt=fmt,
-        window_months=window_months,
-        delinquency_threshold=delinquency_threshold,
-        liquidation_codes=liquidation_codes,
-        include_ra=include_ra,
-        require_full_window=require_full_window,
-    )
-
+    # ------------- Build per quarter (parallel) -------------
     t0 = time.time()
     results: List[Dict[str, Any]] = []
     produced_quarters: List[str] = []
 
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(worker, q) for q in all_quarters]
-        for fut in as_completed(futures):
-            r = fut.result()
-            results.append(r)
-            if r.get("ok"):
-                produced_quarters.append(r["quarter"])
-                print(f"✔ {r['quarter']} saved ({r['n_rows']} rows)")
-            else:
-                print(f"[WARN] {r['quarter']} failed: {r.get('error')}")
+    if quarters_to_build:
+        workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
+        print(f"→ Building {len(quarters_to_build)} quarters with {workers} workers...")
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = [
+                ex.submit(
+                    quarter_worker,
+                    q,
+                    str(root),
+                    str(window_dir),
+                    out_fmt,
+                    window_months,
+                    delinquency_threshold,
+                    liquidation_codes,
+                    include_ra,
+                    require_full_window,
+                    vintage_basis,
+                )
+                for q in quarters_to_build
+            ]
+            for fut in as_completed(futs):
+                r = fut.result()
+                results.append(r)
+                if r.get("ok"):
+                    produced_quarters.append(r["quarter"])
+                    print(f"✔ {r['quarter']} saved ({r.get('n_rows','?')} rows)")
+                else:
+                    _warn(f"{r['quarter']} failed: {r.get('error')}")
+    else:
+        raise SystemExit("[ERR] Aucun quarter à produire : vérifiez data.quarters et splits.explicit.*")
 
-    # ---- Summary
+    # ------------- Summary -------------
     lbl_col = f"default_{window_months}m"
-    summary_rows = [{
-        k: r.get(k) for k in ("quarter","n_rows","n_unique_loans","default_rate","ok","path","error")
-    } for r in sorted(results, key=lambda x: x["quarter"])]
+    summary_rows = [
+        {k: r.get(k) for k in ("quarter", "n_rows", "n_unique_loans", "default_rate", "ok", "path", "error")}
+        for r in sorted(results, key=lambda x: x["quarter"])
+    ]
     if summary_rows:
         pd.DataFrame(summary_rows).to_csv(window_dir / "_summary.csv", index=False)
 
-    # ---- Build pooled/oos from EXPLICIT lists (using only produced/ok)
-    ok_map: Dict[str, Path] = {r["quarter"]: Path(r["path"]) for r in results if r.get("ok") and r.get("path")}
-
-    # keep order as in data.quarters
-    design_ordered = [q for q in all_quarters if q in set(design_quarters) and q in ok_map]
-    oos_ordered    = [q for q in all_quarters if q in set(oos_quarters) and q in ok_map]
-
-    if design_ordered:
-        concat_outputs([ok_map[q] for q in design_ordered], window_dir / f"pooled.{fmt}", fmt)
-        print(f"✔ pooled -> {window_dir / f'pooled.{fmt}'}  (quarters: {design_ordered[:3]}{'...' if len(design_ordered)>3 else ''})")
-    else:
-        print("[WARN] No design_quarters produced; pooled not created.")
-
-    if oos_ordered:
-        concat_outputs([ok_map[q] for q in oos_ordered], window_dir / f"oos.{fmt}", fmt)
-        print(f"✔ oos -> {window_dir / f'oos.{fmt}'}  (quarters: {oos_ordered[:3]}{'...' if len(oos_ordered)>3 else ''})")
-    else:
-        print("[INFO] No oos_quarters (empty).")
-
-    # ---- Persist splits definition (for downstream scripts)
-    splits_payload = {
-        "mode": "explicit",
-        "pooled_quarters": design_ordered,
-        "oos_quarters": oos_ordered,
-        "validation_quarters": default_val_quarters,  # toujours une LISTE
+    # ------------- pooled (design) & oos concatenations -------------
+    # Map quarter -> path existant
+    ok_map: Dict[str, Path] = {
+        r["quarter"]: Path(r["path"]) for r in results if r.get("ok") and r.get("path")
     }
-    (window_dir / "_splits.json").write_text(json.dumps(splits_payload, indent=2), encoding="utf-8")
 
-    # ---- Manifest
+    # pooled = concat(design_quarters présents)
+    pooled_list = [q for q in design_quarters if q in ok_map]
+    if pooled_list:
+        concat_outputs([ok_map[q] for q in pooled_list], window_dir / f"pooled.{out_fmt}", out_fmt)
+        print(f"✔ pooled -> {window_dir / f'pooled.{out_fmt}'} "
+              f"(quarters: {pooled_list[:3]}{'...' if len(pooled_list) > 3 else ''})")
+    else:
+        _warn("Aucun quarter pour pooled (design_quarters vide ou non produits).")
+
+    # oos = concat(oos_quarters présents)
+    oos_list = [q for q in oos_quarters if q in ok_map]
+    if oos_list:
+        concat_outputs([ok_map[q] for q in oos_list], window_dir / f"oos.{out_fmt}", out_fmt)
+        print(f"✔ oos -> {window_dir / f'oos.{out_fmt}'} "
+              f"(quarters: {oos_list[:3]}{'...' if len(oos_list) > 3 else ''})")
+    else:
+        print("[INFO] Pas de oos (liste vide ou non produits).")
+
+    # ------------- Manifest -------------
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "run_dir": str(out_dir.resolve()),
         "window_months": window_months,
-        "format": fmt,
-        "quarters_requested": all_quarters,
+        "format": out_fmt,
+        "vintage_basis": vintage_basis,
+        "quarters_requested": quarters_to_build,
         "quarters_produced": produced_quarters,
+        "splits": {
+            "mode": mode,
+            "explicit": {
+                "design_quarters": design_quarters,
+                "default_val_quarters": default_val_quarters,
+                "oos_quarters": oos_quarters,
+            },
+        },
         "elapsed_sec": round(time.time() - t0, 2),
-        "splits_file": str((window_dir / "_splits.json").resolve()),
-        "label_column": lbl_col,
+        "config_snapshot": cfg,
     }
-    (window_dir / "_manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
-
-    print("✓ Done.")
+    (window_dir / "_splits.json").write_text(json.dumps(manifest, indent=2, default=str))
+    print("✔ Manifest written:", window_dir / "_splits.json")
 
 
 if __name__ == "__main__":
