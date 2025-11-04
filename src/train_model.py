@@ -4,7 +4,7 @@
 from __future__ import annotations
 import argparse, json, time, contextlib, sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -244,7 +244,7 @@ def train_from_binned(
     ablation_max_steps: int = 10,
     ablation_max_auc_loss: float = 0.02,
     timer: Optional[Timer] = None
-):
+) -> Dict[str, Any]:
     nullctx = contextlib.nullcontext()
     tctx = (lambda name: timer.section(name)) if timer else (lambda name: nullctx)
 
@@ -322,6 +322,7 @@ def train_from_binned(
         }
 
     dec = pd.DataFrame()
+    p_va = None
 
     if Xva is not None and y_va is not None:
         with tctx("metrics_val"):
@@ -339,7 +340,7 @@ def train_from_binned(
 
     # 6) Ablation gloutonne (PSI(probas) ↓, perte AUC ≤ seuil)
     X_train_curr, X_val_curr = Xtr.copy(), (Xva.copy() if Xva is not None else None)
-    model_curr, p_tr_curr, p_va_curr = model, p_tr, (model.predict_proba(Xva)[:, 1] if Xva is not None else None)
+    model_curr, p_tr_curr, p_va_curr = model, p_tr, (p_va if p_va is not None else None)
     best_auc = float(roc_auc_score(y_va, p_va_curr)) if p_va_curr is not None else np.nan
     best_psi = float(psi(p_tr_curr, p_va_curr)) if p_va_curr is not None else np.nan
     keep_cols = list(X_train_curr.columns)
@@ -368,6 +369,7 @@ def train_from_binned(
                     break
 
     # 7) Prior-shift adjust + metrics adj
+    p_va_adj = None
     if p_va_curr is not None and do_prior_shift_adjust:
         with tctx("prior_shift_adjust"):
             base_train = float(np.mean(y_tr))
@@ -403,7 +405,7 @@ def train_from_binned(
                 .sort_values("std_coef", key=lambda s: s.abs(), ascending=False)
             )
 
-    out = {
+    out: Dict[str, Any] = {
         "model": model_curr,            # calibré après ablation (si faite)
         "best_lr": lr_final,
         "kept_woe": list(X_train_curr.columns),
@@ -411,9 +413,57 @@ def train_from_binned(
         "woe_maps": woe_maps,           # None si WOE déjà fournis
         "metrics": metrics,
         "deciles_val": dec,
-        "importance": imp_df
+        "importance": imp_df,
+        # sorties supplémentaires pour bucketing
+        "p_tr_final": p_tr_curr,
+        "p_va_final": p_va_adj if p_va_adj is not None else p_va_curr,
+        "y_va": y_va,
     }
     return out
+
+# -----------------------------
+# Bucketing helpers (quantiles robustes)
+# -----------------------------
+def safe_quantile_edges(scores: np.ndarray, n: int = 10) -> np.ndarray:
+    """Bornes strictement croissantes dans [0,1] à partir de quantiles."""
+    s = np.asarray(scores, float)
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return np.array([0.0, 1.0], dtype=float)
+    qs = np.linspace(0.0, 1.0, n + 1)
+    edges = np.quantile(s, qs, method="linear")
+    edges[0] = 0.0
+    edges[-1] = 1.0
+    for i in range(1, len(edges)):
+        if not (edges[i] > edges[i-1]):
+            edges[i] = np.nextafter(edges[i-1], 1.0)
+    return edges
+
+def assign_bucket(scores: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Retourne des buckets 1..K-1 en utilisant les bornes `edges`."""
+    inner = edges[1:-1]
+    return (np.digitize(scores, inner, right=False) + 1).astype(int)
+
+def bucket_stats(scores: np.ndarray, y: Optional[np.ndarray], edges: np.ndarray) -> pd.DataFrame:
+    b = assign_bucket(scores, edges)
+    dfb = pd.DataFrame({"bucket": b, "p": scores})
+    if y is not None and len(y) == len(scores):
+        dfb["y"] = y.astype(int)
+        tab = (dfb.groupby("bucket", as_index=True)
+                  .agg(count=("y", "size"),
+                       events=("y", "sum"),
+                       proba_mean=("p", "mean"))
+                  .sort_index())
+        tab["pd"] = tab["events"] / tab["count"].where(tab["count"] > 0, 1)
+    else:
+        tab = (dfb.groupby("bucket", as_index=True)
+                 .agg(count=("p", "size"),
+                      proba_mean=("p", "mean"))
+                 .sort_index())
+        tab["events"] = np.nan
+        tab["pd"] = np.nan
+    tab.reset_index(inplace=True)
+    return tab
 
 # -----------------------------
 # CLI
@@ -438,6 +488,8 @@ def parse_args():
     # timing
     p.add_argument("--timing", action="store_true", help="Sauve timings.json + résumé final en stdout")
     p.add_argument("--timing-live", action="store_true", help="Affiche le timing de chaque section en live")
+    # bucketing
+    p.add_argument("--n-buckets", type=int, default=10, help="Nombre de classes risque (quantiles)")
     return p.parse_args()
 
 def main():
@@ -469,6 +521,34 @@ def main():
             timer=timer
         )
 
+    # ---------------- Buckets (bornes + stats) ----------------
+    with tctx("save_buckets"):
+        # base = probas de validation (après prior-shift si calculé)
+        p_tr_final = np.asarray(out.get("p_tr_final", []), float)
+        p_va_final = out.get("p_va_final", None)
+        y_va = out.get("y_va", None)
+        if p_va_final is None or (isinstance(p_va_final, np.ndarray) and p_va_final.size == 0):
+            # fallback si pas de validation exploitable
+            base_scores = p_tr_final
+        else:
+            base_scores = np.asarray(p_va_final, float)
+
+        edges = safe_quantile_edges(base_scores, n=args.n_buckets)
+        # stats sur validation si y dispo, sinon sur base_scores sans PD
+        stats_df = bucket_stats(
+            scores=(np.asarray(p_va_final, float) if p_va_final is not None else base_scores),
+            y=(np.asarray(y_va, int) if y_va is not None else None),
+            edges=edges
+        )
+        save_json({"edges": edges.tolist()}, artifacts / "risk_buckets.json")
+        save_json({
+            "n_buckets": int(len(edges) - 1),
+            "edges": edges.tolist(),
+            "by_bucket": stats_df.to_dict(orient="records")
+        }, artifacts / "bucket_stats.json")
+        print(f"✔ Buckets sauvés → {artifacts/'risk_buckets.json'}")
+        print(f"✔ Stats buckets → {artifacts/'bucket_stats.json'}")
+
     with tctx("save_artifacts"):
         dump({
             "model": out["model"],
@@ -497,7 +577,8 @@ def main():
             "prior_shift_adjust": bool(not args.no_prior_shift_adjust),
             "ablation_max_steps": int(args.ablation_max_steps),
             "ablation_max_auc_loss": float(args.ablation_max_auc_loss),
-            "metrics": out["metrics"]
+            "metrics": out["metrics"],
+            "n_buckets": int(args.n_buckets)
         }, artifacts / "meta.json")
 
         if isinstance(out["deciles_val"], pd.DataFrame) and not out["deciles_val"].empty:
@@ -521,6 +602,10 @@ def main():
         print("✔ Saved:", artifacts / "deciles_val.csv")
     if (artifacts / "importance.csv").exists():
         print("✔ Saved:", artifacts / "importance.csv")
+    if (artifacts / "risk_buckets.json").exists():
+        print("✔ Saved:", artifacts / "risk_buckets.json")
+    if (artifacts / "bucket_stats.json").exists():
+        print("✔ Saved:", artifacts / "bucket_stats.json")
 
 if __name__ == "__main__":
     main()
