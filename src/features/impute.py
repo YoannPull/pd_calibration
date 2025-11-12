@@ -46,17 +46,15 @@ class DataImputer(BaseEstimator, TransformerMixin):
         if pd.api.types.is_datetime64_any_dtype(s):
             return pd.to_datetime(s, errors="coerce").dt.year.astype("Int16")
 
-        # Catégoric/objet/chaine -> on extrait les 4 premiers chiffres (YYYY)
+        # Catégorique/objet/chaine -> on extrait les 4 premiers chiffres (YYYY)
         ss = s.astype("string").str.strip()
-        # prend la première occurrence de 4 chiffres en début de chaîne
         year_str = ss.str.extract(r"^\s*(\d{4})")[0]
         year = pd.to_numeric(year_str, errors="coerce").astype("Int16")
 
-        # Si tout est NA, rien d'exploitable → désactive la logique "by year"
+        # Si tout est NA, rien d'exploitable -> désactive la logique "by year"
         if year.isna().all():
             return None
         return year
-
 
     def _map_fill(self, keys_tuple_series, mapping):
         """keys_tuple_series = Series of tuples; mapping = dict {tuple: value}"""
@@ -78,7 +76,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
         # STORAGE
         self.stats_ = {}
 
-        # ---- CREDIT SCORE medians
+        # CREDIT SCORE medians
         if 'credit_score' in df.columns:
             cs = pd.to_numeric(df['credit_score'], errors='coerce').clip(300, 850)
             self.stats_['credit_score_global'] = float(cs.median())
@@ -96,7 +94,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                     ).groupby(level=[0, 1], observed=True).median()
                     self.stats_['credit_score_by_year_lp'] = {k: float(v) for k, v in med_y_lp.items()}
 
-        # ---- MI% medians by LTV bins (and year)
+        # MI% medians by LTV bins (and year)
         if 'mi_percent' in df.columns and 'original_ltv' in df.columns:
             mi = pd.to_numeric(df['mi_percent'], errors='coerce')
             ltv = pd.to_numeric(df['original_ltv'], errors='coerce').clip(lower=0)
@@ -109,7 +107,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                 med = pd.Series(mi.values, index=idx).groupby(level=[0, 1], observed=True).median()
                 self.stats_['mi_by_year_bin'] = {k: float(v) for k, v in med.items()}
 
-        # ---- DTI medians
+        # DTI medians
         if 'original_dti' in df.columns:
             dti = pd.to_numeric(df['original_dti'], errors='coerce')
             self.stats_['dti_global'] = float(dti.median())
@@ -125,7 +123,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                     ).groupby(level=[0, 1], observed=True).median()
                     self.stats_['dti_by_year_lp'] = {k: float(v) for k, v in med.items()}
 
-        # ---- CLTV medians by year (fallback global)
+        # CLTV medians by year (fallback global)
         if 'original_cltv' in df.columns:
             cltv = pd.to_numeric(df['original_cltv'], errors='coerce')
             self.stats_['cltv_global'] = float(cltv.median())
@@ -134,12 +132,12 @@ class DataImputer(BaseEstimator, TransformerMixin):
                 med = pd.Series(cltv.values, index=vyear).groupby(level=0).median()
                 self.stats_['cltv_by_year'] = {int(k): float(v) for k, v in med.items() if pd.notna(v)}
 
-        # ---- modes for small ordinal
+        # modes for small ordinal
         for col in ['original_loan_term', 'number_of_borrowers']:
             if col in df.columns:
                 self.stats_[f'{col}_mode'] = self._mode(df[col])
 
-        # ---- Fallbacks génériques appris sur le train
+        # Fallbacks génériques appris sur le train
         num_cols = df.select_dtypes(include='number').columns.tolist()
         self.stats_['global_num_median'] = {
             c: float(pd.to_numeric(df[c], errors='coerce').median()) for c in num_cols
@@ -170,7 +168,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
         # Helpers
         vyear = self._to_year(df['vintage']) if 'vintage' in df.columns else None
 
-        # 1) Catés : Unknown / NotApplicable
+        # 1) Catégorielles : Unknown / NotApplicable
         if 'channel' in df.columns and isinstance(df['channel'].dtype, CategoricalDtype):
             df['channel'] = df['channel'].cat.add_categories(['Unknown']).fillna('Unknown')
 
@@ -266,7 +264,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
             cltv = pd.Series(cltv, index=df.index).fillna(self.stats_.get('cltv_global', float(np.nan)))
             df['original_cltv'] = cltv.astype('Float32')
 
-        # 6) Small ordinal → mode (cast explicite en numérique pour éviter FutureWarning de downcast object)
+        # 6) Small ordinal -> mode (cast explicite en numérique)
         for col in ['original_loan_term', 'number_of_borrowers']:
             if col in df.columns:
                 df[col + '_missing'] = df[col].isna().astype('int8')
@@ -278,9 +276,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                     ser_num = ser_num.fillna(method='ffill').fillna(method='bfill')
                 df[col] = pd.Series(ser_num.round(), index=df.index).astype('Int16')
 
-        # 7) Filet de sécurité générique (pour TOUTES les colonnes restantes)
-        #    - Numériques: médiane globale apprise sur le train
-        #    - Non-numériques: mode global; si pas dispo -> 'Unknown' (sauf datetime qu'on laisse si pas de mode)
+        # 7) Filet de sécurité générique
         num_meds = self.stats_.get('global_num_median', {})
         for c, med in num_meds.items():
             if c in df.columns:
@@ -288,7 +284,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                 if pd.notna(med):
                     df[c] = s.fillna(med)
                 else:
-                    df[c] = s  # colonne peut-être 100% NaN au train
+                    df[c] = s
 
         non_modes = self.stats_.get('global_nonnum_mode', {})
         for c, mode_val in non_modes.items():
@@ -311,7 +307,6 @@ class DataImputer(BaseEstimator, TransformerMixin):
                 cats_dtype = cats.dtype
 
                 if is_integer_dtype(cats_dtype) or is_float_dtype(cats_dtype):
-                    # catégories numériques (y compris extensions Int64/Float64)
                     if pd.isna(mode_val):
                         if len(cats) == 0:
                             continue
@@ -333,19 +328,22 @@ class DataImputer(BaseEstimator, TransformerMixin):
                         cat = cat.cat.add_categories([fill_val])
                     df[c] = cat.fillna(fill_val)
                 else:
-                    # catégories textuelles
                     fill_val = mode_val if pd.notna(mode_val) else 'Unknown'
                     if fill_val not in cats:
                         cat = cat.cat.add_categories([fill_val])
                     df[c] = cat.fillna(fill_val)
                 continue
 
-            # Autres non-numériques (object/string)
+            # Autres non-numériques
             fill_val = mode_val if pd.notna(mode_val) else 'Unknown'
             df[c] = df[c].fillna(fill_val)
 
-        # Added missing flag
+        # Added missing flag or drop all missing flags depending on configuration
         if self.missing_flag:
             df = pd.concat([df, missing0], axis=1)
+        else:
+            drop_cols = [c for c in df.columns if c.endswith('_missing') or c.startswith('was_missing_')]
+            if drop_cols:
+                df.drop(columns=drop_cols, inplace=True, errors='ignore')
 
         return df

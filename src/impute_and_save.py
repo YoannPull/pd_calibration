@@ -46,7 +46,7 @@ def parse_args():
     # Mode basé sur les splits produits par make_labels.py
     p.add_argument(
         "--labels-window-dir",
-        help="Chemin du dossier window=XXm (ex: data/processed/labels/window=24m)"
+        help="Chemin du dossier window=XXm (ex: data/processed/default_labels/window=24m)"
     )
     p.add_argument(
         "--use-splits",
@@ -85,14 +85,12 @@ def concat_parquet(paths: List[Path]) -> pd.DataFrame:
     """Concatène une liste de fichiers parquet (schema-align si nécessaire)."""
     if not paths:
         return pd.DataFrame()
-    # Essaye fast-path parquet -> pandas
     dfs = []
     for p in paths:
         if p.exists():
             dfs.append(pd.read_parquet(p))
     if not dfs:
         return pd.DataFrame()
-    # Align des colonnes
     all_cols = sorted(set().union(*[df.columns for df in dfs]))
     dfs = [df.reindex(columns=all_cols) for df in dfs]
     return pd.concat(dfs, ignore_index=True)
@@ -112,9 +110,7 @@ def save_csv_with_dtypes(df_train_imp: pd.DataFrame, df_val_imp: pd.DataFrame, o
 
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Dtypes de référence (ceux du train)
     dtypes = df_train_imp.dtypes.to_dict()
-
     parse_dates = [c for c, dt in dtypes.items() if str(dt).startswith("datetime64")]
     cat_dtypes = {c: dt for c, dt in dtypes.items() if isinstance(dt, CategoricalDtype)}
     other_dtypes = {
@@ -123,7 +119,6 @@ def save_csv_with_dtypes(df_train_imp: pd.DataFrame, df_val_imp: pd.DataFrame, o
         if c not in parse_dates and c not in cat_dtypes
     }
 
-    # Sauvegarde des schémas
     with open(outdir / "parse_dates.pkl", "wb") as f:
         pickle.dump(parse_dates, f)
     with open(outdir / "cat_dtypes.pkl", "wb") as f:
@@ -131,19 +126,26 @@ def save_csv_with_dtypes(df_train_imp: pd.DataFrame, df_val_imp: pd.DataFrame, o
     with open(outdir / "other_dtypes.pkl", "wb") as f:
         pickle.dump(other_dtypes, f)
 
-    # CSV
     df_train_imp.to_csv(outdir / "train_imputed.csv", index=False)
     df_val_imp.to_csv(outdir / "validation_imputed.csv", index=False)
     print(f"✔ CSV + dtypes picklés écrits dans {outdir}")
 
 
 # ----------------------------- Splits loader -----------------------------
+def _pull(d: dict, key: str, default=None):
+    """Cherche une clé à la racine, sinon dans d['splits'], sinon default."""
+    if key in d:
+        return d[key]
+    s = d.get("splits", {})
+    return s.get(key, default)
+
+
 def resolve_splits(labels_window_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
     Construit (train_df, val_df) à partir de window/_splits.json :
       - train = pooled.parquet
       - validation = concat(quartiers listés) OU oos.parquet selon 'validation_mode'
-    Retourne aussi le dict 'splits' pour log/trace.
+    Supporte les manifests où les clés sont à la racine OU sous "splits".
     """
     splits_path = labels_window_dir / "_splits.json"
     pooled_path = labels_window_dir / "pooled.parquet"
@@ -152,47 +154,68 @@ def resolve_splits(labels_window_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame,
     if not splits_path.exists():
         raise SystemExit(f"[ERR] Splits file not found: {splits_path}")
 
-    splits = json.loads(splits_path.read_text(encoding="utf-8"))
+    manifest = json.loads(splits_path.read_text(encoding="utf-8"))
 
     # Train
     if not pooled_path.exists():
         raise SystemExit(f"[ERR] Train 'pooled.parquet' not found at {pooled_path}")
     df_train = load_any(pooled_path)
 
-    # Validation
-    mode = splits.get("validation_mode", "quarters")  # "quarters" | "oos"
+    # Récupération robuste des infos de validation
+    mode = (_pull(manifest, "validation_mode", None) or "quarters").lower()
+
+    # 1) validation_quarters normalisés
+    val_quarters = _pull(manifest, "validation_quarters", [])
+    # 2) rétro-compat via splits.explicit
+    explicit = _pull(manifest, "explicit", {}) or {}
+    if not val_quarters:
+        val_quarters = list(explicit.get("validation_quarters", []))
+    if not val_quarters:
+        val_quarters = list(explicit.get("default_val_quarters", []))
+    if not val_quarters and explicit.get("default_val_quarter"):
+        val_quarters = [explicit["default_val_quarter"]]
+
+    # 3) oos_quarters
+    oos_quarters = _pull(manifest, "oos_quarters", [])
+    if not oos_quarters:
+        oos_quarters = list(explicit.get("oos_quarters", []))
+
+    # Si mode=quarters mais aucune liste fournie, on bascule intelligemment
+    if mode == "quarters" and not val_quarters:
+        if oos_path.exists() and oos_quarters:
+            print("[WARN] Pas de validation_quarters trouvés → fallback sur OOS.")
+            mode = "oos"
+        else:
+            raise SystemExit("[ERR] No 'validation_quarters' found and no oos fallback available.")
+
+    # Build validation
     if mode == "oos":
-        # tout l'oos en bloc
         if not oos_path.exists():
             raise SystemExit(f"[ERR] Validation 'oos.parquet' not found at {oos_path}")
         df_val = load_any(oos_path)
-        used_quarters = splits.get("oos_quarters", [])
+        used_quarters = oos_quarters
     else:
-        # concat des quarters listés
-        val_quarters = splits.get("validation_quarters", [])
-        if not val_quarters:
-            # fallback raisonnable : si rien, mais oos est dispo, on l'utilise
-            if oos_path.exists():
-                df_val = load_any(oos_path)
-                used_quarters = splits.get("oos_quarters", [])
-            else:
-                # ou bien on échoue explicitement
-                raise SystemExit("[ERR] No 'validation_quarters' in _splits.json and no oos.parquet found.")
-        else:
-            files = [labels_window_dir / f"quarter={q}" / "data.parquet" for q in val_quarters]
-            missing = [str(p) for p in files if not p.exists()]
-            if missing:
-                raise SystemExit(f"[ERR] Missing validation quarter files:\n  " + "\n  ".join(missing))
-            df_val = concat_parquet(files)
-            used_quarters = val_quarters
+        files = [labels_window_dir / f"quarter={q}" / "data.parquet" for q in val_quarters]
+        missing = [str(p) for p in files if not p.exists()]
+        if missing:
+            raise SystemExit(f"[ERR] Missing validation quarter files:\n  " + "\n  ".join(missing))
+        df_val = concat_parquet(files)
+        used_quarters = val_quarters
 
-    # Sanity: conserver même colonnes si possible (l’imputer gérera sinon)
+    # Align colonnes
     all_cols = sorted(set(df_train.columns).union(df_val.columns))
     df_train = df_train.reindex(columns=all_cols)
     df_val = df_val.reindex(columns=all_cols)
 
-    # Enrichir splits pour la méta
-    splits["_resolved"] = {
+    # Logs utiles
+    print(f"[SPLITS] mode: {mode}")
+    if mode == "quarters":
+        print(f"[SPLITS] validation_quarters: {used_quarters}")
+    else:
+        print(f"[SPLITS] oos_quarters: {used_quarters}")
+
+    # Méta enrichie
+    meta = {
         "train_file": str(pooled_path),
         "validation_mode": mode,
         "validation_used_quarters": used_quarters,
@@ -201,7 +224,9 @@ def resolve_splits(labels_window_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame,
             if mode != "oos" else [str(oos_path)]
         )
     }
-    return df_train, df_val, splits
+    # Conserver le manifest brut pour traçabilité
+    manifest["_resolved"] = meta
+    return df_train, df_val, manifest
 
 
 # ----------------------------- Main -----------------------------
@@ -225,7 +250,6 @@ def main():
             raise SystemExit(f"[ERR] labels_window_dir introuvable : {labels_dir}")
         df_train, df_val, splits_meta = resolve_splits(labels_dir)
     else:
-        # Rétro-compat : chemins explicites
         if not args.train_csv or not args.validation_csv:
             raise SystemExit("[ERR] Fournir --train-csv et --validation-csv, ou utiliser --use-splits avec --labels-window-dir")
         df_train = load_any(args.train_csv)
@@ -252,7 +276,7 @@ def main():
     if y_val is not None:
         df_val_imp[args.target] = y_val.values
 
-    # Optionnel : garde-fou qualité (échoue si des NaN restent)
+    # Optionnel : garde-fou qualité
     if args.fail_on_nan:
         bad_train = df_train_imp.columns[df_train_imp.isna().any()].tolist()
         bad_val = df_val_imp.columns[df_val_imp.isna().any()].tolist()

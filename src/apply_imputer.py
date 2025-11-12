@@ -91,10 +91,8 @@ def align_to_meta(df: pd.DataFrame, meta_path: Path, drop_extras: bool) -> pd.Da
     if not feats:
         return df
     cols = list(df.columns)
-    # Drop extras not in feats
     if drop_extras:
         cols = [c for c in cols if c in feats]
-    # Reorder: keep feats first (in order), then any remaining columns
     remaining = [c for c in cols if c not in feats]
     ordered = [c for c in feats if c in cols] + remaining
     return df[ordered]
@@ -142,7 +140,6 @@ def main():
     for d in args.data:
         inputs.append(Path(d))
     if args.glob:
-        # NB: Path().glob doesn't expand ~; the shell does. Keep as-is.
         for p in sorted(Path().glob(args.glob)):
             if p.is_file():
                 inputs.append(p)
@@ -165,7 +162,6 @@ def main():
                   drop_extras=args.drop_extras, drop_flags=args.drop_missing_flags)
         return
 
-    # Batch mode
     if args.out_dir is None:
         raise SystemExit("Multiple inputs detected: please provide --out-dir.")
     out_dir = Path(args.out_dir)

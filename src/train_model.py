@@ -207,7 +207,7 @@ def apply_woe_with_maps(
     return pd.concat([s for _, s in cols], axis=1)
 
 # -----------------------------
-# Feature selection
+# Sélection par anti-colinéarité
 # -----------------------------
 def select_woe_columns(X_woe: pd.DataFrame, order_hint: List[str], corr_thr: float = 0.85) -> List[str]:
     cols = [c for c in order_hint if c in X_woe.columns] or list(X_woe.columns)
@@ -248,11 +248,12 @@ def train_from_binned(
     nullctx = contextlib.nullcontext()
     tctx = (lambda name: timer.section(name)) if timer else (lambda name: nullctx)
 
-    # 1) WOE existants ?
+    # 1) Y
     with tctx("prep_y"):
         y_tr = df_tr[target].astype(int).values
         y_va = df_va[target].astype(int).values if target in df_va.columns else None
 
+    # 2) WOE existants ?
     with tctx("detect_woe"):
         woe_cols = [c for c in df_tr.columns if any(c.startswith(p) for p in use_existing_woe_prefixes if p)]
         woe_cols += [c for c in df_tr.columns if c.endswith("_WOE")]
@@ -262,9 +263,9 @@ def train_from_binned(
     woe_maps = None
 
     if not woe_cols:
-        # 2) Sinon BIN -> WOE
+        # Sinon BIN -> WOE
         with tctx("detect_bin_cols"):
-            bin_cols = find_bin_columns(df_tr, bin_suffix)
+            bin_cols = [c for c in df_tr.columns if c.endswith(bin_suffix) or c.startswith(bin_suffix)]
         if not bin_cols:
             raise SystemExit("Aucune colonne WOE ni BIN détectée. Données attendues (__BIN ou préfixe) ou WOE.")
         with tctx("woe_build"):
@@ -352,7 +353,7 @@ def train_from_binned(
                 cand = psi_feat_now.index[0]
                 Xtr_try = X_train_curr.drop(columns=[cand])
                 Xva_try = X_val_curr.drop(columns=[cand], errors="ignore")
-                gs2 = GridSearchCV(base_lr, grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True).fit(Xtr_try, y_tr)
+                gs2 = GridSearchCV(best_lr, {**grid}, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True).fit(Xtr_try, y_tr)
                 lr2 = gs2.best_estimator_
                 cal2 = CalibratedClassifierCV(lr2, method=("isotonic" if isotonic else "sigmoid"), cv=cv).fit(Xtr_try, y_tr)
                 p_tr2 = cal2.predict_proba(Xtr_try)[:, 1]

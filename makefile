@@ -79,7 +79,7 @@ MAX_BINS_NUM           ?= 6
 MIN_BIN_SIZE_NUM       ?= 200
 N_QUANTILES_NUM        ?= 50
 MIN_GINI_KEEP          ?=
-BIN_DROP_MISSING_FLAGS ?= 0
+BIN_DROP_MISSING_FLAGS ?= 1   # <— robuste : ne repose pas sur flags manquants
 BIN_NO_DENYLIST        ?= 0
 N_JOBS_CATEG           ?= -1
 N_JOBS_NUM             ?= -1
@@ -165,9 +165,9 @@ ABLATION_MAX_AUC_LOSS_OPT:= $(if $(ABLATION_MAX_AUC_LOSS),--ablation-max-auc-los
 MODEL_TIMING_OPT         := $(if $(filter $(MODEL_TIMING),1),--timing,)
 MODEL_TIMING_LIVE_OPT    := $(if $(filter $(MODEL_TIMING_LIVE),1),--timing-live,)
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # HELP
-# ----------------------------------------------------------------------------
+# ============================================================================
 ## help : affiche cette aide
 .PHONY: help
 help:
@@ -175,7 +175,8 @@ help:
 	@printf "\n\033[1mExemples\033[0m\n"
 	@echo "  make labels LABELS_WORKERS=6"
 	@echo "  make impute                                  # utilise window/_splits.json"
-	@echo "  make impute IMPUTE_FROM_SPLITS=0 VAL_QUARTER=2023Q2   # rétro"
+	@echo "  make impute_from_splits                      # utilise _splits.json (validation_quarters)"
+	@echo "  make impute_val VAL_QUARTER=2024Q3           # mode rétro: validation=quarter explicite"
 	@echo "  make binning_fit BIN_INCLUDE_MISSING=1 MAX_BINS_NUM=8 N_QUANTILES_NUM=80 N_JOBS_CATEG=-1 N_JOBS_NUM=-1"
 	@echo "  make binning_fit BIN_DROP_MISSING_FLAGS=1"
 	@echo "  make binning_fit BIN_NO_DENYLIST=1   # pour désactiver la denylist stricte"
@@ -214,7 +215,9 @@ endif
 IMPUTE_TARGET_COL   ?= default_$(LABELS_WINDOW)m
 IMPUTE_FORMAT       ?= parquet
 IMPUTE_COHORT       ?= 1
-IMPUTE_MISSING_FLAG ?= 1
+
+# Par défaut: pas de flags was_missing_* en imputation
+IMPUTE_MISSING_FLAG ?= 0
 
 IMPUTE_COHORT_OPT  := $(if $(filter $(IMPUTE_COHORT),1),--use-cohort,)
 IMPUTE_MISSING_OPT := $(if $(filter $(IMPUTE_MISSING_FLAG),1),--missing-flag,)
@@ -253,6 +256,17 @@ else
 		--format $(IMPUTE_FORMAT) \
 		$(IMPUTE_COHORT_OPT) $(IMPUTE_MISSING_OPT)
 endif
+
+# Raccourcis pratiques
+## impute_from_splits : imputation en lisant window/_splits.json (validation_quarters)
+.PHONY: impute_from_splits
+impute_from_splits:
+	$(MAKE) impute IMPUTE_FROM_SPLITS=1
+
+## impute_val : imputation rétro avec un quarter explicite (ex: VAL_QUARTER=2024Q3)
+.PHONY: impute_val
+impute_val:
+	$(MAKE) impute IMPUTE_FROM_SPLITS=0 IMPUTE_VAL_SOURCE=quarter VAL_QUARTER=$(VAL_QUARTER)
 
 # ============================================================================
 # 3) BINNING (fit/apply) – max |Gini|
@@ -296,7 +310,8 @@ binning_apply:
 	$(BINNING_APPLY_CMD) \
 		--data $(BINNING_APPLY_DATA) \
 		--bins $(BINNING_MODEL) \
-		--out $(BINNING_APPLY_OUT)
+		--out $(BINNING_APPLY_OUT) \
+		--bin-col-suffix "$(BIN_COL_SUFFIX)"
 
 ## binning : enchaîne impute puis binning_fit
 .PHONY: binning
@@ -334,7 +349,7 @@ model_train:
 		$(MODEL_TIMING_LIVE_OPT)
 	@mkdir -p "$(REPORTS_BASE_DIR)/model"
 	@if [ -f "$(MODEL_ARTIFACTS_DIR)/reports.csv" ]; then cp "$(MODEL_ARTIFACTS_DIR)/reports.csv" "$(REPORTS_BASE_DIR)/model/reports.csv"; fi
-	@if [ -f "$(MODEL_ARTIFACTS_DIR)/importance.csv" ]; then cp "$(MODEL_ARTIFACTS_DIR)/importance.csv" "$(REPORTS_BASE_DIR)/model/importance.csv"; fi
+	@if [ -f "$(MODEL_ARTIFACTS_DIR)/importance.csv" ]; then cp "$(MODEL_ARTIFACTS_DIR)/model/importance.csv" "$(REPORTS_BASE_DIR)/model/importance.csv"; fi || true
 
 MODEL_APPLY_DATA ?= $(BINNING_OUT_DIR)/test.parquet
 MODEL_PATH       ?= $(MODEL_ARTIFACTS_DIR)/model_best.joblib
@@ -346,7 +361,8 @@ model_apply:
 	$(MODEL_APPLY_CMD) \
 		--data $(MODEL_APPLY_DATA) \
 		--model $(MODEL_PATH) \
-		--out $(MODEL_OUT)
+		--out $(MODEL_OUT) \
+		--bin-suffix "$(BIN_SUFFIX)"
 
 ## model_apply_segment : applique le modèle + segmentation (si supporté)
 .PHONY: model_apply_segment
@@ -356,7 +372,8 @@ model_apply_segment:
 		--model $(MODEL_PATH) \
 		--out $(MODEL_OUT) \
 		--buckets $(BUCKETS_PATH) \
-		--bucket-col $(SEGMENT_COL)
+		--bucket-col $(SEGMENT_COL) \
+		--bin-suffix "$(BIN_SUFFIX)"
 
 # ============================================================================
 # 5) RESULTS (rapport vintage × grade)
@@ -406,8 +423,10 @@ IMPUTER_META ?= $(IMPUTE_ARTIFACTS_DIR)/imputer_meta.json
 BINS_JSON    ?= $(BINNING_ARTIFACTS_DIR)/bins.json
 MODEL_PATH   ?= $(MODEL_ARTIFACTS_DIR)/model_best.joblib
 
-# Option OOS : drop des flags de manquants à l'imputation (désactivé par défaut, pour rester aligné training)
-OOS_IMPUTE_DROP_FLAGS ?= 0
+# OOS: par défaut on NE drop PAS les extras (pour ne rien perdre) ; on droppe les flags NA si présents
+OOS_IMPUTE_DROP_EXTRAS ?= 0
+OOS_IMPUTE_DROP_FLAGS  ?= 1
+
 OOS_IMPUTE_DROP_FLAGS_OPT := $(if $(filter $(OOS_IMPUTE_DROP_FLAGS),1),--drop-missing-flags,)
 
 ## check_trained : vérifie que le modèle et ses artefacts existent
@@ -428,18 +447,19 @@ oos_score: check_trained
 		--data $(OOS_LABELS_PARQUET) \
 		--out $(OOS_IMPUTED) \
 		--meta $(IMPUTER_META) \
-		--drop-extras \
 		$(OOS_IMPUTE_DROP_FLAGS_OPT)
 	$(PY) src/apply_binning.py \
 		--data $(OOS_IMPUTED) \
 		--bins $(BINS_JSON) \
-		--out $(OOS_BINNED)
+		--out $(OOS_BINNED) \
+		--bin-col-suffix "$(BIN_COL_SUFFIX)"
 	$(MODEL_APPLY_CMD) \
 		--data $(OOS_BINNED) \
 		--model $(MODEL_PATH) \
 		--out $(OOS_SCORED) \
 		--buckets $(BUCKETS_PATH) \
 		--bucket-col $(SEGMENT_COL) \
+		--bin-suffix "$(BIN_SUFFIX)" \
 		$(if $(OOS_METRICS_OUT),--metrics-out $(OOS_METRICS_OUT),)
 	@echo "✔ OOS scored → $(OOS_SCORED)"
 	@echo "  (metrics: $(OOS_METRICS_OUT))"

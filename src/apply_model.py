@@ -6,10 +6,10 @@ Apply a persisted model (joblib) to a new dataset and optionally:
 - append risk class (bucket) using precomputed score edges,
 - compute and save OOS performance metrics when the target is present.
 
-This version is robust to two training setups:
+Robust to two training setups:
   A) Model trained on existing WOE columns (e.g., prefix 'woe__' or suffix '_WOE')
-  B) Model trained after computing WOE from BIN columns (__BIN). In that case,
-     we rely on 'woe_maps' and 'kept_woe' stored in the joblib bundle.
+  B) Model trained after computing WOE from BIN columns (__BIN), in which case
+     we rebuild WOE using 'woe_maps' + 'kept_woe' saved in the bundle.
 
 Outputs:
   - Scored file with 'proba' (+ optional bucket col)
@@ -19,7 +19,7 @@ Outputs:
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -47,12 +47,12 @@ def save_any(df: pd.DataFrame, path: str):
 def save_json(obj: Dict[str, Any], path: str):
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, indent=2, default=float))
+    p.write_text(json.dumps(obj, indent=2, default=float), encoding="utf-8")
 
 
 # ---------------- Bucketing ----------------
 def load_buckets(path: str) -> np.ndarray:
-    spec = json.loads(Path(path).read_text())
+    spec = json.loads(Path(path).read_text(encoding="utf-8"))
     if "edges" not in spec:
         raise ValueError(f"Bucket file '{path}' must contain an 'edges' array.")
     edges = np.asarray(spec["edges"], dtype=float)
@@ -120,14 +120,15 @@ def apply_woe_with_maps_for_scoring(
     cols: List[pd.Series] = []
     names: List[str] = []
     for raw in kept_vars_raw:
-        if raw not in woe_maps:
+        wm = woe_maps.get(raw)
+        if not isinstance(wm, dict):
             continue
         bcol = resolve_bin_col(df_any, raw, bin_tag)
-        if bcol is None or bcol not in df_any.columns:
+        if bcol is None:
             continue
-        ser = df_any[bcol].astype("Int64")  # bin index
-        wmap = woe_maps[raw]["map"]           # dict {bin_idx -> woe}
-        wdef = float(woe_maps[raw]["default"])
+        ser = df_any[bcol].astype("Int64")
+        wmap = wm.get("map", {})
+        wdef = float(wm.get("default", 0.0))
         w = ser.map(wmap).astype(float).fillna(wdef)
         cols.append(w)
         names.append(f"{raw}_WOE")
@@ -138,10 +139,24 @@ def apply_woe_with_maps_for_scoring(
     return out
 
 
+# ---------------- Predict proba with fallbacks ----------------
+def predict_proba_safe(model, X: pd.DataFrame) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        p = model.predict_proba(X)
+        if isinstance(p, np.ndarray) and p.ndim == 2 and p.shape[1] == 2:
+            return p[:, 1]
+        if isinstance(p, np.ndarray) and p.ndim == 1:
+            return p
+    if hasattr(model, "decision_function"):
+        z = model.decision_function(X)
+        return 1 / (1 + np.exp(-z))
+    raise SystemExit("The loaded model has neither predict_proba nor decision_function.")
+
+
 # ---------------- CLI ----------------
 def parse_args():
     p = argparse.ArgumentParser(description="Apply a saved model to a new dataset (with optional bucketing + OOS metrics)")
-    p.add_argument("--data", required=True, help="CSV/Parquet with same features used in training or the BIN columns used to derive WOE")
+    p.add_argument("--data", required=True, help="CSV/Parquet with same features used in training OR the BIN columns used to derive WOE")
     p.add_argument("--model", required=True, help="Path to artifacts/model_best.joblib")
     p.add_argument("--out", required=True, help="Output path (CSV/Parquet)")
     # segmentation
@@ -158,52 +173,76 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Load model bundle
-    bundle = load(args.model)
-    model = bundle["model"]
+    # Load model bundle (dict expected; accept raw estimator as fallback)
+    raw_bundle = load(args.model)
+    if isinstance(raw_bundle, dict):
+        bundle = raw_bundle
+        model = bundle.get("model", None)
+        if model is None:
+            raise SystemExit("Model bundle dict must contain key 'model'.")
+        target_col: Optional[str] = bundle.get("target", None)
+        kept_woe: Optional[List[str]] = bundle.get("kept_woe", None)  # final features used by the model
+        features: Optional[List[str]] = bundle.get("features", None) or kept_woe
+        computed_woe: bool = bool(bundle.get("computed_woe", False))
+        woe_maps: Optional[Dict[str, Dict]] = bundle.get("woe_maps", None)
+    else:
+        model = raw_bundle
+        target_col = None
+        features = getattr(model, "feature_names_in_", None)
+        kept_woe = None
+        computed_woe = False
+        woe_maps = None
 
-    # Training metadata saved by train_model.py
-    target_col: Optional[str] = bundle.get("target", None)
-    kept_woe: Optional[List[str]] = bundle.get("kept_woe", None)  # list of feature names actually used by the model
-    computed_woe: bool = bool(bundle.get("computed_woe", False))  # True if WOE were computed from BIN at training
-    woe_maps: Optional[Dict[str, Dict]] = bundle.get("woe_maps", None)
-
-    # Backward-compat: allow an explicit "features" field if present
-    features: Optional[List[str]] = bundle.get("features", None)
-    if features is None:
-        features = kept_woe
-
-    if not features:
-        raise SystemExit("Model bundle does not contain 'features' or 'kept_woe' — cannot determine input columns.")
+    if features is None or len(features) == 0:
+        raise SystemExit("Cannot determine feature list from bundle (missing 'features'/'kept_woe' and model has no 'feature_names_in_').")
 
     # Load data
     df_raw = load_any(args.data)
 
-    # Prepare feature matrix:
-    #  - if model expects WOE and we TRAINED with computed_woe=True, rebuild WOE from BIN using woe_maps
-    #  - else, assume features are already present in df_raw
+    # Build X
     if computed_woe:
         if not isinstance(woe_maps, dict):
-            raise SystemExit("Model bundle indicates 'computed_woe=True' but no 'woe_maps' were found.")
-        # Derive the underlying raw variable names from kept_woe = ["<raw>_WOE", ...]
-        kept_raw = [c[:-4] if c.endswith("_WOE") else c for c in features]
+            raise SystemExit("Bundle indicates 'computed_woe=True' but 'woe_maps' is missing.")
+        kept_raw = [c[:-4] if isinstance(c, str) and c.endswith("_WOE") else c for c in features]
         X_woe = apply_woe_with_maps_for_scoring(df_raw, woe_maps, kept_raw, bin_tag=args.bin_suffix)
-        missing = [c for c in features if c not in X_woe.columns]
-        if missing:
-            raise SystemExit(f"Cannot rebuild required WOE features from BIN: missing {missing}. "
-                             f"Check BIN columns and --bin-suffix (got '{args.bin_suffix}').")
-        X = X_woe[features].copy()
+
+        missing_from_bin = [c for c in features if c not in X_woe.columns]
+        if missing_from_bin:
+            # Fallback: si les colonnes WOE sont déjà présentes dans df_raw, utilisons-les
+            have_direct_woe = all(c in df_raw.columns for c in features)
+            if have_direct_woe:
+                X = df_raw[features].astype(float)
+            else:
+                present_bin_cols = sorted([c for c in df_raw.columns if c.endswith(args.bin_suffix)])
+                expected_bin_cols = sorted([ (c[:-4] if c.endswith("_WOE") else c) + args.bin_suffix for c in features ])
+                raise SystemExit(
+                    "Cannot rebuild required WOE features from BIN.\n"
+                    f"- Missing WOE from BIN: {missing_from_bin}\n"
+                    f"- Present BIN columns (first 30): {present_bin_cols[:30]}\n"
+                    f"- Expected BIN columns (first 30): {expected_bin_cols[:30]}\n"
+                    f"Check OOS schema and --bin-suffix='{args.bin_suffix}'."
+                )
+        else:
+            X = X_woe[features].astype(float)
     else:
-        # Expect features already in df (e.g., existing WOE columns were used at training)
         missing = [f for f in features if f not in df_raw.columns]
         if missing:
             raise SystemExit(f"Missing feature(s) in data: {missing}")
-        X = df_raw[features].copy()
+        X = df_raw[features].astype(float)
+
+    # Align order to estimator feature_names_in_ if available (safety)
+    feat_in = getattr(model, "feature_names_in_", None)
+    if feat_in is not None:
+        common = [c for c in feat_in if c in X.columns]
+        if len(common) != len(feat_in):
+            miss = [c for c in feat_in if c not in X.columns]
+            raise SystemExit(f"Input matrix missing columns expected by estimator: {miss}")
+        X = X.reindex(columns=common)
 
     # Predict probabilities
-    proba = model.predict_proba(X)[:, 1]
+    proba = predict_proba_safe(model, X)
     out = df_raw.copy()
-    out["proba"] = proba
+    out["proba"] = np.asarray(proba, dtype=float)
 
     # Optional bucketing
     if args.buckets:
@@ -212,9 +251,9 @@ def main():
 
     # Optional OOS metrics if target present
     metrics_path = args.metrics_out
-    if target_col and (target_col in df_raw.columns):
-        y = df_raw[target_col].astype(int).values
-        metrics = compute_oos_metrics(y, proba)
+    if (target_col is not None) and (target_col in df_raw.columns):
+        y = pd.to_numeric(df_raw[target_col], errors="coerce").fillna(0).astype(int).values
+        metrics = compute_oos_metrics(y, out["proba"].values)
         if metrics_path is None:
             out_path = Path(args.out)
             metrics_path = str(out_path.with_suffix("")) + "_metrics.json"
@@ -223,14 +262,14 @@ def main():
     elif args.metrics_out:
         print(f"[WARN] --metrics-out provided but target column '{target_col}' not found in data — no metrics saved.")
 
-    # Save
+    # Save predictions
     save_any(out, args.out)
     print(f"✔ Predictions saved to: {args.out}")
 
-    # Small tail: bucket distribution
+    # Bucket distribution (if any)
     if args.buckets:
         try:
-            counts = out[args.bucket_col].value_counts().sort_index()
+            counts = out[args.bucket_col].value_counts(dropna=False).sort_index()
             print("Risk bucket distribution:")
             for k, v in counts.items():
                 print(f"  bucket {k}: {v}")

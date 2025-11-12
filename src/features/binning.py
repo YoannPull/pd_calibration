@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import json, math, warnings, os
+import json, math, warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -12,9 +12,9 @@ import pandas as pd
 # Parallélisation
 try:
     from joblib import Parallel, delayed
-except Exception:
+except Exception:  # fallback si joblib indisponible
     Parallel = None
-    def delayed(f): return f
+    def delayed(f): return f  # type: ignore
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*is_period_dtype is deprecated.*")
 
@@ -65,7 +65,6 @@ def to_float_series(s: pd.Series) -> pd.Series:
                 s_dt = s_dt.dt.tz_convert(None)
         except Exception:
             pass
-    #   s_dt = s_dt.astype("datetime64[ns]")  # convert not necessary if already ns
         s_dt = s_dt.astype("datetime64[ns]")
         days = (s_dt.astype("int64") // 86_400_000_000_000)
         return days.astype("float64")
@@ -327,6 +326,7 @@ def maximize_gini_numeric(
 ):
     s = to_float_series(df[col])
     y = df[target_col].astype(int)
+    # Cas dégénéré
     if s.dropna().nunique() < 2:
         s_f = s[np.isfinite(s)]
         if s_f.empty:
@@ -339,8 +339,7 @@ def maximize_gini_numeric(
         return {"edges": [-np.inf, np.inf], "edges_for_cut": e_cut, "gini_before": float(g0), "gini_after": float(g0)}
 
     qs = np.linspace(q_low, q_high, n_quantiles)
-    cand_vals = s.quantile(qs).dropna().unique()
-    cand_vals = np.unique(cand_vals)
+    cand_vals = np.unique(s.quantile(qs).dropna().values)
     edges = [-np.inf, np.inf]
 
     n = len(s)
@@ -358,7 +357,10 @@ def maximize_gini_numeric(
                 return False
         return True
 
-    best_g, _ = _gini_from_numeric_bins(y, s, edges, include_missing)
+    # baseline correcte
+    g0, _ = _gini_from_numeric_bins(y, s, edges, include_missing)
+    best_g = g0
+
     improved = True
     while improved and (len(edges) - 1) < max_bins:
         improved = False
@@ -385,7 +387,7 @@ def maximize_gini_numeric(
     g_after, _ = _gini_from_numeric_bins(y, s, edges, include_missing)
     e = sorted(edges)
     e_cut = _safe_edges_for_cut(e, s)
-    return {"edges": e, "edges_for_cut": e_cut, "gini_before": float(best_g), "gini_after": float(g_after)}
+    return {"edges": e, "edges_for_cut": e_cut, "gini_before": float(g0), "gini_after": float(g_after)}
 
 # -----------------------------
 # Pipeline binning complet (train) + transform (val/test)
@@ -539,23 +541,24 @@ def run_binning_maxgini_on_df(
             b = b.where(~s.isna(), -1).astype("Int64")
         enriched[c + bin_col_suffix] = b
 
-    # option min_gini_keep
-    keep_vars = None
+    # option min_gini_keep → filtre effectif des colonnes sorties
+    keep_vars: Optional[set] = None
     if min_gini_keep is not None:
         rows = []
         for v, info in cat_results.items():
-            rows.append((v, "categorical", info["gini_after"]))
+            rows.append((v, info["gini_after"]))
         for v, info in num_results.items():
-            rows.append((v, "numeric", info["gini_after"]))
-        summary = pd.DataFrame(rows, columns=["variable", "type", "gini_after"])
+            rows.append((v, info["gini_after"]))
+        summary = pd.DataFrame(rows, columns=["variable", "gini_after"])
         keep_vars = set(summary.loc[summary["gini_after"] >= float(min_gini_keep), "variable"].tolist())
 
     if keep_vars is None:
         keep_vars = set(list(cat_results.keys()) + list(num_results.keys()))
-    bin_cols = [v + bin_col_suffix for v in keep_vars if v + bin_col_suffix in enriched.columns]
-    drop_cols = list(cat_results.keys()) + list(num_results.keys())
-    df_binned = enriched.drop(columns=drop_cols, errors="ignore").copy()
 
+    bin_cols = [v + bin_col_suffix for v in keep_vars if v + bin_col_suffix in enriched.columns]
+    # on ne garde que target + bins sélectionnées
+    kept = bin_cols + ([target] if target in enriched.columns else [])
+    df_binned = enriched[kept].copy()
 
     learned = LearnedBins(
         target=target,
@@ -589,12 +592,11 @@ def transform_with_learned_bins(df, learned: LearnedBins) -> pd.DataFrame:
             b = b.where(~s.isna(), -1).astype("Int64")
         DF[c + suffix] = b
 
-    # >>> Nouveau : on sort un DF pour le modèle avec SEULEMENT les colonnes __BIN (et la cible si présente)
+    # sort un DF modèle: uniquement __BIN (+ cible si présente)
     bin_cols = [c for c in DF.columns if c.endswith(suffix)]
     keep = bin_cols + ([learned.target] if learned.target in DF.columns else [])
     model_df = DF[keep].copy()
     return model_df
-
 
 # -----------------------------
 # Sérialisation (robuste JSON)

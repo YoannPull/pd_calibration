@@ -6,8 +6,13 @@ Build default labels (default_{T}m) per quarter, in parallel.
 - Lit TOUTE la config dans config.yml (data.*, labels.*, output.*, splits.*)
 - Écrit : quarter=YYYYQn/data.{fmt}, pooled.{fmt} (design), oos.{fmt} (hold-out)
 - 'vintage' est calculé selon labels.vintage_basis :
-    * "first_payment_date" (par défaut historique, FPD → Quarter)
+    * "first_payment_date" (historique, FPD → Quarter)
     * "origination_quarter" (RECOMMANDÉ ici : le quarter du fichier source)
+- IMPORTANT : le manifest _splits.json inclut
+    * validation_mode: "quarters"
+    * validation_quarters: [...]
+    * oos_quarters: [...]
+  pour être compatible avec impute_and_save.resolve_splits().
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 
 import yaml
 import pandas as pd
@@ -60,7 +65,7 @@ def _concat_parquet(paths: List[Path], out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         import pyarrow.parquet as pq
-        import pyarrow as pa
+        import pyarrow as pa  # noqa: F401  (utile si cast)
         writer = None
         schema = None
         wrote = False
@@ -81,7 +86,6 @@ def _concat_parquet(paths: List[Path], out_path: Path):
         if not wrote:
             pd.DataFrame().to_parquet(out_path, index=False)
     except Exception:
-        # Fallback concat Pandas
         dfs = [pd.read_parquet(p) for p in paths if p.exists()]
         if dfs:
             pd.concat(dfs, ignore_index=True).to_parquet(out_path, index=False)
@@ -113,9 +117,7 @@ def concat_outputs(paths: List[Path], out_path: Path, fmt: str):
 
 # ===================== Vintage computation =======================
 def _infer_vintage_fpd(df: pd.DataFrame) -> pd.Series:
-    """
-    Vintage basé sur first_payment_date (FPD).
-    """
+    """Vintage basé sur first_payment_date (FPD)."""
     fpd = df["first_payment_date"]
     qnum = ((fpd.dt.month - 1) // 3 + 1).astype("int")
     return fpd.dt.year.astype("string") + "Q" + qnum.astype("string")
@@ -239,18 +241,20 @@ def main():
     mode = (splits_cfg.get("mode", "explicit") or "explicit").lower()
     explicit_cfg = splits_cfg.get("explicit", {}) if mode == "explicit" else {}
 
+    # Clés normalisées + rétro-compat
     design_quarters: List[str] = list(explicit_cfg.get("design_quarters", []))
-    default_val_quarters: List[str] = list(explicit_cfg.get("default_val_quarters", []))
-    # rétrocompat single string
-    if not default_val_quarters and explicit_cfg.get("default_val_quarter"):
-        default_val_quarters = [explicit_cfg["default_val_quarter"]]
+    validation_quarters: List[str] = list(explicit_cfg.get("validation_quarters", []))
+    if not validation_quarters:
+        # rétro-compat : default_val_quarters / default_val_quarter
+        validation_quarters = list(explicit_cfg.get("default_val_quarters", []))
+        if not validation_quarters and explicit_cfg.get("default_val_quarter"):
+            validation_quarters = [explicit_cfg["default_val_quarter"]]
     oos_quarters: List[str] = list(explicit_cfg.get("oos_quarters", []))
 
-    # ------------- Sanity checks -------------
+    # ------------- Sanity checks / logs -------------
     def _warn(msg: str):
         print(f"[WARN] {msg}")
 
-    # Construire la liste des quarters à produire = union(design, oos) ∩ quarters_all (si listée)
     requested = sorted(set(design_quarters) | set(oos_quarters))
     if quarters_all:
         missing = [q for q in requested if q not in quarters_all]
@@ -260,15 +264,20 @@ def main():
     else:
         quarters_to_build = requested
 
-    # Vérifs d’inclusion
-    if any(q not in design_quarters for q in default_val_quarters):
-        diff = [q for q in default_val_quarters if q not in design_quarters]
-        _warn(f"default_val_quarters contient des quarters hors design_quarters: {diff}")
-    # Rappel utile
+    if any(q not in design_quarters for q in validation_quarters):
+        diff = [q for q in validation_quarters if q not in design_quarters]
+        _warn(f"validation_quarters contient des quarters hors design_quarters: {diff}")
+
     if not design_quarters:
         _warn("design_quarters est vide → pooled sera vide.")
+    if not validation_quarters:
+        _warn("validation_quarters est vide → validation interne vide (imputer retombera sur OOS si présent).")
     if not oos_quarters:
         print("[INFO] Aucun oos_quarters renseigné (oos.{fmt} sera vide).")
+
+    print(f"[INFO] design_quarters: {design_quarters}")
+    print(f"[INFO] validation_quarters: {validation_quarters}")
+    print(f"[INFO] oos_quarters: {oos_quarters}")
 
     window_dir = out_dir / f"window={window_months}m"
     window_dir.mkdir(parents=True, exist_ok=True)
@@ -319,7 +328,6 @@ def main():
         pd.DataFrame(summary_rows).to_csv(window_dir / "_summary.csv", index=False)
 
     # ------------- pooled (design) & oos concatenations -------------
-    # Map quarter -> path existant
     ok_map: Dict[str, Path] = {
         r["quarter"]: Path(r["path"]) for r in results if r.get("ok") and r.get("path")
     }
@@ -342,7 +350,7 @@ def main():
     else:
         print("[INFO] Pas de oos (liste vide ou non produits).")
 
-    # ------------- Manifest -------------
+    # ------------- Manifest (compatible resolve_splits) -------------
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "run_dir": str(out_dir.resolve()),
@@ -351,17 +359,24 @@ def main():
         "vintage_basis": vintage_basis,
         "quarters_requested": quarters_to_build,
         "quarters_produced": produced_quarters,
+        # Bloc "splits" minimal + rétro-compat :
         "splits": {
             "mode": mode,
             "explicit": {
                 "design_quarters": design_quarters,
-                "default_val_quarters": default_val_quarters,
+                # Rétro-compat d'affichage : on garde les anciennes clés aussi
+                "default_val_quarters": validation_quarters,
                 "oos_quarters": oos_quarters,
             },
+            # CLÉS NORMALISÉES attendues par resolve_splits()
+            "validation_mode": "quarters",
+            "validation_quarters": validation_quarters,
+            "oos_quarters": oos_quarters,
         },
         "elapsed_sec": round(time.time() - t0, 2),
         "config_snapshot": cfg,
     }
+
     (window_dir / "_splits.json").write_text(json.dumps(manifest, indent=2, default=str))
     print("✔ Manifest written:", window_dir / "_splits.json")
 
