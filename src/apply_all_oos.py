@@ -27,6 +27,7 @@ def save_any(df: pd.DataFrame, path: Path):
 
 # ============== housekeeping =================
 def drop_missing_flag_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Supprime les colonnes de type was_missing_* ou *_missing si demandé."""
     cols = df.columns
     mask = cols.str.startswith("was_missing_") | cols.str.endswith("_missing")
     todrop = cols[mask].tolist()
@@ -38,14 +39,19 @@ def drop_missing_flag_columns(df: pd.DataFrame) -> pd.DataFrame:
 def resolve_bin_col(df: pd.DataFrame, raw: str, tag: str) -> str | None:
     pref = f"{tag}{raw}"
     suff = f"{raw}{tag}"
-    if pref in df.columns:  return pref
-    if suff in df.columns:  return suff
+    if pref in df.columns:
+        return pref
+    if suff in df.columns:
+        return suff
     return None
 
-def apply_woe_with_maps(df_any: pd.DataFrame,
-                        maps: dict[str, dict],
-                        kept_vars_raw: list[str],
-                        bin_tag: str) -> pd.DataFrame:
+def apply_woe_with_maps(
+    df_any: pd.DataFrame,
+    maps: dict[str, dict],
+    kept_vars_raw: list[str],
+    bin_tag: str
+) -> pd.DataFrame:
+    """Construit les colonnes *_WOE à partir des colonnes BIN et des woe_maps."""
     cols = []
     for raw in kept_vars_raw:
         bcol = resolve_bin_col(df_any, raw, bin_tag)
@@ -94,7 +100,9 @@ def compute_metrics_if_target(df_scored: pd.DataFrame, target: str, proba_col: s
 
 # ============== CLI =================
 def parse_args():
-    p = argparse.ArgumentParser("Apply imputer → binning → WOE → model → risk buckets on raw OOS.")
+    p = argparse.ArgumentParser(
+        "Apply imputer → binning → (WOE ou BIN) → model → risk buckets sur OOS."
+    )
     p.add_argument("--data", required=True, help="Chemin du OOS brut (parquet/csv).")
     p.add_argument("--out", required=True, help="Fichier de sortie scoré (parquet/csv).")
     # artefacts
@@ -152,21 +160,50 @@ def main():
 
     # 3) Binning appris
     learned = load_bins_json(args.bins)
-    # APRÈS (robuste quel que soit le nom du paramètre dans ta fonction)
+    # NB: la fonction de ton repo n'attend pas de paramètre bin_col_suffix
     df_binned = transform_with_learned_bins(df_imp, learned)
 
-
-
-    # 4) Modèle & WOE
+    # 4) Modèle & features attendues
     art = load(args.model)
     model = art["model"]
     kept_woe = art["kept_woe"]
     woe_maps = art.get("woe_maps", None)
     target_col = art.get("target", args.target)
+    bin_tag = args.bin_suffix
 
-    kept_raw = [c.replace("_WOE", "") for c in kept_woe]
-    X_woe = apply_woe_with_maps(df_binned, woe_maps, kept_raw, bin_tag=args.bin_suffix)
-    X = X_woe.reindex(columns=kept_woe).astype(float).fillna(0.0)
+    feature_names = list(kept_woe)
+
+    # Détection du type de features attendu par le modèle
+    any_woe_like = any(c.endswith("_WOE") for c in feature_names)
+    all_bin_like = (
+        bin_tag
+        and all(c.endswith(bin_tag) or c.startswith(bin_tag) for c in feature_names)
+    )
+
+    # 4.a Cas 1 : modèle entraîné sur WOE (feature_names en *_WOE)
+    if any_woe_like:
+        if woe_maps is None:
+            raise ValueError(
+                "Le modèle semble attendre des colonnes WOE (*_WOE) mais 'woe_maps' est absent de l'artefact."
+            )
+        kept_raw = [c.replace("_WOE", "") for c in feature_names]
+        X_woe = apply_woe_with_maps(df_binned, woe_maps, kept_raw, bin_tag=bin_tag)
+        # Reindex pour avoir exactement les colonnes dans le bon ordre
+        X = X_woe.reindex(columns=feature_names).astype(float).fillna(0.0)
+
+    # 4.b Cas 2 : modèle entraîné directement sur BIN (feature_names en __BIN)
+    elif all_bin_like:
+        missing = [c for c in feature_names if c not in df_binned.columns]
+        if missing:
+            raise ValueError(
+                f"Colonnes BIN attendues par le modèle manquantes dans le dataset binned: {missing}"
+            )
+        X = df_binned[feature_names].astype(float).fillna(0.0)
+
+    # 4.c Cas 3 : cas mixte/ambiguous → fallback direct (rare)
+    else:
+        # On tente un alignement direct sur df_binned
+        X = df_binned.reindex(columns=feature_names).astype(float).fillna(0.0)
 
     # 5) Probas
     proba = model.predict_proba(X)[:, 1]
@@ -194,8 +231,10 @@ def main():
     # 9) Log
     print(f"✔ OOS scored → {out_path}")
     keep = ["proba"]
-    if "risk_bucket" in df_scored.columns: keep.append("risk_bucket")
-    if target_col in df_scored.columns: keep.append(target_col)
+    if "risk_bucket" in df_scored.columns:
+        keep.append("risk_bucket")
+    if target_col in df_scored.columns:
+        keep.append(target_col)
     print("  Columns:", ", ".join(keep))
     if metrics:
         print("  Metrics:", json.dumps(metrics, indent=2))

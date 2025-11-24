@@ -182,8 +182,14 @@ def build_woe_maps_from_bins(
         K = max(int(len(tab)), 1)
         denom_bad  = (B + smooth * K) if (B + smooth * K) > 0 else 1.0
         denom_good = (G + smooth * K) if (G + smooth * K) > 0 else 1.0
-        w = np.log(((tab["sum"] + smooth) / denom_bad) / ((tab["good"] + smooth) / denom_good)).replace([np.inf, -np.inf], np.nan)
-        maps[raw] = {"map": {int(k) if pd.notna(k) else -9999: float(v) for k, v in w.items()}, "default": global_woe}
+        w = np.log(
+            ((tab["sum"] + smooth) / denom_bad) /
+            ((tab["good"] + smooth) / denom_good)
+        ).replace([np.inf, -np.inf], np.nan)
+        maps[raw] = {
+            "map": {int(k) if pd.notna(k) else -9999: float(v) for k, v in w.items()},
+            "default": global_woe
+        }
     return maps
 
 def apply_woe_with_maps(
@@ -232,7 +238,6 @@ def train_from_binned(
     df_tr: pd.DataFrame,
     df_va: pd.DataFrame,
     target: str,
-    use_existing_woe_prefixes: Tuple[str, ...] = ("woe__",),
     bin_suffix: str = "__BIN",
     corr_threshold: float = 0.85,
     cv_folds: int = 5,
@@ -245,6 +250,11 @@ def train_from_binned(
     ablation_max_auc_loss: float = 0.02,
     timer: Optional[Timer] = None
 ) -> Dict[str, Any]:
+    """
+    Entraîne un modèle de PD en suivant strictement :
+      BIN -> WOE -> LR -> calibration isotonic -> ablation -> prior-shift.
+    """
+
     nullctx = contextlib.nullcontext()
     tctx = (lambda name: timer.section(name)) if timer else (lambda name: nullctx)
 
@@ -253,36 +263,24 @@ def train_from_binned(
         y_tr = df_tr[target].astype(int).values
         y_va = df_va[target].astype(int).values if target in df_va.columns else None
 
-    # 2) WOE existants ?
-    with tctx("detect_woe"):
-        woe_cols = [c for c in df_tr.columns if any(c.startswith(p) for p in use_existing_woe_prefixes if p)]
-        woe_cols += [c for c in df_tr.columns if c.endswith("_WOE")]
-        woe_cols = sorted(set(woe_cols) - {target})
+    # 2) Toujours : BIN -> WOE (on ignore d'éventuelles colonnes WOE présentes)
+    with tctx("detect_bin_cols"):
+        bin_cols = [c for c in df_tr.columns if c.endswith(bin_suffix) or c.startswith(bin_suffix)]
+    if not bin_cols:
+        raise SystemExit("Aucune colonne BIN détectée (__BIN en suffixe ou préfixe).")
 
-    computed_woe = False
-    woe_maps = None
+    with tctx("woe_build"):
+        raw_to_bin = {raw_name_from_bin(c, bin_suffix): c for c in bin_cols}
+        keep_raw = sorted(raw_to_bin.keys())
+        woe_maps = build_woe_maps_from_bins(df_tr, target, raw_to_bin, smooth=0.5)
+        Xtr_woe_full = apply_woe_with_maps(df_tr, woe_maps, keep_raw, bin_tag=bin_suffix)
+        Xva_woe_full = apply_woe_with_maps(df_va, woe_maps, keep_raw, bin_tag=bin_suffix) if y_va is not None else None
+        if Xva_woe_full is not None:
+            Xva_woe_full = Xva_woe_full.reindex(columns=Xtr_woe_full.columns, fill_value=0.0)
 
-    if not woe_cols:
-        # Sinon BIN -> WOE
-        with tctx("detect_bin_cols"):
-            bin_cols = [c for c in df_tr.columns if c.endswith(bin_suffix) or c.startswith(bin_suffix)]
-        if not bin_cols:
-            raise SystemExit("Aucune colonne WOE ni BIN détectée. Données attendues (__BIN ou préfixe) ou WOE.")
-        with tctx("woe_build"):
-            raw_to_bin = {raw_name_from_bin(c, bin_suffix): c for c in bin_cols}
-            keep_raw = sorted(raw_to_bin.keys())
-            woe_maps = build_woe_maps_from_bins(df_tr, target, raw_to_bin, smooth=0.5)
-            Xtr_woe_full = apply_woe_with_maps(df_tr, woe_maps, keep_raw, bin_tag=bin_suffix)
-            Xva_woe_full = apply_woe_with_maps(df_va, woe_maps, keep_raw, bin_tag=bin_suffix) if y_va is not None else None
-            if Xva_woe_full is not None:
-                Xva_woe_full = Xva_woe_full.reindex(columns=Xtr_woe_full.columns, fill_value=0.0)
-            computed_woe = True
-    else:
-        with tctx("use_existing_woe"):
-            Xtr_woe_full = df_tr[woe_cols].astype(float).copy()
-            Xva_woe_full = df_va.reindex(columns=woe_cols).astype(float).fillna(0.0) if y_va is not None else None
+    computed_woe = True
 
-    # 3) Drop proxies instables via PSI(feature)
+    # 3) Drop proxies instables via PSI(feature) entre train / val
     if drop_proxy_cutoff is not None and conditional_proxies and Xva_woe_full is not None:
         with tctx("psi_drop"):
             to_drop = []
@@ -306,7 +304,13 @@ def train_from_binned(
     # 5) GridSearch + calibration
     with tctx("gridsearch"):
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        grid = {"C": [0.1, 0.3, 1.0, 3.0, 10.0], "penalty": ["l2"], "solver": ["lbfgs"], "class_weight": [None], "max_iter": [2000]}
+        grid = {
+            "C": [0.1, 0.3, 1.0, 3.0, 10.0],
+            "penalty": ["l2"],
+            "solver": ["lbfgs"],
+            "class_weight": [None],
+            "max_iter": [2000],
+        }
         base_lr = LogisticRegression()
         gs = GridSearchCV(base_lr, grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True).fit(Xtr, y_tr)
         best_lr = gs.best_estimator_
@@ -349,7 +353,9 @@ def train_from_binned(
     if ablation_max_steps > 0 and p_va_curr is not None:
         with tctx("ablation"):
             for _ in range(min(ablation_max_steps, len(keep_cols))):
-                psi_feat_now = pd.Series({c: psi_by_feature(X_train_curr[c], X_val_curr[c]) for c in keep_cols}).sort_values(ascending=False)
+                psi_feat_now = pd.Series(
+                    {c: psi_by_feature(X_train_curr[c], X_val_curr[c]) for c in keep_cols}
+                ).sort_values(ascending=False)
                 cand = psi_feat_now.index[0]
                 Xtr_try = X_train_curr.drop(columns=[cand])
                 Xva_try = X_val_curr.drop(columns=[cand], errors="ignore")
@@ -408,10 +414,10 @@ def train_from_binned(
 
     out: Dict[str, Any] = {
         "model": model_curr,            # calibré après ablation (si faite)
-        "best_lr": lr_final,
+        "best_lr": lr_final,            # LR "brute" post-ablation
         "kept_woe": list(X_train_curr.columns),
         "computed_woe": bool(computed_woe),
-        "woe_maps": woe_maps,           # None si WOE déjà fournis
+        "woe_maps": woe_maps,           # toujours non-None ici
         "metrics": metrics,
         "deciles_val": dec,
         "importance": imp_df,
@@ -470,13 +476,14 @@ def bucket_stats(scores: np.ndarray, y: Optional[np.ndarray], edges: np.ndarray)
 # CLI
 # -----------------------------
 def parse_args():
-    p = argparse.ArgumentParser("Train depuis données binners (ou WOE) + calibration isotonic + ablation + prior-shift.")
+    p = argparse.ArgumentParser(
+        "Train depuis données binners (BIN → WOE) + calibration isotonic + ablation + prior-shift."
+    )
     p.add_argument("--train", required=True)
     p.add_argument("--validation", required=True)
     p.add_argument("--target", required=True)
     p.add_argument("--artifacts", default="artifacts/model_from_binned")
     p.add_argument("--bin-suffix", default="__BIN")     # tag (préfixe OU suffixe)
-    p.add_argument("--woe-prefixes", default="woe__")   # séparés par virgule si plusieurs
     p.add_argument("--corr-threshold", type=float, default=0.85)
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--no-isotonic", action="store_true")
@@ -508,13 +515,12 @@ def main():
             raise SystemExit(f"Target '{args.target}' absente de train/validation.")
 
     with tctx("parse_args"):
-        prefixes = tuple([s.strip() for s in args.woe_prefixes.split(",") if s.strip()])
         cond_proxies = [s.strip() for s in args.conditional_proxies.split(",") if s.strip()] if args.conditional_proxies else None
 
     with tctx("train_from_binned"):
         out = train_from_binned(
             df_tr=df_tr, df_va=df_va, target=args.target,
-            use_existing_woe_prefixes=prefixes, bin_suffix=args.bin_suffix,
+            bin_suffix=args.bin_suffix,
             corr_threshold=args.corr_threshold, cv_folds=args.cv_folds, isotonic=(not args.no_isotonic),
             drop_proxy_cutoff=args.drop_proxy_cutoff, conditional_proxies=cond_proxies,
             do_prior_shift_adjust=not args.no_prior_shift_adjust,
@@ -552,7 +558,8 @@ def main():
 
     with tctx("save_artifacts"):
         dump({
-            "model": out["model"],
+            "model": out["model"],           # CalibratedClassifierCV (post-ablation)
+            "best_lr": out["best_lr"],       # LogisticRegression "brute" (post-ablation)
             "kept_woe": out["kept_woe"],
             "computed_woe": out["computed_woe"],
             "woe_maps": out["woe_maps"],
@@ -567,7 +574,6 @@ def main():
             "artifacts_dir": str(artifacts.resolve()),
             "target": args.target,
             "bin_suffix": args.bin_suffix,
-            "woe_prefixes": prefixes,
             "cv_folds": int(args.cv_folds),
             "corr_threshold": float(args.corr_threshold),
             "isotonic": bool(not args.no_isotonic),
