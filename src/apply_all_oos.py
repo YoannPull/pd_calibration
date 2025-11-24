@@ -101,7 +101,7 @@ def compute_metrics_if_target(df_scored: pd.DataFrame, target: str, proba_col: s
 # ============== CLI =================
 def parse_args():
     p = argparse.ArgumentParser(
-        "Apply imputer → binning → (WOE ou BIN) → model → risk buckets sur OOS."
+        "Apply imputer → binning → (WOE ou BIN) → model (LR brute de préférence) → risk buckets sur OOS."
     )
     p.add_argument("--data", required=True, help="Chemin du OOS brut (parquet/csv).")
     p.add_argument("--out", required=True, help="Fichier de sortie scoré (parquet/csv).")
@@ -113,7 +113,7 @@ def parse_args():
     p.add_argument("--bins", default="artifacts/binning_maxgini/bins.json",
                    help="bins.json appris.")
     p.add_argument("--model", default="artifacts/model_from_binned/model_best.joblib",
-                   help="Modèle entraîné (joblib) avec clés model / kept_woe / woe_maps / target.")
+                   help="Modèle entraîné (joblib) avec clés model / best_lr / kept_woe / woe_maps / target.")
     p.add_argument("--buckets", default="artifacts/model_from_binned/risk_buckets.json",
                    help="JSON avec 'edges' pour les classes (1..K).")
     # colonnes & options
@@ -165,7 +165,8 @@ def main():
 
     # 4) Modèle & features attendues
     art = load(args.model)
-    model = art["model"]
+    model = art["model"]                 # CalibratedClassifierCV
+    best_lr = art.get("best_lr", None)   # LogisticRegression brute (post-ablation)
     kept_woe = art["kept_woe"]
     woe_maps = art.get("woe_maps", None)
     target_col = art.get("target", args.target)
@@ -205,8 +206,13 @@ def main():
         # On tente un alignement direct sur df_binned
         X = df_binned.reindex(columns=feature_names).astype(float).fillna(0.0)
 
-    # 5) Probas
-    proba = model.predict_proba(X)[:, 1]
+    # 5) Probas : on privilégie la LR brute pour le scoring OOS
+    if best_lr is not None:
+        proba = best_lr.predict_proba(X)[:, 1]
+    else:
+        print("[WARN] Pas de 'best_lr' dans l'artefact, utilisation du modèle calibré.")
+        proba = model.predict_proba(X)[:, 1]
+
     df_scored = pd.DataFrame({"proba": proba}, index=df_binned.index)
 
     # 6) Buckets
