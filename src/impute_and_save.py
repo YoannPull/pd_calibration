@@ -6,15 +6,10 @@ Impute train/validation with DataImputer, then save either:
 - Parquet files (types conservés nativement), or
 - CSV + pickles des dtypes (parse_dates, cat_dtypes, other_dtypes)
 
-Nouveautés :
-- --labels-window-dir + --use-splits : lit window=.../_splits.json pour construire
-  automatiquement train (pooled.parquet) et validation (liste de quarters ou oos).
-- Supporte plusieurs quarters de validation (concat).
-- Rétro-compatible avec --train-csv / --validation-csv.
-
-Sorties :
-- data/processed/imputed/{train.parquet, validation.parquet} (ou CSV)
-- artifacts/imputer/imputer.joblib + imputer_meta.json
+Corrections & Améliorations :
+- Fix Data Leakage : Filtre explicitement le fichier pooled (Train) pour en retirer
+  les quarters de validation définis dans _splits.json.
+- Optimisation RAM : Tente de charger uniquement les données nécessaires via PyArrow.
 """
 
 from __future__ import annotations
@@ -23,16 +18,25 @@ import argparse
 import json
 import os
 import pickle
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
 from joblib import dump
 
-# Rendez le package importable depuis ./src
-import sys
+# Gestion du path pour importer src.features.impute si lancé en script
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
-from features.impute import DataImputer  # adapte si besoin
+
+# Adapter l'import selon la structure réelle de ton projet
+# Si 'features.impute' n'est pas trouvé, vérifie ton PYTHONPATH ou cette ligne
+try:
+    from features.impute import DataImputer
+except ImportError:
+    # Fallback pour le développement local si le package n'est pas installé
+    import sys
+    sys.path.append(".")
+    from src.features.impute import DataImputer
 
 
 # ----------------------------- CLI -----------------------------
@@ -142,10 +146,14 @@ def _pull(d: dict, key: str, default=None):
 
 def resolve_splits(labels_window_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    Construit (train_df, val_df) à partir de window/_splits.json :
-      - train = pooled.parquet
-      - validation = concat(quartiers listés) OU oos.parquet selon 'validation_mode'
-    Supporte les manifests où les clés sont à la racine OU sous "splits".
+    Construit (train_df, val_df) à partir de window/_splits.json.
+    
+    IMPORTANT - LOGIQUE DE TRAITEMENT :
+    1. Charge le manifest JSON.
+    2. Identifie les quarters de validation.
+    3. Construit le DataFrame de validation (soit via fichiers quarters, soit OOS).
+    4. Construit le DataFrame de Train à partir de 'pooled.parquet' EN LE FILTRANT
+       pour exclure strictement les données utilisées en Validation.
     """
     splits_path = labels_window_dir / "_splits.json"
     pooled_path = labels_window_dir / "pooled.parquet"
@@ -156,31 +164,26 @@ def resolve_splits(labels_window_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame,
 
     manifest = json.loads(splits_path.read_text(encoding="utf-8"))
 
-    # Train
-    if not pooled_path.exists():
-        raise SystemExit(f"[ERR] Train 'pooled.parquet' not found at {pooled_path}")
-    df_train = load_any(pooled_path)
-
-    # Récupération robuste des infos de validation
+    # --- 1. Détermination de la Stratégie de Validation ---
     mode = (_pull(manifest, "validation_mode", None) or "quarters").lower()
 
-    # 1) validation_quarters normalisés
+    # Récupération des quarters
     val_quarters = _pull(manifest, "validation_quarters", [])
-    # 2) rétro-compat via splits.explicit
-    explicit = _pull(manifest, "explicit", {}) or {}
+    # Fallback rétro-compatibilité
     if not val_quarters:
+        explicit = _pull(manifest, "explicit", {}) or {}
         val_quarters = list(explicit.get("validation_quarters", []))
-    if not val_quarters:
-        val_quarters = list(explicit.get("default_val_quarters", []))
-    if not val_quarters and explicit.get("default_val_quarter"):
-        val_quarters = [explicit["default_val_quarter"]]
+        if not val_quarters:
+            val_quarters = list(explicit.get("default_val_quarters", []))
+        if not val_quarters and explicit.get("default_val_quarter"):
+            val_quarters = [explicit["default_val_quarter"]]
 
-    # 3) oos_quarters
     oos_quarters = _pull(manifest, "oos_quarters", [])
     if not oos_quarters:
+        explicit = _pull(manifest, "explicit", {}) or {}
         oos_quarters = list(explicit.get("oos_quarters", []))
 
-    # Si mode=quarters mais aucune liste fournie, on bascule intelligemment
+    # Fallback si mode=quarters mais liste vide -> tenter OOS
     if mode == "quarters" and not val_quarters:
         if oos_path.exists() and oos_quarters:
             print("[WARN] Pas de validation_quarters trouvés → fallback sur OOS.")
@@ -188,33 +191,94 @@ def resolve_splits(labels_window_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame,
         else:
             raise SystemExit("[ERR] No 'validation_quarters' found and no oos fallback available.")
 
-    # Build validation
+    # --- 2. Construction du DataFrame Validation ---
+    df_val = pd.DataFrame()
+    used_quarters = []
+    quarters_to_exclude_from_train = []
+
     if mode == "oos":
         if not oos_path.exists():
             raise SystemExit(f"[ERR] Validation 'oos.parquet' not found at {oos_path}")
         df_val = load_any(oos_path)
         used_quarters = oos_quarters
+        # En mode OOS pur, on suppose généralement que pooled ne contient QUE le train.
+        # Mais par sécurité, si oos_quarters est dans pooled, on pourrait vouloir filtrer.
+        # Pour l'instant, on ne filtre pas le train en mode OOS sauf si explicitement demandé.
     else:
+        # Mode "quarters" (validation interne ou OOT)
         files = [labels_window_dir / f"quarter={q}" / "data.parquet" for q in val_quarters]
         missing = [str(p) for p in files if not p.exists()]
         if missing:
             raise SystemExit(f"[ERR] Missing validation quarter files:\n  " + "\n  ".join(missing))
+        
         df_val = concat_parquet(files)
         used_quarters = val_quarters
+        # Ce qui est dans val doit être retiré de train
+        quarters_to_exclude_from_train = val_quarters
 
-    # Align colonnes
+    # --- 3. Construction du DataFrame Train (Avec Filtrage) ---
+    if not pooled_path.exists():
+        raise SystemExit(f"[ERR] Train 'pooled.parquet' not found at {pooled_path}")
+
+    # ### FIX DATA LEAKAGE & OPTIMISATION RAM ###
+    # On va essayer de lire pooled.parquet en filtrant directement à la lecture (PyArrow).
+    # Si ça échoue (ex: format CSV ou pas de PyArrow), on lit tout et on filtre Pandas.
+    
+    df_train = None
+    
+    # Colonne utilisée pour le split (voir make_labels.py)
+    # On essaie de deviner le nom de la colonne de temps
+    split_col_candidates = ["vintage", "__file_quarter", "quarter"]
+    
+    # Lecture initiale pour inspecter les colonnes (légère) ou lecture complète
+    try:
+        import pyarrow.parquet as pq
+        # Lecture du schéma uniquement
+        pq_file = pq.ParquetFile(pooled_path)
+        cols_in_file = pq_file.schema.names
+        
+        # Trouver la colonne de split
+        split_col = next((c for c in split_col_candidates if c in cols_in_file), None)
+
+        if split_col and quarters_to_exclude_from_train:
+            # OPTIMISATION: Push-down predicate filter
+            # On lit tout SAUF les quarters de validation
+            print(f"[SPLIT] Optimisation PyArrow : Exclusion de {len(quarters_to_exclude_from_train)} quarters sur '{split_col}'")
+            filters = [(split_col, 'not in', quarters_to_exclude_from_train)]
+            df_train = pd.read_parquet(pooled_path, filters=filters)
+        else:
+            # Pas de filtre à appliquer ou colonne non trouvée -> Lecture complète
+            df_train = pd.read_parquet(pooled_path)
+
+    except Exception as e:
+        print(f"[INFO] Lecture optimisée impossible ({e}), passage en mode standard.")
+        df_train = load_any(pooled_path)
+        split_col = next((c for c in split_col_candidates if c in df_train.columns), None)
+
+    # Filtrage de sécurité (Pandas) si PyArrow n'a pas été utilisé ou si CSV
+    # Cela sert de double sécurité pour garantir l'absence de fuite.
+    if quarters_to_exclude_from_train and split_col and split_col in df_train.columns:
+        n_orig = len(df_train)
+        # On vérifie si on doit encore filtrer
+        mask_leak = df_train[split_col].isin(quarters_to_exclude_from_train)
+        if mask_leak.any():
+            print(f"[SPLIT] Application du filtre de sécurité (Data Leakage Fix).")
+            df_train = df_train[~mask_leak].copy()
+            print(f"[SPLIT] Lignes retirées du train : {n_orig - len(df_train)}")
+    
+    if df_train is None or df_train.empty:
+         print("[WARN] Attention : Le DataFrame Train résultant est vide !")
+
+    # --- 4. Alignement des colonnes ---
     all_cols = sorted(set(df_train.columns).union(df_val.columns))
     df_train = df_train.reindex(columns=all_cols)
     df_val = df_val.reindex(columns=all_cols)
 
-    # Logs utiles
+    # --- Logs ---
     print(f"[SPLITS] mode: {mode}")
-    if mode == "quarters":
-        print(f"[SPLITS] validation_quarters: {used_quarters}")
-    else:
-        print(f"[SPLITS] oos_quarters: {used_quarters}")
+    print(f"[SPLITS] Train shape: {df_train.shape} (from pooled)")
+    print(f"[SPLITS] Val   shape: {df_val.shape} (quarters: {used_quarters})")
 
-    # Méta enrichie
     meta = {
         "train_file": str(pooled_path),
         "validation_mode": mode,
@@ -222,9 +286,9 @@ def resolve_splits(labels_window_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame,
         "validation_paths": (
             [str(labels_window_dir / f"quarter={q}" / "data.parquet") for q in used_quarters]
             if mode != "oos" else [str(oos_path)]
-        )
+        ),
+        "train_excluded_quarters": quarters_to_exclude_from_train
     }
-    # Conserver le manifest brut pour traçabilité
     manifest["_resolved"] = meta
     return df_train, df_val, manifest
 
@@ -265,9 +329,15 @@ def main():
         df_val = df_val.drop(columns=[args.target])
 
     # ----------------- Imputation -----------------
+    # Fit uniquement sur le TRAIN (sécurisé par resolve_splits)
     imputer = DataImputer(use_cohort=args.use_cohort, missing_flag=args.missing_flag)
+    
+    print(f"-> Fitting imputer on Train ({len(df_train)} rows)...")
     imputer.fit(df_train)
+    
+    print("-> Transforming Train...")
     df_train_imp = imputer.transform(df_train)
+    print("-> Transforming Validation...")
     df_val_imp = imputer.transform(df_val)
 
     # Ré-attacher la cible si présente

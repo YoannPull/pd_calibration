@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Entraînement Modèle Risque de Crédit (Bank-Grade) - Version Améliorée.
+- Robustesse : Augmentation de l'espace de régularisation (C).
+- Stabilité : Utilisation de class_weight='balanced'.
+- Calibration : Calibration honnête sur le split WOE (Part 1).
+- Audit : Ajout du Brier Score.
+"""
+
 from __future__ import annotations
-import argparse, json, time, contextlib, sys
+import argparse
+import json
+import time
+import contextlib
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -12,607 +24,427 @@ from joblib import dump
 
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss, roc_curve
-from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
+from sklearn.model_selection import StratifiedKFold, GridSearchCV, train_test_split
 
-# -----------------------------
-# I/O helpers
-# -----------------------------
+# ==============================================================================
+# 1. UTILITAIRES I/O & TIMING
+# ==============================================================================
 def load_any(path: str) -> pd.DataFrame:
     p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Fichier introuvable : {p}")
     if p.suffix.lower() in (".parquet", ".pq"):
         return pd.read_parquet(p)
     return pd.read_csv(p)
 
 def save_json(obj, path: Path):
+    """Sauvegarde JSON robuste."""
+    def default_fmt(o):
+        if isinstance(o, (np.integer, np.int64, np.int32)): return int(o)
+        if isinstance(o, (np.floating, np.float64, np.float32)): return float(o)
+        if isinstance(o, np.ndarray): return o.tolist()
+        return str(o)
+    
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, default=float), encoding="utf-8")
+    path.write_text(json.dumps(obj, indent=2, default=default_fmt), encoding="utf-8")
 
-# -----------------------------
-# Timing utils (overhead négligeable)
-# -----------------------------
 class Timer:
-    def __init__(self, live: bool = False, stream=None):
+    def __init__(self, live: bool = False):
         self.records: Dict[str, float] = {}
-        self._stack: List[str] = []
-        self.live = bool(live)
-        self.stream = stream or sys.stdout
+        self.live = live
 
     @contextlib.contextmanager
     def section(self, name: str):
         t0 = time.perf_counter()
-        self._stack.append(name)
         if self.live:
-            print(f"▶ {name} ...", file=self.stream, flush=True)
+            print(f"▶ {name} ...", file=sys.stdout, flush=True)
         try:
             yield
         finally:
             dt = time.perf_counter() - t0
             self.records[name] = self.records.get(name, 0.0) + dt
-            self._stack.pop()
             if self.live:
-                print(f"  ✓ {name:22s} {dt:8.3f}s", file=self.stream, flush=True)
+                print(f"  ✓ {name:22s} {dt:8.3f}s", file=sys.stdout, flush=True)
 
-    def add(self, name: str, dt: float):
-        self.records[name] = self.records.get(name, 0.0) + dt
+# ==============================================================================
+# 2. SCALING (LOG-ODDS -> POINTS)
+# ==============================================================================
+def scale_score(log_odds: np.ndarray, base_points=600, base_odds=50, pdo=20) -> np.ndarray:
+    factor = pdo / np.log(2)
+    offset = base_points - (factor * np.log(base_odds))
+    scores = offset - (factor * log_odds)
+    return np.round(scores).astype(int)
 
-# -----------------------------
-# Metrics & utils
-# -----------------------------
-def ks_best_threshold(y, p):
-    y = pd.Series(y).astype(int).to_numpy()
-    p = pd.Series(p).astype(float).to_numpy()
-    if np.unique(y).size < 2:
-        return np.nan, np.nan
-    fpr, tpr, thr = roc_curve(y, p)
-    ks_arr = tpr - fpr
-    i = int(np.nanargmax(ks_arr))
-    return float(ks_arr[i]), float(thr[i])
-
-def decile_table(y, p, q=10):
-    df = pd.DataFrame({"y": pd.Series(y).astype(int), "p": pd.Series(p).astype(float)})
-    try:
-        df["decile"] = pd.qcut(df["p"], q=q, labels=False, duplicates="drop")
-    except Exception:
-        n = len(df)
-        ranks = df["p"].rank(method="first") / max(n, 1)
-        df["decile"] = pd.cut(ranks, bins=np.linspace(0, 1, q + 1), labels=False, include_lowest=True)
-    tab = (
-        df.groupby("decile", dropna=True)
-        .agg(events=("y", "sum"), count=("y", "size"), avg_p=("p", "mean"))
-        .sort_index(ascending=False)
-    )
-    if tab.empty:
-        return tab
-    tab["rate"] = tab["events"] / tab["count"].where(tab["count"] > 0, 1)
-    tab["cum_events"] = tab["events"].cumsum()
-    tab["cum_count"] = tab["count"].cumsum()
-    tot_e = float(tab["events"].sum())
-    cum_good = tab["count"] - tab["events"]
-    denom_good = float(cum_good.sum()) if float(cum_good.sum()) > 0 else 1.0
-    tab["TPR"] = tab["cum_events"] / (tot_e if tot_e > 0 else 1.0)
-    tab["FPR"] = cum_good.cumsum() / denom_good
-    tab["KS"] = tab["TPR"] - tab["FPR"]
-    return tab
-
-def psi(a, b, bins=10, eps=1e-9):
-    a = np.asarray(a, float); b = np.asarray(b, float)
-    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
-    if a.size == 0 or b.size == 0:
-        return np.nan
-    q = np.quantile(a, np.linspace(0, 1, bins + 1))
-    q = np.unique(q)
-    if q.size < 2:
-        return 0.0
-    q[0], q[-1] = -np.inf, np.inf
-    for i in range(1, len(q)):
-        if not (q[i] > q[i - 1]):
-            q[i] = np.nextafter(q[i - 1], np.inf)
-    ca, _ = np.histogram(a, bins=q)
-    cb, _ = np.histogram(b, bins=q)
-    pa, pb = ca / max(ca.sum(), 1), cb / max(cb.sum(), 1)
-    return float(np.sum((pa - pb) * np.log((pa + eps) / (pb + eps))))
-
-def psi_by_feature(a, b, bins=10, eps=1e-9):
-    a = np.asarray(a, float); b = np.asarray(b, float)
-    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
-    if a.size == 0 or b.size == 0:
-        return np.nan
-    q = np.quantile(a, np.linspace(0, 1, bins + 1))
-    q = np.unique(q); q[0], q[-1] = -np.inf, np.inf
-    for i in range(1, len(q)):
-        if not (q[i] > q[i - 1]):
-            q[i] = np.nextafter(q[i - 1], np.inf)
-    ca, _ = np.histogram(a, bins=q)
-    cb, _ = np.histogram(b, bins=q)
-    pa, pb = ca / max(ca.sum(), 1), cb / max(cb.sum(), 1)
-    return float(np.sum((pa - pb) * np.log((pa + eps) / (pb + eps))))
-
-def prior_shift_adjust(p, base_train, base_val, eps=1e-9):
-    p = np.clip(np.asarray(p, float), eps, 1 - eps)
-    logit = np.log(p / (1 - p))
-    delta = np.log((base_val + eps) / (1 - base_val + eps)) - np.log((base_train + eps) / (1 - base_train + eps))
-    z = logit + delta
-    return 1 / (1 + np.exp(-z))
-
-# -----------------------------
-# BIN helpers (préfixe/suffixe)
-# -----------------------------
+# ==============================================================================
+# 3. WOE TRANSFORMATION
+# ==============================================================================
 def find_bin_columns(df: pd.DataFrame, tag: str) -> List[str]:
-    cols = []
-    for c in df.columns:
-        if c.startswith(tag) or c.endswith(tag):
-            cols.append(c)
-    return sorted(cols)
+    return sorted([c for c in df.columns if c.startswith(tag) or c.endswith(tag)])
 
 def raw_name_from_bin(col: str, tag: str) -> str:
     if col.startswith(tag): return col[len(tag):]
     if col.endswith(tag):  return col[:-len(tag)]
     return col
 
-def resolve_bin_col(df: pd.DataFrame, raw: str, tag: str) -> Optional[str]:
-    cand_prefix = f"{tag}{raw}"
-    cand_suffix = f"{raw}{tag}"
-    if cand_prefix in df.columns: return cand_prefix
-    if cand_suffix in df.columns: return cand_suffix
-    return None
-
-# -----------------------------
-# WOE from BIN
-# -----------------------------
-def build_woe_maps_from_bins(
-    df_enrichi: pd.DataFrame,
-    target: str,
-    raw_to_bin: Dict[str, str],
-    smooth: float = 0.5
-) -> Dict[str, Dict]:
+def build_woe_maps_from_bins(df: pd.DataFrame, target: str, raw_to_bin: Dict[str, str], smooth: float = 0.5) -> Dict:
     maps = {}
-    y = df_enrichi[target].astype(int)
-    B_all = float(y.sum())
-    G_all = float(len(y) - y.sum())
+    y = df[target].astype(int)
+    B_all, G_all = float(y.sum()), float(len(y) - y.sum())
+    
+    # Global default
     global_woe = float(np.log((B_all + smooth) / (G_all + smooth)))
+    
     for raw, bcol in raw_to_bin.items():
-        tab = df_enrichi.groupby(bcol, dropna=True)[target].agg(["sum", "count"])
+        tab = df.groupby(bcol, dropna=True)[target].agg(["sum", "count"])
         if tab.empty:
             maps[raw] = {"map": {}, "default": global_woe}
             continue
+            
         tab["good"] = tab["count"] - tab["sum"]
-        B = float(tab["sum"].sum())
-        G = float(tab["good"].sum())
-        K = max(int(len(tab)), 1)
-        denom_bad  = (B + smooth * K) if (B + smooth * K) > 0 else 1.0
-        denom_good = (G + smooth * K) if (G + smooth * K) > 0 else 1.0
-        w = np.log(
-            ((tab["sum"] + smooth) / denom_bad) /
-            ((tab["good"] + smooth) / denom_good)
-        ).replace([np.inf, -np.inf], np.nan)
+        B, G = float(tab["sum"].sum()), float(tab["good"].sum())
+        
+        bad_rate_i = (tab["sum"] + smooth) / (B + smooth * len(tab))
+        good_rate_i = (tab["good"] + smooth) / (G + smooth * len(tab))
+        
+        woe_series = np.log(bad_rate_i / good_rate_i)
+        
         maps[raw] = {
-            "map": {int(k) if pd.notna(k) else -9999: float(v) for k, v in w.items()},
+            "map": {int(k): float(v) for k, v in woe_series.items()},
             "default": global_woe
         }
     return maps
 
-def apply_woe_with_maps(
-    df_any: pd.DataFrame,
-    maps: Dict[str, Dict],
-    kept_vars_raw: List[str],
-    bin_tag: str
-) -> pd.DataFrame:
+def apply_woe_with_maps(df: pd.DataFrame, maps: Dict, kept_vars_raw: List[str], bin_tag: str) -> pd.DataFrame:
     cols = []
     for raw in kept_vars_raw:
-        bcol = resolve_bin_col(df_any, raw, bin_tag)
+        cand_p, cand_s = f"{bin_tag}{raw}", f"{raw}{bin_tag}"
+        bcol = cand_p if cand_p in df.columns else (cand_s if cand_s in df.columns else None)
+        
         if bcol is None or raw not in maps:
             continue
-        ser = df_any[bcol].astype("Int64")
+            
         wmap = maps[raw]["map"]
         wdef = float(maps[raw]["default"])
-        x = ser.map(wmap).astype(float).fillna(wdef)
-        cols.append((f"{raw}_WOE", x))
+        
+        x = df[bcol].map(wmap).astype(float).fillna(wdef)
+        cols.append(pd.Series(x, name=f"{raw}_WOE", index=df.index))
+        
     if not cols:
-        return pd.DataFrame(index=df_any.index)
-    return pd.concat([s for _, s in cols], axis=1)
+        return pd.DataFrame(index=df.index)
+    return pd.concat(cols, axis=1)
 
-# -----------------------------
-# Sélection par anti-colinéarité
-# -----------------------------
-def select_woe_columns(X_woe: pd.DataFrame, order_hint: List[str], corr_thr: float = 0.85) -> List[str]:
-    cols = [c for c in order_hint if c in X_woe.columns] or list(X_woe.columns)
-    corr = X_woe[cols].corr().abs().fillna(0.0)
-    selected = []
-    for c in cols:
-        if not selected:
-            selected.append(c)
+# ==============================================================================
+# 4. INTERACTIONS (FEATURE ENGINEERING)
+# ==============================================================================
+def add_interactions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Crée des variables d'interaction clés pour le risque de crédit.
+    Multiplie les WOE pour capturer les risques conjoints (ex: Haut LTV ET Mauvais Score).
+    """
+    # Liste des candidats à l'interaction (Noms exacts des colonnes WOE attendues)
+    # Ces noms dépendent de tes données brutes + suffixe _WOE
+    
+    # 1. Interaction Score x LTV (Le classique)
+    if 'credit_score_WOE' in df.columns and 'original_cltv_WOE' in df.columns:
+        df['inter_score_x_cltv'] = df['credit_score_WOE'] * df['original_cltv_WOE']
+        
+    # 2. Interaction Score x DTI (Capacité de remboursement)
+    if 'credit_score_WOE' in df.columns and 'original_dti_WOE' in df.columns:
+        df['inter_score_x_dti'] = df['credit_score_WOE'] * df['original_dti_WOE']
+
+    # 3. Interaction LTV x DTI (Fragilité structurelle)
+    if 'original_cltv_WOE' in df.columns and 'original_dti_WOE' in df.columns:
+        df['inter_cltv_x_dti'] = df['original_cltv_WOE'] * df['original_dti_WOE']
+
+    return df
+
+# ==============================================================================
+# 5. FEATURE SELECTION
+# ==============================================================================
+def select_features_robust(X: pd.DataFrame, corr_thr: float = 0.85) -> List[str]:
+    """
+    Sélectionne les features. 
+    Note : Les interactions seront gardées si elles ont une forte variance 
+    et ne sont pas trop corrélées aux variables mères.
+    """
+    # On remplit les NaNs éventuels des interactions par 0 (neutre)
+    X = X.fillna(0)
+    
+    # On préfère l'approche Gloutonne ici
+    order = X.var().sort_values(ascending=False).index.tolist()
+    kept = []
+    corr_matrix = X.corr().abs()
+    
+    for col in order:
+        if not kept:
+            kept.append(col)
             continue
-        mc = corr.loc[c, corr.columns.intersection(selected)]
-        max_corr = float(mc.max()) if len(mc) else 0.0
-        if not np.isfinite(max_corr) or np.isnan(max_corr):
-            max_corr = 0.0
-        if max_corr < corr_thr:
-            selected.append(c)
-    return selected
+        existing_corr = corr_matrix.loc[col, kept]
+        if existing_corr.max() < corr_thr:
+            kept.append(col)
+    return kept
 
-# -----------------------------
-# Entraînement principal + ablation gloutonne
-# -----------------------------
-def train_from_binned(
+# ==============================================================================
+# 6. CORE TRAINING ROUTINE
+# ==============================================================================
+def train_pipeline(
     df_tr: pd.DataFrame,
     df_va: pd.DataFrame,
     target: str,
-    bin_suffix: str = "__BIN",
-    corr_threshold: float = 0.85,
-    cv_folds: int = 5,
-    isotonic: bool = True,
-    # options PSI/ablation
-    drop_proxy_cutoff: Optional[float] = None,           # PSI(feature) cutoff
-    conditional_proxies: Optional[List[str]] = None,     # raw var names
-    do_prior_shift_adjust: bool = True,
-    ablation_max_steps: int = 10,
-    ablation_max_auc_loss: float = 0.02,
-    timer: Optional[Timer] = None
+    bin_suffix: str,
+    corr_threshold: float,
+    cv_folds: int,
+    calibration_method: str,
+    timer: Optional[Timer]
 ) -> Dict[str, Any]:
-    """
-    Entraîne un modèle de PD en suivant strictement :
-      BIN -> WOE -> LR -> calibration isotonic -> ablation -> prior-shift.
-    """
 
-    nullctx = contextlib.nullcontext()
-    tctx = (lambda name: timer.section(name)) if timer else (lambda name: nullctx)
+    tctx = (lambda name: timer.section(name)) if timer else (lambda name: contextlib.nullcontext())
 
-    # 1) Y
-    with tctx("prep_y"):
-        y_tr = df_tr[target].astype(int).values
-        y_va = df_va[target].astype(int).values if target in df_va.columns else None
+    # --- A. Préparation & Sécurité ---
+    with tctx("Data Prep"):
+        # 1. Identification des variables sûres
+        bin_cols = find_bin_columns(df_tr, bin_suffix)
+        
+        # BLACKLIST ANTI-LEAKAGE
+        BLACKLIST_KEYWORDS = [
+            "quarter", "year", "month", "vintage", "time", "date",
+            "property_valuation_method", "first_payment", "maturity",
+            "mi_cancellation", "interest_rate", "loan_sequence_number", "postal_code"
+        ]
+        
+        def is_safe(col_name):
+            raw = raw_name_from_bin(col_name, bin_suffix).lower()
+            if raw.startswith("__"): return False
+            for bad_word in BLACKLIST_KEYWORDS:
+                if bad_word in raw: return False
+            return True
 
-    # 2) Toujours : BIN -> WOE (on ignore d'éventuelles colonnes WOE présentes)
-    with tctx("detect_bin_cols"):
-        bin_cols = [c for c in df_tr.columns if c.endswith(bin_suffix) or c.startswith(bin_suffix)]
-    if not bin_cols:
-        raise SystemExit("Aucune colonne BIN détectée (__BIN en suffixe ou préfixe).")
-
-    with tctx("woe_build"):
+        bin_cols = [c for c in bin_cols if is_safe(c)]
+        if not bin_cols: raise ValueError("Aucune colonne bin détectée après filtrage.")
         raw_to_bin = {raw_name_from_bin(c, bin_suffix): c for c in bin_cols}
-        keep_raw = sorted(raw_to_bin.keys())
-        woe_maps = build_woe_maps_from_bins(df_tr, target, raw_to_bin, smooth=0.5)
-        Xtr_woe_full = apply_woe_with_maps(df_tr, woe_maps, keep_raw, bin_tag=bin_suffix)
-        Xva_woe_full = apply_woe_with_maps(df_va, woe_maps, keep_raw, bin_tag=bin_suffix) if y_va is not None else None
-        if Xva_woe_full is not None:
-            Xva_woe_full = Xva_woe_full.reindex(columns=Xtr_woe_full.columns, fill_value=0.0)
+        
+        print(f"  -> Features Candidates : {len(bin_cols)}")
 
-    computed_woe = True
+    # --- B. SPLIT TRAIN (WOE vs MODEL) ---
+    with tctx("Splitting Train"):
+        # 50/50 Split pour intégrité du WOE
+        df_woe_learn, df_model_learn = train_test_split(
+            df_tr, test_size=0.5, stratify=df_tr[target], random_state=42
+        )
+        print(f"  -> Split appliqué : {len(df_woe_learn)} (WOE Fit) / {len(df_model_learn)} (Model Fit)")
 
-    # 3) Drop proxies instables via PSI(feature) entre train / val
-    if drop_proxy_cutoff is not None and conditional_proxies and Xva_woe_full is not None:
-        with tctx("psi_drop"):
-            to_drop = []
-            for raw in conditional_proxies:
-                c = f"{raw}_WOE"
-                if c in Xtr_woe_full.columns and c in Xva_woe_full.columns:
-                    v = psi_by_feature(Xtr_woe_full[c], Xva_woe_full[c])
-                    if v is not None and np.isfinite(v) and v > float(drop_proxy_cutoff):
-                        to_drop.append(c)
-            if to_drop:
-                Xtr_woe_full = Xtr_woe_full.drop(columns=to_drop, errors="ignore")
-                Xva_woe_full = Xva_woe_full.drop(columns=to_drop, errors="ignore")
+    # --- C. Calcul WOE & Interactions ---
+    with tctx("WOE & Interactions"):
+        # 1. Learn WOE on Part 1
+        woe_maps = build_woe_maps_from_bins(df_woe_learn, target, raw_to_bin)
+        keep_raw = sorted(woe_maps.keys())
+        
+        # 2. Transform Part 2 (Model Fit Split)
+        Xtr_woe_model = apply_woe_with_maps(df_model_learn, woe_maps, keep_raw, bin_suffix)
+        Xtr_woe_model = add_interactions(Xtr_woe_model)
+        y_tr_model = df_model_learn[target].values.astype(int)
+        
+        # 3. Transform Part 1 (Calibration Split)
+        Xcalib_woe = apply_woe_with_maps(df_woe_learn, woe_maps, keep_raw, bin_suffix)
+        Xcalib_woe = add_interactions(Xcalib_woe)
+        y_calib = df_woe_learn[target].values.astype(int)
+        
+        # 4. Transform Validation
+        Xva_woe_all = apply_woe_with_maps(df_va, woe_maps, keep_raw, bin_suffix)
+        Xva_woe_all = add_interactions(Xva_woe_all)
+        y_va = df_va[target].values.astype(int) if target in df_va.columns else None
 
-    # 4) Sélection anti-colinéarité (ordre = variance décroissante)
-    with tctx("feature_selection"):
-        order_hint = list(Xtr_woe_full.var().sort_values(ascending=False).index)
-        kept_woe = select_woe_columns(Xtr_woe_full, order_hint, corr_thr=corr_threshold)
-        Xtr = Xtr_woe_full[kept_woe].copy()
-        Xva = Xva_woe_full[kept_woe].copy() if Xva_woe_full is not None else None
+    # --- D. Sélection Variables ---
+    with tctx("Feature Selection"):
+        kept_features = select_features_robust(Xtr_woe_model, corr_thr=corr_threshold)
+        Xtr = Xtr_woe_model[kept_features]
+        Xva = Xva_woe_all[kept_features]
+        # Filtrer aussi le jeu de calibration pour garder les mêmes colonnes
+        Xcalib = Xcalib_woe[kept_features] 
+        print(f"  -> Features kept: {len(kept_features)} (incluant interactions)")
 
-    # 5) GridSearch + calibration
-    with tctx("gridsearch"):
+    # --- E. Régression Logistique ---
+    with tctx("Logistic Regression"):
+        # GRILLE ÉLARGIE pour auditer le faible besoin de régularisation C
+        grid = {"C": [0.1, 1.0, 10.0, 100.0, 1000.0]}
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        grid = {
-            "C": [0.1, 0.3, 1.0, 3.0, 10.0],
-            "penalty": ["l2"],
-            "solver": ["lbfgs"],
-            "class_weight": [None],
-            "max_iter": [2000],
-        }
-        base_lr = LogisticRegression()
-        gs = GridSearchCV(base_lr, grid, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True).fit(Xtr, y_tr)
+        
+        # AJOUT : class_weight='balanced' pour une meilleure robustesse au Population Shift
+        lr_base = LogisticRegression(
+            penalty="l2", 
+            solver="lbfgs", 
+            max_iter=1000, 
+            random_state=42,
+            class_weight='balanced'
+        )
+        gs = GridSearchCV(lr_base, grid, cv=cv, scoring="roc_auc", n_jobs=-1)
+        
+        gs.fit(Xtr, y_tr_model)
         best_lr = gs.best_estimator_
-    with tctx("calibration_fit"):
-        model = CalibratedClassifierCV(best_lr, method=("isotonic" if isotonic else "sigmoid"), cv=cv).fit(Xtr, y_tr)
+        print(f"  -> Best Params: {gs.best_params_} | Best CV AUC (Honest): {gs.best_score_:.4f}")
 
-    with tctx("metrics_train"):
-        p_tr = model.predict_proba(Xtr)[:, 1]
+    # --- F. Scaling & Calibration ---
+    with tctx("Scaling & Calibration"):
+        raw_tr = best_lr.decision_function(Xtr)
+        raw_va = best_lr.decision_function(Xva)
+        score_tr = scale_score(raw_tr)
+        score_va = scale_score(raw_va)
+        print(f"  -> Score Train (Part 2): Mean={score_tr.mean():.0f}")
+
+        if calibration_method != "none":
+            # CALIBRATION HONNÊTE : fit sur le split WOE (Xcalib, y_calib), jamais vu par best_lr lors du fit.
+            calibrator = CalibratedClassifierCV(best_lr, method=calibration_method, cv="prefit")
+            calibrator.fit(Xcalib, y_calib) # Fit sur la partie 1 du Train
+            model_pd = calibrator
+        else:
+            model_pd = best_lr
+            
+        pd_tr = model_pd.predict_proba(Xtr)[:, 1]
+        pd_va = model_pd.predict_proba(Xva)[:, 1]
+
+    # --- G. Metrics ---
+    with tctx("Metrics Calculation"):
         metrics = {
-            "train_auc": float(roc_auc_score(y_tr, p_tr)),
-            "train_brier": float(brier_score_loss(y_tr, p_tr)),
-            "train_logloss": float(log_loss(y_tr, p_tr)),
-            "n_kept_features": int(len(kept_woe)),
+            "train_auc": float(roc_auc_score(y_tr_model, pd_tr)),
+            "val_auc": float(roc_auc_score(y_va, pd_va)),
+            "train_logloss": float(log_loss(y_tr_model, pd_tr)),
+            "val_logloss": float(log_loss(y_va, pd_va)),
+            # AJOUT DU BRIER SCORE pour auditer la qualité de la probabilité prédite
+            "train_brier_score": float(brier_score_loss(y_tr_model, pd_tr)),
+            "val_brier_score": float(brier_score_loss(y_va, pd_va)),
+            "n_features": len(kept_features)
         }
 
-    dec = pd.DataFrame()
-    p_va = None
-
-    if Xva is not None and y_va is not None:
-        with tctx("metrics_val"):
-            p_va = model.predict_proba(Xva)[:, 1]
-            ks, thr = ks_best_threshold(y_va, p_va)
-            metrics.update({
-                "val_auc": float(roc_auc_score(y_va, p_va)),
-                "val_brier": float(brier_score_loss(y_va, p_va)),
-                "val_logloss": float(log_loss(y_va, p_va)),
-                "val_ks": float(ks),
-                "val_ks_threshold": float(thr),
-                "psi_train_to_val_proba": float(psi(p_tr, p_va, bins=10))
-            })
-            dec = decile_table(y_va, p_va, q=10)
-
-    # 6) Ablation gloutonne (PSI(probas) ↓, perte AUC ≤ seuil)
-    X_train_curr, X_val_curr = Xtr.copy(), (Xva.copy() if Xva is not None else None)
-    model_curr, p_tr_curr, p_va_curr = model, p_tr, (p_va if p_va is not None else None)
-    best_auc = float(roc_auc_score(y_va, p_va_curr)) if p_va_curr is not None else np.nan
-    best_psi = float(psi(p_tr_curr, p_va_curr)) if p_va_curr is not None else np.nan
-    keep_cols = list(X_train_curr.columns)
-
-    if ablation_max_steps > 0 and p_va_curr is not None:
-        with tctx("ablation"):
-            for _ in range(min(ablation_max_steps, len(keep_cols))):
-                psi_feat_now = pd.Series(
-                    {c: psi_by_feature(X_train_curr[c], X_val_curr[c]) for c in keep_cols}
-                ).sort_values(ascending=False)
-                cand = psi_feat_now.index[0]
-                Xtr_try = X_train_curr.drop(columns=[cand])
-                Xva_try = X_val_curr.drop(columns=[cand], errors="ignore")
-                gs2 = GridSearchCV(best_lr, {**grid}, scoring="roc_auc", cv=cv, n_jobs=-1, refit=True).fit(Xtr_try, y_tr)
-                lr2 = gs2.best_estimator_
-                cal2 = CalibratedClassifierCV(lr2, method=("isotonic" if isotonic else "sigmoid"), cv=cv).fit(Xtr_try, y_tr)
-                p_tr2 = cal2.predict_proba(Xtr_try)[:, 1]
-                p_va2 = cal2.predict_proba(Xva_try)[:, 1]
-                auc2 = float(roc_auc_score(y_va, p_va2))
-                psi2 = float(psi(p_tr2, p_va2))
-                loss_auc = best_auc - auc2
-                if (psi2 + 1e-6) < best_psi and (np.isnan(loss_auc) or loss_auc <= ablation_max_auc_loss):
-                    X_train_curr, X_val_curr = Xtr_try, Xva_try
-                    model_curr, p_tr_curr, p_va_curr = cal2, p_tr2, p_va2
-                    best_auc, best_psi = auc2, psi2
-                    keep_cols.remove(cand)
-                else:
-                    break
-
-    # 7) Prior-shift adjust + metrics adj
-    p_va_adj = None
-    if p_va_curr is not None and do_prior_shift_adjust:
-        with tctx("prior_shift_adjust"):
-            base_train = float(np.mean(y_tr))
-            base_val = float(np.mean(y_va))
-            p_va_adj = prior_shift_adjust(p_va_curr, base_train, base_val)
-            ks_adj, thr_adj = ks_best_threshold(y_va, p_va_adj)
-            metrics.update({
-                "val_auc_adj": float(roc_auc_score(y_va, p_va_adj)),
-                "val_brier_adj": float(brier_score_loss(y_va, p_va_adj)),
-                "val_logloss_adj": float(log_loss(y_va, p_va_adj)),
-                "val_ks_adj": float(ks_adj),
-                "val_ks_threshold_adj": float(thr_adj),
-                "psi_train_to_val_proba_adj": float(psi(p_tr_curr, p_va_adj, bins=10))
-            })
-            dec = decile_table(y_va, p_va_adj, q=10) if dec.empty else dec
-
-    # 8) Importance standardisée
-    imp_df = None
-    with tctx("importance"):
-        lr_final = getattr(model_curr, "base_estimator", None) or getattr(model_curr, "estimator", None) or best_lr
-        if hasattr(lr_final, "coef_"):
-            beta = np.asarray(lr_final.coef_).ravel()
-            feat_cols = list(X_train_curr.columns)
-            if len(beta) != len(feat_cols):
-                m = min(len(beta), len(feat_cols))
-                beta = beta[:m]
-                feat_cols = feat_cols[:m]
-            stds = X_train_curr[feat_cols].std(ddof=0).replace(0, np.nan)
-            std_coef = pd.Series(beta, index=feat_cols) * stds
-            imp_df = (
-                pd.DataFrame({"feature": feat_cols, "coef": beta, "std": stds.values, "std_coef": std_coef.values})
-                .dropna(subset=["std_coef"])
-                .sort_values("std_coef", key=lambda s: s.abs(), ascending=False)
-            )
-
-    out: Dict[str, Any] = {
-        "model": model_curr,            # calibré après ablation (si faite)
-        "best_lr": lr_final,            # LR "brute" post-ablation
-        "kept_woe": list(X_train_curr.columns),
-        "computed_woe": bool(computed_woe),
-        "woe_maps": woe_maps,           # toujours non-None ici
+    return {
+        "model_pd": model_pd,
+        "best_lr": best_lr,
+        "woe_maps": woe_maps,
+        "kept_features": kept_features,
         "metrics": metrics,
-        "deciles_val": dec,
-        "importance": imp_df,
-        # sorties supplémentaires pour bucketing
-        "p_tr_final": p_tr_curr,
-        "p_va_final": p_va_adj if p_va_adj is not None else p_va_curr,
-        "y_va": y_va,
+        "score_tr": score_tr,
+        "score_va": score_va,
+        "y_tr": y_tr_model,
+        "y_va": y_va
     }
-    return out
 
-# -----------------------------
-# Bucketing helpers (quantiles robustes)
-# -----------------------------
-def safe_quantile_edges(scores: np.ndarray, n: int = 10) -> np.ndarray:
-    """Bornes strictement croissantes dans [0,1] à partir de quantiles."""
-    s = np.asarray(scores, float)
-    s = s[np.isfinite(s)]
-    if s.size == 0:
-        return np.array([0.0, 1.0], dtype=float)
-    qs = np.linspace(0.0, 1.0, n + 1)
-    edges = np.quantile(s, qs, method="linear")
-    edges[0] = 0.0
-    edges[-1] = 1.0
-    for i in range(1, len(edges)):
-        if not (edges[i] > edges[i-1]):
-            edges[i] = np.nextafter(edges[i-1], 1.0)
-    return edges
-
-def assign_bucket(scores: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """Retourne des buckets 1..K-1 en utilisant les bornes `edges`."""
-    inner = edges[1:-1]
-    return (np.digitize(scores, inner, right=False) + 1).astype(int)
-
-def bucket_stats(scores: np.ndarray, y: Optional[np.ndarray], edges: np.ndarray) -> pd.DataFrame:
-    b = assign_bucket(scores, edges)
-    dfb = pd.DataFrame({"bucket": b, "p": scores})
-    if y is not None and len(y) == len(scores):
-        dfb["y"] = y.astype(int)
-        tab = (dfb.groupby("bucket", as_index=True)
-                  .agg(count=("y", "size"),
-                       events=("y", "sum"),
-                       proba_mean=("p", "mean"))
-                  .sort_index())
-        tab["pd"] = tab["events"] / tab["count"].where(tab["count"] > 0, 1)
+# ==============================================================================
+# 7. BUCKETING & MASTER SCALE
+# ==============================================================================
+def create_risk_buckets(
+    scores: np.ndarray, 
+    y: np.ndarray, 
+    n_buckets: int = 10, 
+    fixed_edges: Optional[List[float]] = None
+) -> Tuple[List[float], pd.DataFrame, bool]:
+    df = pd.DataFrame({"score": scores, "y": y})
+    
+    if fixed_edges is not None:
+        edges = np.array(fixed_edges)
+        edges[0] = -np.inf
+        edges[-1] = np.inf
     else:
-        tab = (dfb.groupby("bucket", as_index=True)
-                 .agg(count=("p", "size"),
-                      proba_mean=("p", "mean"))
-                 .sort_index())
-        tab["events"] = np.nan
-        tab["pd"] = np.nan
-    tab.reset_index(inplace=True)
-    return tab
+        qs = np.linspace(0, 1, n_buckets + 1)
+        edges = np.unique(np.quantile(scores, qs))
+        edges[0] = -np.inf
+        edges[-1] = np.inf
 
-# -----------------------------
-# CLI
-# -----------------------------
+    df["bucket"] = np.digitize(df["score"], edges[1:], right=True) + 1
+    
+    stats = df.groupby("bucket").agg(
+        count=("y", "size"),
+        bad=("y", "sum"),
+        min_score=("score", "min"),
+        max_score=("score", "max"),
+        mean_score=("score", "mean")
+    ).reset_index()
+    
+    stats["good"] = stats["count"] - stats["bad"]
+    stats["pd"] = stats["bad"] / stats["count"]
+    
+    pds = stats["pd"].values
+    # Check monotonicity strictly
+    is_monotonic_decreasing = np.all(np.diff(pds) <= 0) 
+    stats["monotonic_check"] = is_monotonic_decreasing
+    
+    return edges.tolist(), stats, is_monotonic_decreasing
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
 def parse_args():
-    p = argparse.ArgumentParser(
-        "Train depuis données binners (BIN → WOE) + calibration isotonic + ablation + prior-shift."
-    )
+    p = argparse.ArgumentParser()
     p.add_argument("--train", required=True)
     p.add_argument("--validation", required=True)
     p.add_argument("--target", required=True)
     p.add_argument("--artifacts", default="artifacts/model_from_binned")
-    p.add_argument("--bin-suffix", default="__BIN")     # tag (préfixe OU suffixe)
+    p.add_argument("--bin-suffix", default="__BIN")
     p.add_argument("--corr-threshold", type=float, default=0.85)
     p.add_argument("--cv-folds", type=int, default=5)
-    p.add_argument("--no-isotonic", action="store_true")
-    # PSI / ablation / prior-shift
-    p.add_argument("--drop-proxy-cutoff", type=float, default=None)
-    p.add_argument("--conditional-proxies", default="")
-    p.add_argument("--no-prior-shift-adjust", action="store_true")
-    p.add_argument("--ablation-max-steps", type=int, default=10)
-    p.add_argument("--ablation-max-auc-loss", type=float, default=0.02)
-    # timing
-    p.add_argument("--timing", action="store_true", help="Sauve timings.json + résumé final en stdout")
-    p.add_argument("--timing-live", action="store_true", help="Affiche le timing de chaque section en live")
-    # bucketing
-    p.add_argument("--n-buckets", type=int, default=10, help="Nombre de classes risque (quantiles)")
+    p.add_argument("--calibration", default="isotonic", help="none, sigmoid, isotonic")
+    p.add_argument("--n-buckets", type=int, default=10)
+    p.add_argument("--risk-buckets-in", default=None, help="JSON avec edges existants")
+    p.add_argument("--timing", action="store_true")
     return p.parse_args()
 
 def main():
     args = parse_args()
     artifacts = Path(args.artifacts)
     artifacts.mkdir(parents=True, exist_ok=True)
-    timer = Timer(live=args.timing_live) if (args.timing or args.timing_live) else None
-    nullctx = contextlib.nullcontext()
-    tctx = (lambda name: timer.section(name)) if timer else (lambda name: nullctx)
+    
+    timer = Timer(live=True)
+    
+    df_tr = load_any(args.train)
+    df_va = load_any(args.validation)
+    
+    out = train_pipeline(
+        df_tr, df_va, args.target, args.bin_suffix,
+        args.corr_threshold, args.cv_folds, args.calibration,
+        timer
+    )
+    
+    print("\n--- Construction de la Grille de Notation (Master Scale) ---")
+    
+    fixed_edges = None
+    if args.risk_buckets_in and Path(args.risk_buckets_in).exists():
+        print(f"-> Chargement de la grille existante : {args.risk_buckets_in}")
+        with open(args.risk_buckets_in) as f:
+            fixed_edges = json.load(f)["edges"]
 
-    with tctx("load_data"):
-        df_tr = load_any(args.train)
-        df_va = load_any(args.validation)
-        if args.target not in df_tr.columns or args.target not in df_va.columns:
-            raise SystemExit(f"Target '{args.target}' absente de train/validation.")
+    edges, stats_tr, mono_tr = create_risk_buckets(out["score_tr"], out["y_tr"], args.n_buckets, fixed_edges)
+    _, stats_va, mono_va = create_risk_buckets(out["score_va"], out["y_va"], args.n_buckets, edges)
 
-    with tctx("parse_args"):
-        cond_proxies = [s.strip() for s in args.conditional_proxies.split(",") if s.strip()] if args.conditional_proxies else None
+    print("\n[Statistiques TRAIN (Model Fit Split)]")
+    print(stats_tr[["bucket", "min_score", "max_score", "count", "pd"]].to_string(index=False))
+    
+    print("\n[Statistiques VALIDATION]")
+    print(stats_va[["bucket", "min_score", "max_score", "count", "pd"]].to_string(index=False))
+    
+    # Affichage des métriques complètes
+    print("\n[Métriques Complètes]")
+    for k, v in out['metrics'].items():
+         print(f"  {k:20s}: {v:.4f}")
 
-    with tctx("train_from_binned"):
-        out = train_from_binned(
-            df_tr=df_tr, df_va=df_va, target=args.target,
-            bin_suffix=args.bin_suffix,
-            corr_threshold=args.corr_threshold, cv_folds=args.cv_folds, isotonic=(not args.no_isotonic),
-            drop_proxy_cutoff=args.drop_proxy_cutoff, conditional_proxies=cond_proxies,
-            do_prior_shift_adjust=not args.no_prior_shift_adjust,
-            ablation_max_steps=int(args.ablation_max_steps), ablation_max_auc_loss=float(args.ablation_max_auc_loss),
-            timer=timer
-        )
+    if not mono_tr: print("\n⚠️  ATTENTION: Grille non monotone sur TRAIN !")
+    else: print("\n✅ Grille robuste et monotone.")
 
-    # ---------------- Buckets (bornes + stats) ----------------
-    with tctx("save_buckets"):
-        # base = probas de validation (après prior-shift si calculé)
-        p_tr_final = np.asarray(out.get("p_tr_final", []), float)
-        p_va_final = out.get("p_va_final", None)
-        y_va = out.get("y_va", None)
-        if p_va_final is None or (isinstance(p_va_final, np.ndarray) and p_va_final.size == 0):
-            # fallback si pas de validation exploitable
-            base_scores = p_tr_final
-        else:
-            base_scores = np.asarray(p_va_final, float)
-
-        edges = safe_quantile_edges(base_scores, n=args.n_buckets)
-        # stats sur validation si y dispo, sinon sur base_scores sans PD
-        stats_df = bucket_stats(
-            scores=(np.asarray(p_va_final, float) if p_va_final is not None else base_scores),
-            y=(np.asarray(y_va, int) if y_va is not None else None),
-            edges=edges
-        )
-        save_json({"edges": edges.tolist()}, artifacts / "risk_buckets.json")
-        save_json({
-            "n_buckets": int(len(edges) - 1),
-            "edges": edges.tolist(),
-            "by_bucket": stats_df.to_dict(orient="records")
-        }, artifacts / "bucket_stats.json")
-        print(f"✔ Buckets sauvés → {artifacts/'risk_buckets.json'}")
-        print(f"✔ Stats buckets → {artifacts/'bucket_stats.json'}")
-
-    with tctx("save_artifacts"):
-        dump({
-            "model": out["model"],           # CalibratedClassifierCV (post-ablation)
-            "best_lr": out["best_lr"],       # LogisticRegression "brute" (post-ablation)
-            "kept_woe": out["kept_woe"],
-            "computed_woe": out["computed_woe"],
-            "woe_maps": out["woe_maps"],
-            "target": args.target
-        }, artifacts / "model_best.joblib")
-
-        pd.DataFrame([out["metrics"]]).to_csv(artifacts / "reports.csv", index=False)
-
-        save_json({
-            "train_path": str(Path(args.train).resolve()),
-            "validation_path": str(Path(args.validation).resolve()),
-            "artifacts_dir": str(artifacts.resolve()),
-            "target": args.target,
-            "bin_suffix": args.bin_suffix,
-            "cv_folds": int(args.cv_folds),
-            "corr_threshold": float(args.corr_threshold),
-            "isotonic": bool(not args.no_isotonic),
-            "kept_woe": out["kept_woe"],
-            "computed_woe": bool(out["computed_woe"]),
-            "drop_proxy_cutoff": args.drop_proxy_cutoff,
-            "conditional_proxies": cond_proxies,
-            "prior_shift_adjust": bool(not args.no_prior_shift_adjust),
-            "ablation_max_steps": int(args.ablation_max_steps),
-            "ablation_max_auc_loss": float(args.ablation_max_auc_loss),
-            "metrics": out["metrics"],
-            "n_buckets": int(args.n_buckets)
-        }, artifacts / "meta.json")
-
-        if isinstance(out["deciles_val"], pd.DataFrame) and not out["deciles_val"].empty:
-            out["deciles_val"].to_csv(artifacts / "deciles_val.csv", index=False)
-        if isinstance(out["importance"], pd.DataFrame) and not out["importance"].empty:
-            out["importance"].to_csv(artifacts / "importance.csv", index=False)
-
-    # Affichage + export timings
-    if timer:
-        total = sum(timer.records.values())
-        print("\n⏱ Timings (s):")
-        for k, v in sorted(timer.records.items(), key=lambda kv: -kv[1]):
-            pct = (v / total * 100.0) if total > 0 else 0.0
-            print(f"  - {k:22s} {v:8.3f}s  ({pct:5.1f}%)")
-        save_json({"timings_seconds": timer.records, "total_seconds": total}, artifacts / "timings.json")
-
-    print("✔ Saved:", artifacts / "model_best.joblib")
-    print("✔ Saved:", artifacts / "reports.csv")
-    print("✔ Saved:", artifacts / "meta.json")
-    if (artifacts / "deciles_val.csv").exists():
-        print("✔ Saved:", artifacts / "deciles_val.csv")
-    if (artifacts / "importance.csv").exists():
-        print("✔ Saved:", artifacts / "importance.csv")
-    if (artifacts / "risk_buckets.json").exists():
-        print("✔ Saved:", artifacts / "risk_buckets.json")
-    if (artifacts / "bucket_stats.json").exists():
-        print("✔ Saved:", artifacts / "bucket_stats.json")
+    dump({
+        "model_pd": out["model_pd"],
+        "best_lr": out["best_lr"],
+        "woe_maps": out["woe_maps"],
+        "kept_features": out["kept_features"],
+        "calibration": args.calibration
+    }, artifacts / "model_best.joblib")
+    
+    save_json({"edges": edges}, artifacts / "risk_buckets.json")
+    
+    save_json({
+        "train": stats_tr.to_dict(orient="records"),
+        "validation": stats_va.to_dict(orient="records"),
+        "metrics": out["metrics"]
+    }, artifacts / "bucket_stats.json")
+    
+    print(f"\n✔ Modèle sauvegardé : {artifacts / 'model_best.joblib'}")
 
 if __name__ == "__main__":
     main()
