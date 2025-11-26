@@ -139,7 +139,3 @@ make clean_all
 Ce projet a été développé pour la calibration et validation de modèles PD réglementaires.
 
 * **Licence** : Propriétaire / Interne.
-
----
-
-**Prochaine étape** : Une fois ce fichier créé et le pipeline relancé (`make pipeline`), souhaitez-vous que l'on analyse ensemble le **nouveau rapport HTML** pour vérifier que les courbes AUC Train et Validation sont bien alignées (probablement autour de 0.65 - 0.75) ?

@@ -124,15 +124,13 @@ model_train:
 		--n-buckets 10
 
 # ----------------------------------------------------------------------------
-# 5. REPORTING (TRAIN & VALIDATION ONLY)
+# 5. REPORTING (TRAIN + VALIDATION dans un SEUL HTML)
 # ----------------------------------------------------------------------------
 .PHONY: report
 report:
-	@echo "\n[5/5] GENERATION DES RAPPORTS..."
-	
-	@# 1. Scoring et Rapport TRAIN
-	@echo "-> Traitement du TRAIN..."
-	# Utilise la donnée BINÉE (MODEL_TRAIN_DATA)
+	@echo "\n[5/5] GENERATION DU RAPPORT GLOBAL..."
+
+	@echo "-> Scoring TRAIN..."
 	$(PY) src/apply_model.py \
 		--data $(MODEL_TRAIN_DATA) \
 		--out $(SCORED_TRAIN_DATA) \
@@ -142,16 +140,8 @@ report:
 		--buckets $(MODEL_ARTIFACTS_DIR)/risk_buckets.json \
 		--target $(IMPUTE_TARGET_COL) \
 		--id-col loan_sequence_number
-	$(PY) src/generate_report.py \
-		--data $(SCORED_TRAIN_DATA) \
-		--out $(REPORT_TRAIN_HTML) \
-		--target $(IMPUTE_TARGET_COL) \
-		--score score --pd pd --grade grade \
-		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib
 
-	@# 2. Scoring et Rapport VALIDATION
-	@echo "-> Traitement de la VALIDATION..."
-	# Utilise la donnée BINÉE (MODEL_VAL_DATA)
+	@echo "-> Scoring VALIDATION..."
 	$(PY) src/apply_model.py \
 		--data $(MODEL_VAL_DATA) \
 		--out $(SCORED_VAL_DATA) \
@@ -161,17 +151,19 @@ report:
 		--buckets $(MODEL_ARTIFACTS_DIR)/risk_buckets.json \
 		--target $(IMPUTE_TARGET_COL) \
 		--id-col loan_sequence_number
+
+	@echo "-> Création du RAPPORT UNIQUE (Train + Validation)..."
 	$(PY) src/generate_report.py \
-		--data $(SCORED_VAL_DATA) \
-		--out $(REPORT_VAL_HTML) \
+		--train $(SCORED_TRAIN_DATA) \
+		--validation $(SCORED_VAL_DATA) \
+		--out $(REPORTS_DIR)/model_validation_report.html \
 		--target $(IMPUTE_TARGET_COL) \
 		--score score --pd pd --grade grade \
 		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib
 
-	@echo "✔ Rapports générés :"
-	@echo "  - $(REPORT_TRAIN_HTML)"
-	@echo "  - $(REPORT_VAL_HTML)"
-	@open $(REPORT_VAL_HTML) 2>/dev/null || xdg-open $(REPORT_VAL_HTML) 2>/dev/null || true
+	@echo "✔ Rapport généré : $(REPORTS_DIR)/model_validation_report.html"
+	@open $(REPORTS_DIR)/model_validation_report.html 2>/dev/null || true
+
 # ----------------------------------------------------------------------------
 # PIPELINE GLOBAL
 # ----------------------------------------------------------------------------
