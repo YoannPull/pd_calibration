@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-generate_report.py — DARK MODE PREMIUM
----------------------------------------
+generate_report.py — DARK MODE PREMIUM + GRADE TTC TABLES
+----------------------------------------------------------
 Rapport bancaire complet Train vs Validation
 Comparaisons graphiques superposées
-Dark mode professionnel
+Dark mode professionnel + tableaux TTC par grade
 """
 
 import argparse
@@ -44,7 +44,6 @@ RED = "#E06C75"
 GREEN = "#98C379"
 GREY = "#ABB2BF"
 
-
 plt.rcParams.update({
     "axes.facecolor": DARK_PANEL,
     "figure.facecolor": DARK_BG,
@@ -57,6 +56,9 @@ plt.rcParams.update({
     "grid.color": "#555555",
 })
 
+# =============================================================================
+# Base64 helper
+# =============================================================================
 
 def fig_to_base64(fig):
     buf = io.BytesIO()
@@ -66,10 +68,9 @@ def fig_to_base64(fig):
     plt.close(fig)
     return f"data:image/png;base64,{encoded}"
 
-
-# ============================================================
-#  Calibration Error (ECE)
-# ============================================================
+# =============================================================================
+# Calibration Error (ECE)
+# =============================================================================
 
 def expected_calibration_error(y_true, y_prob, n_bins=10):
     df = pd.DataFrame({"y": y_true, "pred": y_prob})
@@ -85,25 +86,21 @@ def expected_calibration_error(y_true, y_prob, n_bins=10):
     ece = float(np.sum(np.abs(grp["obs"] - grp["pred"]) * (grp["count"] / total)))
     return ece
 
-
-# ============================================================
-#  Plot functions
-# ============================================================
+# =============================================================================
+# ROC Curves
+# =============================================================================
 
 def plot_roc(train_y, train_pd, val_y, val_pd):
     fig, ax = plt.subplots(figsize=(7, 5))
 
-    # Train
     fpr_t, tpr_t, _ = roc_curve(train_y, train_pd)
     auc_t = roc_auc_score(train_y, train_pd)
 
-    # Val
     fpr_v, tpr_v, _ = roc_curve(val_y, val_pd)
     auc_v = roc_auc_score(val_y, val_pd)
 
     ax.plot(fpr_t, tpr_t, color=BLUE, lw=2, label=f"Train AUC = {auc_t:.4f}")
-    ax.plot(fpr_v, tpr_v, color=YELLOW, lw=2, linestyle="--", label=f"Validation AUC = {auc_v:.4f}")
-
+    ax.plot(fpr_v, tpr_v, color=YELLOW, lw=2, linestyle="--", label=f"Val AUC = {auc_v:.4f}")
     ax.plot([0, 1], [0, 1], "k--", lw=1)
 
     ax.set_title("ROC Curve (Train vs Validation)")
@@ -114,6 +111,9 @@ def plot_roc(train_y, train_pd, val_y, val_pd):
 
     return fig_to_base64(fig), auc_t, auc_v
 
+# =============================================================================
+# Calibration Curve
+# =============================================================================
 
 def plot_calibration(train_y, train_pd, val_y, val_pd):
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -133,27 +133,15 @@ def plot_calibration(train_y, train_pd, val_y, val_pd):
 
     return fig_to_base64(fig)
 
-# ============================================================
-#  Score Distribution
-# ============================================================
+# =============================================================================
+# Score Distribution
+# =============================================================================
 
 def plot_score_distribution(train_df, val_df, score_col, target_col):
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    sns.kdeplot(
-        train_df[score_col], 
-        label="Train", 
-        color=BLUE, 
-        lw=2, 
-        ax=ax
-    )
-    sns.kdeplot(
-        val_df[score_col], 
-        label="Validation", 
-        color=YELLOW, 
-        lw=2, 
-        ax=ax
-    )
+    sns.kdeplot(train_df[score_col], label="Train", color=BLUE, lw=2, ax=ax)
+    sns.kdeplot(val_df[score_col], label="Validation", color=YELLOW, lw=2, ax=ax)
 
     ax.set_title("Score Distribution (Train vs Validation)")
     ax.set_xlabel("Score")
@@ -163,62 +151,42 @@ def plot_score_distribution(train_df, val_df, score_col, target_col):
 
     return fig_to_base64(fig)
 
-
-# ============================================================
-#  Master Scale (Train + Validation)
-# ============================================================
+# =============================================================================
+# Master Scale + TTC tables
+# =============================================================================
 
 def plot_master_scale(train_df, val_df, grade_col, target_col, pd_col):
     fig, ax1 = plt.subplots(figsize=(10, 5))
 
-    # TRAIN grouping
     gtr = train_df.groupby(grade_col).agg(
         count=("loan_sequence_number", "size"),
         bad=(target_col, "sum"),
-        pred=("pd", "mean"),
+        pred=(pd_col, "mean"),
     ).reset_index()
-
     gtr["obs"] = gtr["bad"] / gtr["count"]
 
-    # VALIDATION grouping
     gva = val_df.groupby(grade_col).agg(
         count=("loan_sequence_number", "size"),
         bad=(target_col, "sum"),
-        pred=("pd", "mean"),
+        pred=(pd_col, "mean"),
     ).reset_index()
-
     gva["obs"] = gva["bad"] / gva["count"]
 
-    # BAR volume (Train)
-    ax1.bar(
-        gtr[grade_col] - 0.15,
-        gtr["count"],
-        width=0.3,
-        color=BLUE,
-        alpha=0.5,
-        label="Volume Train",
-    )
-
-    # BAR volume (Validation)
-    ax1.bar(
-        gva[grade_col] + 0.15,
-        gva["count"],
-        width=0.3,
-        color=YELLOW,
-        alpha=0.5,
-        label="Volume Validation",
-    )
+    # -- Bar volumes --
+    ax1.bar(gtr[grade_col] - 0.15, gtr["count"], width=0.3, color=BLUE, alpha=0.5, label="Train Volume")
+    ax1.bar(gva[grade_col] + 0.15, gva["count"], width=0.3, color=YELLOW, alpha=0.5, label="Val Volume")
 
     ax1.set_ylabel("Volume")
     ax1.set_xlabel("Grade")
 
-    # PD LINES
+    # -- PD curves --
     ax2 = ax1.twinx()
-    ax2.plot(gtr[grade_col], gtr["obs"], "o-", color=BLUE, label="Observed PD Train")
-    ax2.plot(gtr[grade_col], gtr["pred"], "x--", color=CYAN, label="Predicted PD Train")
 
-    ax2.plot(gva[grade_col], gva["obs"], "o-", color=YELLOW, label="Observed PD Validation")
-    ax2.plot(gva[grade_col], gva["pred"], "x--", color=MAGENTA, label="Predicted PD Validation")
+    ax2.plot(gtr[grade_col], gtr["obs"], "o-", color=BLUE, label="Obs PD Train")
+    ax2.plot(gtr[grade_col], gtr["pred"], "x--", color=CYAN, label="Pred PD Train")
+
+    ax2.plot(gva[grade_col], gva["obs"], "o-", color=YELLOW, label="Obs PD Val")
+    ax2.plot(gva[grade_col], gva["pred"], "x--", color=MAGENTA, label="Pred PD Val")
 
     ax2.set_ylabel("PD")
     ax2.grid(True, alpha=0.2)
@@ -228,21 +196,17 @@ def plot_master_scale(train_df, val_df, grade_col, target_col, pd_col):
 
     return fig_to_base64(fig), gtr, gva
 
-
-# ============================================================
-#  Coefficients plot
-# ============================================================
+# =============================================================================
+# Coefficients plot
+# =============================================================================
 
 def plot_coefficients(df_coef):
     df_sorted = df_coef.reindex(df_coef["Coefficient"].abs().sort_values(ascending=False).index)
 
     fig, ax = plt.subplots(figsize=(8, max(4, len(df_coef) * 0.35)))
     sns.barplot(
-        data=df_sorted,
-        x="Coefficient",
-        y="Feature",
-        palette="coolwarm",
-        ax=ax,
+        data=df_sorted, x="Coefficient", y="Feature",
+        palette="coolwarm", ax=ax
     )
 
     ax.axvline(0, color=GREY, lw=1)
@@ -251,28 +215,53 @@ def plot_coefficients(df_coef):
 
     return fig_to_base64(fig)
 
+# =============================================================================
+# TTC tables by grade
+# =============================================================================
 
-# ============================================================
-#  Args
-# ============================================================
+def build_ttc_table(gdf):
+    """
+    gdf must contain columns: grade, count, bad, obs, pred
+    TTC PD = pred (PD_train)
+    """
+
+    df = gdf.copy()
+    df["pd_ttc"] = df["pred"]
+    df["delta_abs"] = df["obs"] - df["pd_ttc"]
+    df["delta_rel"] = 100 * df["delta_abs"] / df["pd_ttc"].replace(0, np.nan)
+
+    df_final = df.rename(columns={
+        "count": "n_individus",
+        "bad": "n_defauts",
+        "obs": "pd_obs"
+    })[
+        ["grade", "n_individus", "n_defauts", "pd_obs", "pd_ttc", "delta_abs", "delta_rel"]
+    ]
+
+    df_final["delta_rel"] = df_final["delta_rel"].round(2)
+
+    return df_final.to_html(index=False)
+
+
+# =============================================================================
+# Args
+# =============================================================================
 
 def parse_args():
     p = argparse.ArgumentParser(description="Generate unified model report (Dark Mode Premium)")
-
-    p.add_argument("--train", required=True, help="Train scored parquet")
-    p.add_argument("--validation", required=True, help="Validation scored parquet")
-    p.add_argument("--out", required=True, help="Output HTML")
+    p.add_argument("--train", required=True)
+    p.add_argument("--validation", required=True)
+    p.add_argument("--out", required=True)
     p.add_argument("--target", default="default_24m")
     p.add_argument("--score", default="score")
     p.add_argument("--pd", default="pd")
     p.add_argument("--grade", default="grade")
-    p.add_argument("--model", required=True, help="Path to model_best.joblib")
-
+    p.add_argument("--model", required=True)
     return p.parse_args()
 
-# ============================================================
-#  HTML GENERATION — DARK MODE PREMIUM
-# ============================================================
+# =============================================================================
+# HTML GENERATION
+# =============================================================================
 
 def build_html(
     out_path,
@@ -282,9 +271,11 @@ def build_html(
     cal_img,
     dist_img,
     ms_img,
-    coef_img,
     gtr_table_html,
     gva_table_html,
+    ttc_train_html,
+    ttc_val_html,
+    coef_img,
     coef_table_html,
     intercept_val
 ):
@@ -292,84 +283,60 @@ def build_html(
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <title>Credit Risk Model Report — Dark Mode Premium</title>
+<meta charset="utf-8">
+<title>Credit Risk Model Report — Dark Mode Premium</title>
 
-    <style>
-        body {{
-            background-color: #1E1E1E;
-            font-family: Arial, sans-serif;
-            color: #D0D0D0;
-            margin: 0;
-            padding: 0;
-        }}
+<style>
+    body {{
+        background-color: #1E1E1E;
+        font-family: Arial, sans-serif;
+        color: #D0D0D0;
+        margin: 0;
+        padding: 0;
+    }}
 
-        .container {{
-            max-width: 1200px;
-            margin: auto;
-            padding: 30px;
-            background-color: #1E1E1E;
-        }}
+    .container {{
+        max-width: 1200px;
+        margin: auto;
+        padding: 30px;
+        background-color: #1E1E1E;
+    }}
 
-        h1, h2, h3 {{
-            color: #E8E8E8;
-        }}
+    h1, h2, h3 {{
+        color: #E8E8E8;
+    }}
 
-        .section {{
-            margin-top: 40px;
-            padding: 20px;
-            background-color: #2A2A2A;
-            border-radius: 8px;
-        }}
+    .section {{
+        margin-top: 40px;
+        padding: 20px;
+        background-color: #2A2A2A;
+        border-radius: 8px;
+    }}
 
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-            color: #E8E8E8;
-        }}
+    table {{
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 20px;
+        color: #E8E8E8;
+    }}
 
-        th {{
-            background-color: #333333;
-            padding: 8px;
-        }}
+    th {{
+        background-color: #333333;
+        padding: 8px;
+    }}
 
-        td {{
-            background-color: #2E2E2E;
-            padding: 8px;
-            text-align: center;
-        }}
+    td {{
+        background-color: #2E2E2E;
+        padding: 8px;
+        text-align: center;
+    }}
 
-        img {{
-            width: 100%;
-            border-radius: 6px;
-            margin-top: 15px;
-        }}
-
-        .metric-grid {{
-            display: grid;
-            grid-template-columns: repeat(6, 1fr);
-            gap: 12px;
-            margin-top: 20px;
-        }}
-
-        .metric-box {{
-            background-color: #2A2A2A;
-            padding: 12px;
-            border-radius: 6px;
-            text-align: center;
-        }}
-
-        .metric-title {{
-            font-size: 0.9rem;
-            color: #BBBBBB;
-        }}
-
-        .metric-value {{
-            font-size: 1.6rem;
-            color: #4EA8FF;
-        }}
-    </style>
+img {{
+    width: 100%;
+    border-radius: 6px;
+    margin-top: 15px;
+}}
+</style>
 </head>
 
 <body>
@@ -378,12 +345,9 @@ def build_html(
     <h1>Credit Risk Model — Full Validation Report</h1>
     <p><strong>Generated:</strong> {time.strftime("%Y-%m-%d %H:%M:%S")}</p>
 
-    <!-- ======================================================== -->
-    <!-- 1. GLOBAL METRICS -->
-    <!-- ======================================================== -->
+    <!-- GLOBAL METRICS -->
     <div class="section">
         <h2>1. Global Metrics (Train vs Validation)</h2>
-
         <table>
             <tr>
                 <th>Metric</th>
@@ -398,56 +362,48 @@ def build_html(
         </table>
     </div>
 
-    <!-- ======================================================== -->
-    <!-- 2. ROC -->
-    <!-- ======================================================== -->
+    <!-- ROC -->
     <div class="section">
-        <h2>2. ROC Curve (Train vs Validation)</h2>
-        <img src="{roc_img}" />
+        <h2>2. ROC Curve</h2>
+        <img src="{roc_img}">
     </div>
 
-    <!-- ======================================================== -->
-    <!-- 3. Calibration -->
-    <!-- ======================================================== -->
+    <!-- Calibration -->
     <div class="section">
-        <h2>3. Calibration Curve (Train vs Validation)</h2>
-        <img src="{cal_img}" />
+        <h2>3. Calibration Curve</h2>
+        <img src="{cal_img}">
     </div>
 
-    <!-- ======================================================== -->
-    <!-- 4. Score Distribution -->
-    <!-- ======================================================== -->
+    <!-- Score Dist -->
     <div class="section">
         <h2>4. Score Distribution</h2>
-        <img src="{dist_img}" />
+        <img src="{dist_img}">
     </div>
 
-    <!-- ======================================================== -->
-    <!-- 5. Master Scale -->
-    <!-- ======================================================== -->
+    <!-- Master Scale -->
     <div class="section">
         <h2>5. Master Scale Analysis (Train + Validation)</h2>
-        <img src="{ms_img}" />
+        <img src="{ms_img}">
 
         <h3>Train Grades</h3>
         {gtr_table_html}
 
         <h3>Validation Grades</h3>
         {gva_table_html}
+
+        <h3>Train TTC Table</h3>
+        {ttc_train_html}
+
+        <h3>Validation TTC Table</h3>
+        {ttc_val_html}
     </div>
 
-    <!-- ======================================================== -->
-    <!-- 6. Model Coefficients -->
-    <!-- ======================================================== -->
+    <!-- Coefficients -->
     <div class="section">
-        <h2>6. Model Specification</h2>
-
+        <h2>6. Model Coefficients</h2>
         <p><strong>Intercept:</strong> {intercept_val:.6f}</p>
-
-        <h3>Coefficients (Graph)</h3>
-        <img src="{coef_img}" />
-
-        <h3>Coefficients (Table)</h3>
+        <img src="{coef_img}">
+        <h3>Coefficients Table</h3>
         {coef_table_html}
     </div>
 
@@ -459,33 +415,30 @@ def build_html(
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-
-# ============================================================
-#  MAIN
-# ============================================================
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     args = parse_args()
 
-    print(f"Loading scored TRAIN: {args.train}")
-    print(f"Loading scored VAL:   {args.validation}")
+    print(f"Loading TRAIN: {args.train}")
+    print(f"Loading VALIDATION: {args.validation}")
 
     train_df = pd.read_parquet(args.train)
     val_df = pd.read_parquet(args.validation)
 
-    # Filter NA target to avoid errors
+    # Drop NA target
     train_df = train_df.dropna(subset=[args.target])
     val_df = val_df.dropna(subset=[args.target])
 
     y_tr = train_df[args.target].astype(int).values
-    pd_tr = train_df[args.pd].astype(float).values
-
     y_va = val_df[args.target].astype(int).values
+
+    pd_tr = train_df[args.pd].astype(float).values
     pd_va = val_df[args.pd].astype(float).values
 
-    # ========================================================
     # METRICS
-    # ========================================================
     train_metrics = dict(
         auc=roc_auc_score(y_tr, pd_tr),
         gini=2 * roc_auc_score(y_tr, pd_tr) - 1,
@@ -502,17 +455,13 @@ def main():
         ece=expected_calibration_error(y_va, pd_va),
     )
 
-    # ========================================================
     # PLOTS
-    # ========================================================
     roc_img, _, _ = plot_roc(y_tr, pd_tr, y_va, pd_va)
     cal_img = plot_calibration(y_tr, pd_tr, y_va, pd_va)
     dist_img = plot_score_distribution(train_df, val_df, args.score, args.target)
     ms_img, gtr, gva = plot_master_scale(train_df, val_df, args.grade, args.target, args.pd)
 
-    # ========================================================
-    # MODEL COEFFICIENTS
-    # ========================================================
+    # MODEL COEFS
     model_pkg = joblib.load(args.model)
     best_lr = model_pkg["best_lr"]
     kept = model_pkg["kept_features"]
@@ -523,17 +472,18 @@ def main():
     coef_img = plot_coefficients(coef_df)
     coef_table_html = coef_df.to_html(index=False)
 
-    # ========================================================
-    # GRADE TABLES
-    # ========================================================
-    gtr_table_html = gtr.to_html(index=False)
-    gva_table_html = gva.to_html(index=False)
+    # TTC TABLES
+    gtr2 = gtr.copy()
+    gtr2["grade"] = gtr2[args.grade]
+    gva2 = gva.copy()
+    gva2["grade"] = gva2[args.grade]
 
-    # ========================================================
-    # HTML OUTPUT
-    # ========================================================
+    ttc_train_html = build_ttc_table(gtr2)
+    ttc_val_html = build_ttc_table(gva2)
+
+    # OUTPUT HTML
     out_path = Path(args.out)
-    out_path.parent.mkdir(exist_ok=True, parents=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     build_html(
         out_path=out_path,
@@ -543,15 +493,16 @@ def main():
         cal_img=cal_img,
         dist_img=dist_img,
         ms_img=ms_img,
+        gtr_table_html=gtr.to_html(index=False),
+        gva_table_html=gva.to_html(index=False),
+        ttc_train_html=ttc_train_html,
+        ttc_val_html=ttc_val_html,
         coef_img=coef_img,
-        gtr_table_html=gtr_table_html,
-        gva_table_html=gva_table_html,
         coef_table_html=coef_table_html,
         intercept_val=intercept_val,
     )
 
     print(f"\n✔ Report generated: {out_path}")
-
 
 if __name__ == "__main__":
     main()
