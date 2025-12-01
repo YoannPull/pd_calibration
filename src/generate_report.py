@@ -14,6 +14,7 @@ import base64
 import io
 import sys
 import time
+import json
 from pathlib import Path
 
 import numpy as np
@@ -219,14 +220,21 @@ def plot_coefficients(df_coef):
 # TTC tables by grade
 # =============================================================================
 
-def build_ttc_table(gdf):
+def build_ttc_table(gdf, pd_ttc_map=None):
     """
     gdf must contain columns: grade, count, bad, obs, pred
-    TTC PD = pred (PD_train)
+    pd_ttc_map: dict {grade -> PD_TTC_master_scale}
+        - si fourni : PD TTC issue de la master scale (bucket_stats.json)
+        - sinon : on prend 'pred' (PD moyenne de l'échantillon)
     """
-
     df = gdf.copy()
-    df["pd_ttc"] = df["pred"]
+
+    if pd_ttc_map is not None:
+        df["pd_ttc"] = df["grade"].map(pd_ttc_map)
+    else:
+        # fallback : ancienne logique — PD TTC = PD moyenne prédite par grade
+        df["pd_ttc"] = df["pred"]
+
     df["delta_abs"] = df["obs"] - df["pd_ttc"]
     df["delta_rel"] = 100 * df["delta_abs"] / df["pd_ttc"].replace(0, np.nan)
 
@@ -242,6 +250,35 @@ def build_ttc_table(gdf):
 
     return df_final.to_html(index=False)
 
+# =============================================================================
+# Charger la PD TTC de master scale (bucket_stats.json)
+# =============================================================================
+
+def load_pd_ttc_from_master_scale(bucket_stats_path: Path):
+    """
+    Lit bucket_stats.json (généré au training) et retourne un dict:
+        {grade/bucket -> PD_TTC}
+    basé sur la section "train".
+    """
+    if not bucket_stats_path.exists():
+        print(f"[WARN] bucket_stats.json non trouvé à {bucket_stats_path}. "
+              f"Les TTC tables utiliseront la PD moyenne prédite par grade.", file=sys.stderr)
+        return None
+
+    stats = json.loads(bucket_stats_path.read_text())
+    train_stats = stats.get("train", [])
+    if not train_stats:
+        print(f"[WARN] Section 'train' manquante ou vide dans bucket_stats.json.", file=sys.stderr)
+        return None
+
+    df_train = pd.DataFrame(train_stats)
+    # On s'attend à avoir au moins les colonnes: 'bucket' et 'pd'
+    if "bucket" not in df_train.columns or "pd" not in df_train.columns:
+        print(f"[WARN] Colonnes 'bucket'/'pd' manquantes dans bucket_stats.json.", file=sys.stderr)
+        return None
+
+    pd_ttc_map = df_train.set_index("bucket")["pd"].to_dict()
+    return pd_ttc_map
 
 # =============================================================================
 # Args
@@ -257,6 +294,9 @@ def parse_args():
     p.add_argument("--pd", default="pd")
     p.add_argument("--grade", default="grade")
     p.add_argument("--model", required=True)
+    # optionnel: chemin explicite vers bucket_stats.json
+    p.add_argument("--bucket-stats", default=None,
+                   help="Path to bucket_stats.json (for PD TTC master scale). Default: same folder as model.")
     return p.parse_args()
 
 # =============================================================================
@@ -331,11 +371,11 @@ def build_html(
         text-align: center;
     }}
 
-img {{
-    width: 100%;
-    border-radius: 6px;
-    margin-top: 15px;
-}}
+    img {{
+        width: 100%;
+        border-radius: 6px;
+        margin-top: 15px;
+    }}
 </style>
 </head>
 
@@ -391,10 +431,10 @@ img {{
         <h3>Validation Grades</h3>
         {gva_table_html}
 
-        <h3>Train TTC Table</h3>
+        <h3>Train TTC Table (PD TTC = Master Scale)</h3>
         {ttc_train_html}
 
-        <h3>Validation TTC Table</h3>
+        <h3>Validation TTC Table (PD TTC = Master Scale)</h3>
         {ttc_val_html}
     </div>
 
@@ -472,14 +512,23 @@ def main():
     coef_img = plot_coefficients(coef_df)
     coef_table_html = coef_df.to_html(index=False)
 
+    # Charger PD TTC master scale depuis bucket_stats.json
+    if args.bucket_stats is not None:
+        bucket_stats_path = Path(args.bucket_stats)
+    else:
+        # par défaut: même dossier que le modèle
+        bucket_stats_path = Path(args.model).with_name("bucket_stats.json")
+
+    pd_ttc_map = load_pd_ttc_from_master_scale(bucket_stats_path)
+
     # TTC TABLES
     gtr2 = gtr.copy()
     gtr2["grade"] = gtr2[args.grade]
     gva2 = gva.copy()
     gva2["grade"] = gva2[args.grade]
 
-    ttc_train_html = build_ttc_table(gtr2)
-    ttc_val_html = build_ttc_table(gva2)
+    ttc_train_html = build_ttc_table(gtr2, pd_ttc_map=pd_ttc_map)
+    ttc_val_html = build_ttc_table(gva2, pd_ttc_map=pd_ttc_map)
 
     # OUTPUT HTML
     out_path = Path(args.out)

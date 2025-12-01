@@ -13,8 +13,8 @@ Principes :
 - PD calibrée via isotonic regression.
 - Master Scale (10 buckets) monotone.
 - Code propre, lisible, industrialisable.
+- Sauvegarde train_scored / validation_scored avec vintage & loan_sequence_number.
 
-Auteur : ChatGPT — Version A (clean seulement train + apply)
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def save_json(obj: dict, path: Path):
 
 
 class Timer:
-    def __init__(self, live=False):
+    def __init__(self, live: bool = False):
         self.records = {}
         self.live = live
 
@@ -75,7 +75,12 @@ class Timer:
 def raw_name_from_bin(col: str, tag: str) -> str:
     return col.replace(tag, "") if tag in col else col
 
-def build_woe_maps(df: pd.DataFrame, target: str, raw_to_bin: Dict[str, str], smooth=0.5) -> Dict[str, Any]:
+def build_woe_maps(
+    df: pd.DataFrame,
+    target: str,
+    raw_to_bin: Dict[str, str],
+    smooth: float = 0.5
+) -> Dict[str, Any]:
     """WOE map learned on full TRAIN (robuste)."""
     y = df[target].astype(int)
     tot_bad = y.sum()
@@ -83,21 +88,21 @@ def build_woe_maps(df: pd.DataFrame, target: str, raw_to_bin: Dict[str, str], sm
 
     global_woe = float(np.log((tot_bad + smooth) / (tot_good + smooth)))
 
-    maps = {}
+    maps: Dict[str, Any] = {}
 
     for raw, bin_col in raw_to_bin.items():
         tab = df.groupby(bin_col)[target].agg(["sum", "count"])
         tab["good"] = tab["count"] - tab["sum"]
 
-        # WOE(i) = log( (bad_i+prior)/(good_i+prior) ) - log(global odds)
         bad_i = tab["sum"].values.astype(float)
         good_i = tab["good"].values.astype(float)
 
+        # WOE(i) = log( (bad_i+prior)/(good_i+prior) )
         woe_i = np.log((bad_i + smooth) / (good_i + smooth))
 
         maps[raw] = {
             "map": {int(k): float(v) for k, v in zip(tab.index, woe_i)},
-            "default": global_woe
+            "default": global_woe,
         }
     return maps
 
@@ -154,7 +159,7 @@ def select_features(X: pd.DataFrame, corr_thr=0.85):
     X = X.fillna(0)
     order = X.var().sort_values(ascending=False).index.tolist()
 
-    kept = []
+    kept: List[str] = []
     corr = X.corr().abs()
 
     for c in order:
@@ -189,7 +194,7 @@ def create_risk_buckets(scores, y, n_buckets=10, fixed_edges=None):
         count=("y", "size"),
         bad=("y", "sum"),
         min_score=("score", "min"),
-        max_score=("score", "max")
+        max_score=("score", "max"),
     ).reset_index()
 
     stats["pd"] = stats["bad"] / stats["count"]
@@ -203,7 +208,26 @@ def create_risk_buckets(scores, y, n_buckets=10, fixed_edges=None):
 # MAIN TRAINING PIPELINE
 # ---------------------------------------------------------------------------
 
-def train_pipeline(df_tr, df_va, target, bin_suffix, corr_threshold, cv_folds, calibration_method, timer):
+META_COLS = ["vintage", "loan_sequence_number"]  # conservés, jamais utilisés comme features
+
+
+def train_pipeline(
+    df_tr: pd.DataFrame,
+    df_va: pd.DataFrame,
+    target: str,
+    bin_suffix: str,
+    corr_threshold: float,
+    cv_folds: int,
+    calibration_method: str,
+    timer: Timer,
+):
+
+    # -------------------------------------------------
+    # Meta (pour analyse future, pas features)
+    # -------------------------------------------------
+    meta_cols_present = [c for c in META_COLS if c in df_tr.columns and c in df_va.columns]
+    meta_tr = df_tr[meta_cols_present].copy()
+    meta_va = df_va[meta_cols_present].copy()
 
     # -------------------------------------------------
     # Identify binned features
@@ -211,9 +235,11 @@ def train_pipeline(df_tr, df_va, target, bin_suffix, corr_threshold, cv_folds, c
     with timer.section("Identify BIN features"):
         bin_cols = [c for c in df_tr.columns if bin_suffix in c]
 
-        BLACKLIST = ["quarter", "year", "month", "vintage", "date", "time",
-                     "maturity", "first_payment", "mi_cancellation",
-                     "interest_rate", "loan_sequence_number"]
+        BLACKLIST = [
+            "quarter", "year", "month", "vintage", "date", "time",
+            "maturity", "first_payment", "mi_cancellation",
+            "interest_rate", "loan_sequence_number",
+        ]
 
         def safe(col):
             raw = raw_name_from_bin(col, bin_suffix).lower()
@@ -230,11 +256,11 @@ def train_pipeline(df_tr, df_va, target, bin_suffix, corr_threshold, cv_folds, c
 
         Xtr_full = apply_woe(df_tr, woe_maps, bin_suffix)
         Xtr_full = add_interactions(Xtr_full)
-        ytr_full = df_tr[target].astype(int).values
+        ytr_full = df_tr[target].astype(int)
 
         Xva_full = apply_woe(df_va, woe_maps, bin_suffix)
         Xva_full = add_interactions(Xva_full)
-        yva_full = df_va[target].astype(int).values
+        yva_full = df_va[target].astype(int)
 
     # -------------------------------------------------
     # Calibration split
@@ -245,13 +271,15 @@ def train_pipeline(df_tr, df_va, target, bin_suffix, corr_threshold, cv_folds, c
         )
 
     # -------------------------------------------------
-    # Feature selection on X_model
+    # Feature selection (sur X_model)
     # -------------------------------------------------
     with timer.section("Feature Selection"):
-        kept_features = select_features(pd.DataFrame(X_model), corr_thr=corr_threshold)
-        X_model = pd.DataFrame(X_model)[kept_features].values
-        X_cal = pd.DataFrame(X_cal)[kept_features].values
-        X_va = pd.DataFrame(Xva_full)[kept_features].values
+        kept_features = select_features(X_model, corr_thr=corr_threshold)
+
+        X_model_kept = X_model[kept_features].values
+        X_cal_kept = X_cal[kept_features].values
+        Xtr_full_kept = Xtr_full[kept_features].values
+        Xva_full_kept = Xva_full[kept_features].values
 
     # -------------------------------------------------
     # Logistic Regression
@@ -262,19 +290,19 @@ def train_pipeline(df_tr, df_va, target, bin_suffix, corr_threshold, cv_folds, c
 
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
         gs = GridSearchCV(lr, grid, cv=cv, scoring="roc_auc", n_jobs=-1)
-        gs.fit(X_model, y_model)
+        gs.fit(X_model_kept, y_model.values)
 
         best_lr = gs.best_estimator_
 
     # -------------------------------------------------
-    # Score (raw log-odds)
+    # Score TTC (log-odds sur TOUT le train + TOUTE la validation)
     # -------------------------------------------------
     with timer.section("Raw score scaling"):
-        log_odds_tr = best_lr.decision_function(X_model)
-        log_odds_va = best_lr.decision_function(X_va)
+        log_odds_tr_full = best_lr.decision_function(Xtr_full_kept)
+        log_odds_va_full = best_lr.decision_function(Xva_full_kept)
 
-        score_tr = scale_score(log_odds_tr)
-        score_va = scale_score(log_odds_va)
+        score_tr_full = scale_score(log_odds_tr_full)
+        score_va_full = scale_score(log_odds_va_full)
 
     # -------------------------------------------------
     # Calibration Isotonic Regression
@@ -282,25 +310,29 @@ def train_pipeline(df_tr, df_va, target, bin_suffix, corr_threshold, cv_folds, c
     with timer.section("Calibration"):
         if calibration_method != "none":
             calibrator = CalibratedClassifierCV(best_lr, method=calibration_method, cv="prefit")
-            calibrator.fit(X_cal, y_cal)
+            calibrator.fit(X_cal_kept, y_cal.values)
             model_pd = calibrator
         else:
             model_pd = best_lr
 
-        pd_tr = model_pd.predict_proba(X_model)[:, 1]
-        pd_va = model_pd.predict_proba(X_va)[:, 1]
+        # PD pour les jeux utilisés pour les métriques
+        pd_tr_model = model_pd.predict_proba(X_model_kept)[:, 1]
+        pd_va_full = model_pd.predict_proba(Xva_full_kept)[:, 1]
+
+        # PD sur TOUT le train (pour train_scored)
+        pd_tr_full = model_pd.predict_proba(Xtr_full_kept)[:, 1]
 
     # -------------------------------------------------
-    # Metrics
+    # Metrics (sur subset modèle pour le train, full pour la val)
     # -------------------------------------------------
     metrics = {
-        "train_auc": float(roc_auc_score(y_model, pd_tr)),
-        "val_auc": float(roc_auc_score(yva_full, pd_va)),
-        "train_logloss": float(log_loss(y_model, pd_tr)),
-        "val_logloss": float(log_loss(yva_full, pd_va)),
-        "train_brier": float(brier_score_loss(y_model, pd_tr)),
-        "val_brier": float(brier_score_loss(yva_full, pd_va)),
-        "n_features": len(kept_features)
+        "train_auc": float(roc_auc_score(y_model, pd_tr_model)),
+        "val_auc": float(roc_auc_score(yva_full, pd_va_full)),
+        "train_logloss": float(log_loss(y_model, pd_tr_model)),
+        "val_logloss": float(log_loss(yva_full, pd_va_full)),
+        "train_brier": float(brier_score_loss(y_model, pd_tr_model)),
+        "val_brier": float(brier_score_loss(yva_full, pd_va_full)),
+        "n_features": len(kept_features),
     }
 
     return {
@@ -309,10 +341,14 @@ def train_pipeline(df_tr, df_va, target, bin_suffix, corr_threshold, cv_folds, c
         "woe_maps": woe_maps,
         "kept_features": kept_features,
         "metrics": metrics,
-        "score_tr": score_tr,
-        "score_va": score_va,
-        "y_tr": y_model,
-        "y_va": yva_full,
+        "score_tr": score_tr_full,      # score TTC full train
+        "score_va": score_va_full,      # score TTC full val
+        "pd_tr": pd_tr_full,            # PD full train
+        "pd_va": pd_va_full,            # PD full val
+        "y_tr": ytr_full.values,
+        "y_va": yva_full.values,
+        "meta_tr": meta_tr,
+        "meta_va": meta_va,
     }
 
 
@@ -341,7 +377,7 @@ def main():
     artifacts = Path(args.artifacts)
     artifacts.mkdir(parents=True, exist_ok=True)
 
-    timer = Timer(live=True)
+    timer = Timer(live=args.timing)
 
     df_tr = load_any(args.train)
     df_va = load_any(args.validation)
@@ -352,7 +388,7 @@ def main():
         args.cv_folds, args.calibration, timer
     )
 
-    # MASTER SCALE
+    # MASTER SCALE (buckets sur scores TTC full train / full val)
     fixed_edges = None
     if args.risk_buckets_in and Path(args.risk_buckets_in).exists():
         fixed_edges = json.loads(Path(args.risk_buckets_in).read_text())["edges"]
@@ -372,20 +408,44 @@ def main():
     print("\n[MONOTONICITÉ TRAIN] :", "OK" if mono_tr else "NON MONOTONE")
     print("[MONOTONICITÉ VAL]   :", "OK" if mono_va else "NON MONOTONE")
 
+    # Sauvegarde du modèle + artefacts grille
     dump({
         "model_pd": out["model_pd"],
         "best_lr": out["best_lr"],
         "woe_maps": out["woe_maps"],
         "kept_features": out["kept_features"],
-        "calibration": args.calibration
+        "calibration": args.calibration,
     }, artifacts / "model_best.joblib")
 
     save_json({"edges": edges}, artifacts / "risk_buckets.json")
     save_json({
         "train": stats_tr.to_dict(orient="records"),
         "validation": stats_va.to_dict(orient="records"),
-        "metrics": out["metrics"]
+        "metrics": out["metrics"],
     }, artifacts / "bucket_stats.json")
+
+    # ------------------------------------------------------------------
+    # train_scored / validation_scored
+    # ------------------------------------------------------------------
+    # Grade = bucket (1..n_buckets) calculé à partir des edges
+    grade_tr = np.digitize(out["score_tr"], edges[1:], right=True) + 1
+    grade_va = np.digitize(out["score_va"], edges[1:], right=True) + 1
+
+    # Train scored
+    train_scored = out["meta_tr"].copy()
+    train_scored["target"] = out["y_tr"]
+    train_scored["score_ttc"] = out["score_tr"]
+    train_scored["pd"] = out["pd_tr"]
+    train_scored["grade"] = grade_tr
+    train_scored.to_csv(artifacts / "train_scored.csv", index=False)
+
+    # Validation scored
+    validation_scored = out["meta_va"].copy()
+    validation_scored["target"] = out["y_va"]
+    validation_scored["score_ttc"] = out["score_va"]
+    validation_scored["pd"] = out["pd_va"]
+    validation_scored["grade"] = grade_va
+    validation_scored.to_csv(artifacts / "validation_scored.csv", index=False)
 
 
 if __name__ == "__main__":
