@@ -13,8 +13,8 @@ Principes :
 - PD calibrée via isotonic regression.
 - Master Scale (10 buckets) monotone.
 - Code propre, lisible, industrialisable.
-- Sauvegarde train_scored / validation_scored avec vintage & loan_sequence_number.
-
+- Sauvegarde train_scored / validation_scored avec vintage & loan_sequence_number
+  dans data/processed/scored (et plus dans artifacts).
 """
 
 from __future__ import annotations
@@ -22,9 +22,8 @@ import argparse
 import json
 from pathlib import Path
 import contextlib
-import sys
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -368,6 +367,11 @@ def parse_args():
     p.add_argument("--calibration", default="isotonic")
     p.add_argument("--n-buckets", type=int, default=10)
     p.add_argument("--risk-buckets-in", default=None)
+    p.add_argument(
+        "--scored-outdir",
+        default="data/processed/scored",
+        help="Répertoire où écrire train_scored / validation_scored (parquet).",
+    )
     p.add_argument("--timing", action="store_true")
     return p.parse_args()
 
@@ -376,6 +380,9 @@ def main():
     args = parse_args()
     artifacts = Path(args.artifacts)
     artifacts.mkdir(parents=True, exist_ok=True)
+
+    scored_dir = Path(args.scored_outdir)
+    scored_dir.mkdir(parents=True, exist_ok=True)
 
     timer = Timer(live=args.timing)
 
@@ -408,7 +415,7 @@ def main():
     print("\n[MONOTONICITÉ TRAIN] :", "OK" if mono_tr else "NON MONOTONE")
     print("[MONOTONICITÉ VAL]   :", "OK" if mono_va else "NON MONOTONE")
 
-    # Sauvegarde du modèle + artefacts grille
+    # Sauvegarde du modèle + artefacts grille (toujours dans artifacts)
     dump({
         "model_pd": out["model_pd"],
         "best_lr": out["best_lr"],
@@ -425,27 +432,33 @@ def main():
     }, artifacts / "bucket_stats.json")
 
     # ------------------------------------------------------------------
-    # train_scored / validation_scored
+    # train_scored / validation_scored -> data/processed/scored
     # ------------------------------------------------------------------
-    # Grade = bucket (1..n_buckets) calculé à partir des edges
     grade_tr = np.digitize(out["score_tr"], edges[1:], right=True) + 1
     grade_va = np.digitize(out["score_va"], edges[1:], right=True) + 1
 
     # Train scored
     train_scored = out["meta_tr"].copy()
-    train_scored["target"] = out["y_tr"]
+    # on garde la vraie cible sous son nom
+    train_scored[args.target] = out["y_tr"]
     train_scored["score_ttc"] = out["score_tr"]
     train_scored["pd"] = out["pd_tr"]
     train_scored["grade"] = grade_tr
-    train_scored.to_csv(artifacts / "train_scored.csv", index=False)
+
+    train_scored_path = scored_dir / "train_scored.parquet"
+    train_scored.to_parquet(train_scored_path, index=False)
+    print(f"✔ train_scored sauvegardé : {train_scored_path}")
 
     # Validation scored
     validation_scored = out["meta_va"].copy()
-    validation_scored["target"] = out["y_va"]
+    validation_scored[args.target] = out["y_va"]
     validation_scored["score_ttc"] = out["score_va"]
     validation_scored["pd"] = out["pd_va"]
     validation_scored["grade"] = grade_va
-    validation_scored.to_csv(artifacts / "validation_scored.csv", index=False)
+
+    validation_scored_path = scored_dir / "validation_scored.parquet"
+    validation_scored.to_parquet(validation_scored_path, index=False)
+    print(f"✔ validation_scored sauvegardé : {validation_scored_path}")
 
 
 if __name__ == "__main__":

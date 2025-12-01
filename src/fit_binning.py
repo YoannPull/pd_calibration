@@ -6,8 +6,8 @@ Fit max|Gini| bins on TRAIN and apply to VALIDATION.
 Uses the robust 'src.features.binning' module (with Monotonicity constraint).
 
 Outputs:
-    - data/processed/merged/binned/train.parquet
-    - data/processed/merged/binned/validation.parquet
+    - data/processed/binned/train.parquet
+    - data/processed/binned/validation.parquet
     - artifacts/bins.json
 """
 
@@ -29,27 +29,28 @@ logger = logging.getLogger(__name__)
 # Import propre (suppose que le script est lancé via 'poetry run python ...' ou PYTHONPATH=. set)
 try:
     from features.binning import (
-        run_binning_maxgini_on_df, 
+        run_binning_maxgini_on_df,
         transform_with_learned_bins,
         save_bins_json,
-        DENYLIST_STRICT_DEFAULT, 
-        EXCLUDE_IDS_DEFAULT
+        DENYLIST_STRICT_DEFAULT,
+        EXCLUDE_IDS_DEFAULT,
     )
 except ImportError:
     # Fallback si lancé en script direct sans contexte
     import os
     sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
     from features.binning import (
-        run_binning_maxgini_on_df, 
+        run_binning_maxgini_on_df,
         transform_with_learned_bins,
         save_bins_json,
-        DENYLIST_STRICT_DEFAULT, 
-        EXCLUDE_IDS_DEFAULT
+        DENYLIST_STRICT_DEFAULT,
+        EXCLUDE_IDS_DEFAULT,
     )
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Fit Max-Gini Binning (Monotonic) & Apply")
-    
+
     # I/O
     p.add_argument("--train", required=True, help="Path to train parquet/csv")
     p.add_argument("--validation", required=True, help="Path to validation parquet/csv")
@@ -62,24 +63,25 @@ def parse_args():
     p.add_argument("--bin-col-suffix", default="__BIN")
     p.add_argument("--include-missing", action="store_true", help="Create a specific bin for missing values")
     p.add_argument("--missing-label", default="__MISSING__")
-    
+
     # Hyperparamètres (Tailles & Quantiles)
     p.add_argument("--max-bins-categ", type=int, default=6)
     p.add_argument("--min-bin-size-categ", type=int, default=200)
-    
+
     p.add_argument("--max-bins-num", type=int, default=6)
     p.add_argument("--min-bin-size-num", type=int, default=200)
     p.add_argument("--n-quantiles-num", type=int, default=50, help="Granularity for initial numeric splits")
-    
+
     p.add_argument("--min-gini-keep", type=float, default=None, help="Drop variables below this Gini threshold")
-    
+
     # Flags de sécurité / Nettoyage
     p.add_argument("--no-denylist", action="store_true", help="Disable the strict denylist (dates, vintage...)")
     p.add_argument("--drop-missing-flags", action="store_true", help="Drop columns like 'was_missing_*'")
-    
-    # Note: Le parallélisme (n_jobs) a été retiré de l'implémentation backend pour robustesse/simplicité.
-    
+
+    # Note: Le parallélisme (n_jobs) a été retiré du backend pour robustesse/simplicité.
+
     return p.parse_args()
+
 
 def load_any(path: str) -> pd.DataFrame:
     p = Path(path)
@@ -90,6 +92,7 @@ def load_any(path: str) -> pd.DataFrame:
         return pd.read_parquet(p)
     return pd.read_csv(p)
 
+
 def save_any(df: pd.DataFrame, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix.lower() in (".parquet", ".pq"):
@@ -97,9 +100,10 @@ def save_any(df: pd.DataFrame, path: Path):
     else:
         df.to_csv(path, index=False)
 
+
 def main():
     args = parse_args()
-    
+
     outdir = Path(args.outdir)
     artifacts = Path(args.artifacts)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -119,29 +123,37 @@ def main():
     logger.info(f"Target: {args.target} | Monotonicity Constraint: ACTIVE")
 
     learned, tr_enriched, tr_binned = run_binning_maxgini_on_df(
-        df=tr, 
+        df=tr,
         target_col=args.target,
-        include_missing=args.include_missing, 
+        include_missing=args.include_missing,
         missing_label=args.missing_label,
-        
-        max_bins_categ=args.max_bins_categ, 
+
+        max_bins_categ=args.max_bins_categ,
         min_bin_size_categ=args.min_bin_size_categ,
-        
-        max_bins_num=args.max_bins_num,   
+
+        max_bins_num=args.max_bins_num,
         min_bin_size_num=args.min_bin_size_num,
         n_quantiles_num=args.n_quantiles_num,
-        
+
         bin_col_suffix=args.bin_col_suffix,
         min_gini_keep=args.min_gini_keep,
-        
+
         denylist_strict=([] if args.no_denylist else list(DENYLIST_STRICT_DEFAULT)),
         drop_missing_flags=bool(args.drop_missing_flags),
-        exclude_ids=EXCLUDE_IDS_DEFAULT
+        exclude_ids=EXCLUDE_IDS_DEFAULT,
     )
 
     # 3. Application (Validation)
     logger.info(f"Applying bins to Validation ({len(va)} rows)...")
     va_binned = transform_with_learned_bins(va, learned)
+
+    # 3.b Pass-through des colonnes meta (non utilisées en features mais utiles pour l'analyse)
+    META_COLS = ["vintage", "loan_sequence_number"]
+    for col in META_COLS:
+        if col in tr.columns:
+            tr_binned[col] = tr[col]
+        if col in va.columns:
+            va_binned[col] = va[col]
 
     # 4. Sauvegarde
     logger.info("Saving datasets...")
@@ -158,6 +170,7 @@ def main():
 
     logger.info(f"✔ Bins saved: {json_path}")
     logger.info(f"✔ Data saved: {outdir}")
+
 
 if __name__ == "__main__":
     main()
