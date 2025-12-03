@@ -187,7 +187,13 @@ def create_risk_buckets(scores, y, n_buckets=10, fixed_edges=None):
         edges[0] = -np.inf
         edges[-1] = np.inf
 
-    df["bucket"] = np.digitize(df["score"], edges[1:], right=True) + 1
+    # Bucket "brut" : 1 = scores les plus faibles (plus risqués)
+    raw_bucket = np.digitize(df["score"], edges[1:], right=True) + 1
+
+    # Convention finale :
+    #   bucket 1 = moins risqué (scores les plus élevés)
+    #   bucket n = plus risqué (scores les plus faibles)
+    df["bucket"] = n_buckets + 1 - raw_bucket
 
     stats = df.groupby("bucket").agg(
         count=("y", "size"),
@@ -198,7 +204,11 @@ def create_risk_buckets(scores, y, n_buckets=10, fixed_edges=None):
 
     stats["pd"] = stats["bad"] / stats["count"]
 
-    mono = bool(np.all(np.diff(stats["pd"].values) <= 0))
+    # On s'assure que les buckets sont triés
+    stats = stats.sort_values("bucket")
+
+    # Maintenant la PD doit être CROISSANTE avec le numéro de bucket
+    mono = bool(np.all(np.diff(stats["pd"].values) >= 0))
 
     return edges.tolist(), stats, mono
 
@@ -434,8 +444,12 @@ def main():
     # ------------------------------------------------------------------
     # train_scored / validation_scored -> data/processed/scored
     # ------------------------------------------------------------------
-    grade_tr = np.digitize(out["score_tr"], edges[1:], right=True) + 1
-    grade_va = np.digitize(out["score_va"], edges[1:], right=True) + 1
+    # Grades : 1 = moins risqué, n = plus risqué
+    raw_grade_tr = np.digitize(out["score_tr"], edges[1:], right=True) + 1
+    raw_grade_va = np.digitize(out["score_va"], edges[1:], right=True) + 1
+
+    grade_tr = args.n_buckets + 1 - raw_grade_tr
+    grade_va = args.n_buckets + 1 - raw_grade_va
 
     # Train scored
     train_scored = out["meta_tr"].copy()

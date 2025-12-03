@@ -7,6 +7,11 @@ generate_report.py — DARK MODE PREMIUM + GRADE TTC TABLES
 Rapport bancaire complet Train vs Validation
 Comparaisons graphiques superposées
 Dark mode professionnel + tableaux TTC par grade
+
+Convention de grade (alignée sur le pipeline de training) :
+    - grade 1 = classe la moins risquée
+    - grade N = classe la plus risquée
+    - on s'attend donc à ce que les PD soient CROISSANTES avec le grade.
 """
 
 import argparse
@@ -58,7 +63,7 @@ plt.rcParams.update({
 })
 
 # =============================================================================
-# Base64 helper
+# Helpers
 # =============================================================================
 
 def fig_to_base64(fig):
@@ -68,6 +73,18 @@ def fig_to_base64(fig):
     encoded = base64.b64encode(buf.read()).decode("utf-8")
     plt.close(fig)
     return f"data:image/png;base64,{encoded}"
+
+
+def _sort_grades_like_numbers(values):
+    """
+    Trie les grades numériquement si possible (1, 2, 3, ..., 10),
+    sinon lexicographiquement. Permet de garder la logique 1 = moins risqué,
+    N = plus risqué (de gauche à droite).
+    """
+    try:
+        return sorted(values, key=lambda x: float(x))
+    except Exception:
+        return sorted(values)
 
 # =============================================================================
 # Calibration Error (ECE)
@@ -173,6 +190,15 @@ def plot_master_scale(train_df, val_df, grade_col, target_col, pd_col):
     ).reset_index()
     gva["obs"] = gva["bad"] / gva["count"]
 
+    # Tri des grades pour respecter 1 (moins risqué) → N (plus risqué)
+    try:
+        gtr[grade_col] = gtr[grade_col].astype(float)
+        gva[grade_col] = gva[grade_col].astype(float)
+    except Exception:
+        pass
+    gtr = gtr.sort_values(grade_col)
+    gva = gva.sort_values(grade_col)
+
     # -- Bar volumes --
     ax1.bar(gtr[grade_col] - 0.15, gtr["count"], width=0.3, color=BLUE, alpha=0.5, label="Train Volume")
     ax1.bar(gva[grade_col] + 0.15, gva["count"], width=0.3, color=YELLOW, alpha=0.5, label="Val Volume")
@@ -226,6 +252,9 @@ def build_ttc_table(gdf, pd_ttc_map=None):
     pd_ttc_map: dict {grade -> PD_TTC_master_scale}
         - si fourni : PD TTC issue de la master scale (bucket_stats.json)
         - sinon : on prend 'pred' (PD moyenne de l'échantillon)
+
+    Convention :
+        grade 1 = moins risqué, grade N = plus risqué.
     """
     df = gdf.copy()
 
@@ -245,6 +274,13 @@ def build_ttc_table(gdf, pd_ttc_map=None):
     })[
         ["grade", "n_individus", "n_defauts", "pd_obs", "pd_ttc", "delta_abs", "delta_rel"]
     ]
+
+    # Tri des lignes par grade pour respecter 1 → N
+    try:
+        df_final["grade"] = df_final["grade"].astype(float)
+    except Exception:
+        pass
+    df_final = df_final.sort_values("grade")
 
     df_final["delta_rel"] = df_final["delta_rel"].round(2)
 
@@ -495,7 +531,7 @@ def main():
         ece=expected_calibration_error(y_va, pd_va),
     )
 
-    # PLOTS
+    # PLOTS + MASTER SCALE
     roc_img, _, _ = plot_roc(y_tr, pd_tr, y_va, pd_va)
     cal_img = plot_calibration(y_tr, pd_tr, y_va, pd_va)
     dist_img = plot_score_distribution(train_df, val_df, args.score, args.target)
@@ -530,6 +566,10 @@ def main():
     ttc_train_html = build_ttc_table(gtr2, pd_ttc_map=pd_ttc_map)
     ttc_val_html = build_ttc_table(gva2, pd_ttc_map=pd_ttc_map)
 
+    # Tables gtr/gva triées par grade pour l'HTML
+    gtr_html = gtr.sort_values(by=args.grade).to_html(index=False)
+    gva_html = gva.sort_values(by=args.grade).to_html(index=False)
+
     # OUTPUT HTML
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -542,8 +582,8 @@ def main():
         cal_img=cal_img,
         dist_img=dist_img,
         ms_img=ms_img,
-        gtr_table_html=gtr.to_html(index=False),
-        gva_table_html=gva.to_html(index=False),
+        gtr_table_html=gtr_html,
+        gva_table_html=gva_html,
         ttc_train_html=ttc_train_html,
         ttc_val_html=ttc_val_html,
         coef_img=coef_img,

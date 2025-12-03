@@ -7,12 +7,21 @@ generate_vintage_grade_report.py
 
 Rapport d'évolution des GRADES par VINTAGE (ou tout autre segment) à partir d'un fichier scored.
 
+Convention de grade (alignée sur le pipeline de training) :
+    - grade 1 = classe la moins risquée
+    - grade N = classe la plus risquée
+    - on s'attend donc à ce que les PD soient CROISSANTES avec le grade.
+
 Entrée : un fichier parquet/csv contenant au minimum :
     - une colonne vintage (ou segment) (ex: 'vintage')
     - une colonne de grade (ex: 'grade')
 Optionnel :
     - une colonne de PD modèle (ex: 'pd')
     - une cible binaire (ex: 'default_24m')
+
+Référence TTC (master scale) :
+    - issue du fichier bucket_stats.json produit au training
+      (section "train", colonne "pd" par bucket/grade).
 
 Sortie : un fichier HTML avec :
     - métriques globales de scoring (si PD + target dispo)
@@ -21,13 +30,15 @@ Sortie : un fichier HTML avec :
     - (optionnel) PD moyenne par vintage & grade
     - (optionnel) DR observée par vintage
     - tableaux de calibration par (vintage, grade) vs PD TTC master scale :
-        PD_TTC_master(grade) = moyenne PD modèle par grade sur tout le fichier
+        PD_TTC_master(grade) = PD par grade de la master scale (bucket_stats.json)
     - commentaire sur la monotonie par grade (pd_ttc, pd_hat, pd_obs)
 """
 
 import argparse
 import base64
 import io
+import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +47,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
+import seaborn as sns  # noqa: F401 (importé pour cohérence / éventuelles extensions)
 
 from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 
@@ -81,6 +92,56 @@ def fig_to_base64(fig):
     return f"data:image/png;base64,{encoded}"
 
 
+def _sort_grades_like_numbers(cols):
+    """
+    Trie les grades numériquement si possible (1, 2, 3, ..., 10),
+    sinon lexicographiquement. Permet de garder la logique 1 = moins risqué,
+    N = plus risqué, de gauche à droite / haut en bas.
+    """
+    try:
+        return sorted(cols, key=lambda x: float(x))
+    except Exception:
+        return sorted(cols)
+
+
+# =============================================================================
+# Charger la PD TTC de master scale (bucket_stats.json)
+# =============================================================================
+
+def load_pd_ttc_from_master_scale(bucket_stats_path: Path):
+    """
+    Lit bucket_stats.json (généré au training) et retourne un dict:
+        {grade/bucket -> PD_TTC}
+    basé sur la section "train".
+    """
+    if bucket_stats_path is None:
+        print("[WARN] Aucun chemin bucket_stats.json fourni, pd_ttc sera vide.",
+              file=sys.stderr)
+        return None
+
+    if not bucket_stats_path.exists():
+        print(f"[WARN] bucket_stats.json non trouvé à {bucket_stats_path}. "
+              f"pd_ttc sera vide dans le rapport.", file=sys.stderr)
+        return None
+
+    stats = json.loads(bucket_stats_path.read_text())
+    train_stats = stats.get("train", [])
+    if not train_stats:
+        print(f"[WARN] Section 'train' manquante ou vide dans bucket_stats.json.",
+              file=sys.stderr)
+        return None
+
+    df_train = pd.DataFrame(train_stats)
+    # On s'attend à avoir au moins les colonnes: 'bucket' et 'pd'
+    if "bucket" not in df_train.columns or "pd" not in df_train.columns:
+        print("[WARN] Colonnes 'bucket'/'pd' manquantes dans bucket_stats.json.",
+              file=sys.stderr)
+        return None
+
+    pd_ttc_map = df_train.set_index("bucket")["pd"].to_dict()
+    return pd_ttc_map
+
+
 # =============================================================================
 # Calibration Error (ECE)
 # =============================================================================
@@ -115,9 +176,11 @@ def build_volume_tables(df, vintage_col, grade_col):
     pivot_count = tab_count.pivot(index=vintage_col, columns=grade_col, values="count").fillna(0).astype(int)
     pivot_pct = pivot_count.div(pivot_count.sum(axis=1), axis=0) * 100
 
+    # On impose un tri des grades cohérent avec la logique 1 (moins risqué) → N (plus risqué)
     try:
-        pivot_count = pivot_count.reindex(sorted(pivot_count.columns), axis=1)
-        pivot_pct = pivot_pct.reindex(sorted(pivot_pct.columns), axis=1)
+        sorted_cols = _sort_grades_like_numbers(pivot_count.columns)
+        pivot_count = pivot_count.reindex(columns=sorted_cols)
+        pivot_pct = pivot_pct.reindex(columns=sorted_cols)
     except Exception:
         pass
 
@@ -135,7 +198,10 @@ def plot_grade_distribution(pivot_pct: pd.DataFrame, vintage_col: str, grade_nam
     bottoms = np.zeros(len(pivot_pct))
     x = np.arange(len(pivot_pct.index))
 
-    for g in pivot_pct.columns:
+    # On s'assure que les colonnes (grades) sont ordonnées numériquement
+    cols = _sort_grades_like_numbers(pivot_pct.columns)
+
+    for g in cols:
         vals = pivot_pct[g].values
         ax.bar(x, vals, bottom=bottoms, label=f"{grade_name} {g}")
         bottoms += vals
@@ -164,7 +230,9 @@ def plot_pd_by_vintage_and_grade(df, vintage_col, grade_col, pd_col):
           .reset_index()
     )
 
-    for g, sub in grp.groupby(grade_col):
+    # Boucle sur les grades dans l'ordre 1 → N
+    for g in _sort_grades_like_numbers(grp[grade_col].unique()):
+        sub = grp[grp[grade_col] == g].copy()
         sub = sub.sort_values(vintage_col)
         ax.plot(sub[vintage_col], sub[pd_col], marker="o", label=f"Grade {g}")
 
@@ -231,9 +299,18 @@ def compute_global_metrics(df, target_col, pd_col):
 # 6. Calibration vs PD TTC master scale
 # =============================================================================
 
-def build_calibration_table(df, vintage_col, grade_col, pd_col=None, target_col=None):
+def build_calibration_table(
+    df,
+    vintage_col,
+    grade_col,
+    pd_col=None,
+    target_col=None,
+    pd_ttc_map=None,
+):
     """
-    PD_TTC_master(grade) = moyenne des PD modèle par grade sur tout df.
+    PD_TTC_master(grade) = PD par grade issue de la master scale
+    (bucket_stats.json, section 'train', colonne 'pd').
+
     Compare, pour chaque (vintage, grade) :
       - n (volume)
       - n_defaults (nb de défauts, si cible dispo)
@@ -241,16 +318,6 @@ def build_calibration_table(df, vintage_col, grade_col, pd_col=None, target_col=
       - pd_obs (DR observée, si cible dispo)
       - pd_ttc (référence master scale par grade)
     """
-    # PD TTC master par grade (si pd_col dispo)
-    if pd_col is not None and pd_col in df.columns:
-        master = (
-            df.groupby(grade_col)[pd_col]
-              .mean()
-              .reset_index()
-              .rename(columns={pd_col: "pd_ttc"})
-        )
-    else:
-        master = pd.DataFrame(columns=[grade_col, "pd_ttc"])
 
     # Base : n par (vintage, grade)
     calib = (
@@ -279,8 +346,15 @@ def build_calibration_table(df, vintage_col, grade_col, pd_col=None, target_col=
         )
         calib = calib.merge(agg, on=[vintage_col, grade_col], how="left")
 
-    # Merge avec PD TTC master (par grade)
-    calib = calib.merge(master, on=grade_col, how="left")
+    # PD TTC master par grade (issue de pd_ttc_map)
+    if pd_ttc_map is not None:
+        master = pd.DataFrame({
+            grade_col: list(pd_ttc_map.keys()),
+            "pd_ttc": list(pd_ttc_map.values()),
+        })
+        calib = calib.merge(master, on=grade_col, how="left")
+    else:
+        calib["pd_ttc"] = np.nan
 
     return calib
 
@@ -289,6 +363,7 @@ def build_calibration_tables_by_vintage_html(calib_df: pd.DataFrame, vintage_col
     """
     Construit un bloc HTML avec un tableau par vintage pour lisibilité.
     Met n_defaults juste à côté de n.
+    Trie les grades pour respecter la logique 1 (moins risqué) → N (plus risqué).
     """
     if calib_df.empty:
         return "<p>Aucune information de calibration disponible.</p>"
@@ -296,6 +371,14 @@ def build_calibration_tables_by_vintage_html(calib_df: pd.DataFrame, vintage_col
     parts = []
     for v in sorted(calib_df[vintage_col].unique()):
         sub = calib_df[calib_df[vintage_col] == v].copy()
+
+        # Tri des lignes par grade dans l'ordre 1 → N
+        try:
+            sub[grade_col] = sub[grade_col].astype(float)
+            sub = sub.sort_values(by=grade_col)
+        except Exception:
+            sub = sub.sort_values(by=grade_col)
+
         # On évite de répéter la colonne vintage à l'intérieur du tableau
         if vintage_col in sub.columns:
             sub = sub.drop(columns=[vintage_col])
@@ -322,8 +405,11 @@ def build_monotonicity_comment(calib_df: pd.DataFrame, grade_col: str) -> str:
       - pd_ttc
       - pd_hat
       - pd_obs
-    Suppose que le grade est ordonné (1, 2, 3...) ou triable.
-    On teste la monotonie croissante (grade ↑ => PD ↑).
+
+    Convention :
+      - grade 1 = moins risqué
+      - grade N = plus risqué
+    On teste donc la monotonie CROISSANTE (grade ↑ => PD ↑).
     """
     if calib_df.empty or grade_col not in calib_df.columns:
         return "<p>Monotonicité : non évaluée (données insuffisantes).</p>"
@@ -400,12 +486,12 @@ def build_html(
     legend_html = """
     <p><strong>Légende (tables de calibration) :</strong></p>
     <ul>
-        <li><code>grade</code> : classe de risque (master scale).</li>
+        <li><code>grade</code> : classe de risque (master scale), avec 1 = moins risqué et N = plus risqué.</li>
         <li><code>n</code> : nombre d'expositions dans le couple (vintage, grade).</li>
         <li><code>n_defaults</code> : nombre de défauts observés dans ce couple (si la cible est disponible).</li>
         <li><code>pd_hat</code> : PD moyenne du modèle sur ce couple (moyenne de la colonne pd).</li>
         <li><code>pd_obs</code> : taux de défaut observé sur ce couple (si la cible est disponible).</li>
-        <li><code>pd_ttc</code> : PD TTC master scale pour ce grade (moyenne de la PD modèle sur tout le fichier, tous vintages confondus).</li>
+        <li><code>pd_ttc</code> : PD TTC master scale pour ce grade (issue de bucket_stats.json, section train).</li>
     </ul>
     """
 
@@ -507,7 +593,7 @@ def build_html(
     html += f"""
     <div class="section">
         <h2>5. Calibration par vintage / grade vs PD TTC master scale</h2>
-        <p>PD_TTC_master(grade) = moyenne des PD modèle par grade sur tout le fichier.</p>
+        <p>PD_TTC_master(grade) = PD par grade issue de la master scale (bucket_stats.json).</p>
         {legend_html}
         {mono_comment_html}
         {calib_tables_html}
@@ -537,8 +623,12 @@ def parse_args():
     p.add_argument("--pd-col", default="pd", help="Nom de la colonne PD modèle (optionnel).")
     p.add_argument("--target", default=None, help="Nom de la colonne cible (optionnel).")
     p.add_argument("--sample-name", default="OOS", help="Nom du sample (OOS, Train, Val, etc.).")
+    p.add_argument(
+        "--bucket-stats",
+        default=None,
+        help="Chemin vers bucket_stats.json (master scale TTC)."
+    )
     return p.parse_args()
-
 
 
 def main():
@@ -581,20 +671,29 @@ def main():
             and args.pd_col is not None and args.pd_col in df.columns):
         metrics = compute_global_metrics(df, args.target, args.pd_col)
 
-    # 6. Table de calibration vs PD TTC master
+    # 6. Charger la master scale TTC
+    pd_ttc_map = None
+    if args.bucket_stats is not None:
+        pd_ttc_map = load_pd_ttc_from_master_scale(Path(args.bucket_stats))
+    else:
+        print("[WARN] --bucket-stats non fourni, pd_ttc sera vide dans les tables.",
+              file=sys.stderr)
+
+    # 7. Table de calibration vs PD TTC master
     calib_df = build_calibration_table(
         df,
         vintage_col=args.vintage_col,
         grade_col=args.grade_col,
         pd_col=args.pd_col if args.pd_col in df.columns else None,
         target_col=args.target if (args.target and args.target in df.columns) else None,
+        pd_ttc_map=pd_ttc_map,
     )
     calib_tables_html = build_calibration_tables_by_vintage_html(calib_df, args.vintage_col, args.grade_col)
 
     # Commentaire monotonicité (global par grade)
     mono_comment_html = build_monotonicity_comment(calib_df, args.grade_col)
 
-    # 7. HTML final
+    # 8. HTML final
     out_path = Path(args.out)
     build_html(
         out_path=out_path,

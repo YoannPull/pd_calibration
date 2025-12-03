@@ -40,12 +40,17 @@ SCORED_OUT_DIR      = $(DATA_DIR)/scored
 MODEL_TRAIN_DATA    = $(BINNING_OUT_DIR)/train.parquet
 MODEL_VAL_DATA      = $(BINNING_OUT_DIR)/validation.parquet
 
+# Scored (produits par train_model.py)
+SCORED_TRAIN_DATA   = $(SCORED_OUT_DIR)/train_scored.parquet
+SCORED_VAL_DATA     = $(SCORED_OUT_DIR)/validation_scored.parquet
+
 # OOS & Reporting
-OOS_LABELS_PARQUET = $(LABELS_OUTDIR)/window=$(LABELS_WINDOW)m/oos.parquet
-SCORED_TRAIN_DATA  = $(SCORED_OUT_DIR)/train_scored.parquet
-SCORED_VAL_DATA    = $(SCORED_OUT_DIR)/validation_scored.parquet
-REPORT_TRAIN_HTML  = $(REPORTS_DIR)/train_report.html
-REPORT_VAL_HTML    = $(REPORTS_DIR)/validation_report.html
+OOS_LABELS_PARQUET  = $(LABELS_OUTDIR)/window=$(LABELS_WINDOW)m/oos.parquet
+OOS_SCORED          = $(SCORED_OUT_DIR)/oos_scored.parquet
+REPORT_TRAIN_HTML   = $(REPORTS_DIR)/train_report.html
+REPORT_VAL_HTML     = $(REPORTS_DIR)/validation_report.html
+VINTAGE_REPORT_OOS  = $(REPORTS_DIR)/vintage_grade_oos.html
+VINTAGE_REPORT_VAL  = $(REPORTS_DIR)/vintage_grade_validation.html
 
 # ============================================================================
 # CIBLES (TARGETS)
@@ -56,17 +61,19 @@ help:
 	@echo "================================================================="
 	@echo "   PIPELINE RISQUE DE CRÉDIT -- FOCUS CALIBRATION"
 	@echo "================================================================="
-	@echo "  make pipeline      : Exécute le flux principal (Labels -> Report)"
+	@echo "  make pipeline            : Labels -> Impute -> Binning -> Model -> Report"
 	@echo "-----------------------------------------------------------------"
-	@echo "  make labels        : 1. Génère les labels"
-	@echo "  make impute        : 2. Impute (Fit Train / Trans. Val)"
-	@echo "  make binning_fit   : 3. Discrétise (Max Gini + Monotonicité)"
-	@echo "  make model_train   : 4. Entraîne (LR + Calibration + Grille)"
-	@echo "  make report        : 5. Génère les rapports HTML (Train & Val)"
+	@echo "  make labels              : 1. Génère les labels"
+	@echo "  make impute              : 2. Impute (Fit Train / Transform All)"
+	@echo "  make binning_fit         : 3. Discrétise (Max Gini + Monotonicité)"
+	@echo "  make model_train         : 4. Entraîne (LR + Calibration + Grille, + scored)"
+	@echo "  make report              : 5. Génère le rapport HTML (Train & Val scored)"
 	@echo "-----------------------------------------------------------------"
-	@echo "  make oos_score     : [MANUEL] Applique le modèle sur OOS"
-	@echo "  make score_custom  : [MANUEL] Scorer un fichier spécifique"
-	@echo "  make clean_all     : Nettoyage complet"
+	@echo "  make oos_score           : [MANUEL] Scoring OOS (fichier oos.parquet)"
+	@echo "  make oos_vintage_report  : [MANUEL] Scoring OOS + Vintage/Grade report"
+	@echo "  make val_vintage_report  : [MANUEL] Vintage/Grade report sur Validation"
+	@echo "  make score_custom        : [MANUEL] Scorer un fichier spécifique"
+	@echo "  make clean_all           : Nettoyage complet"
 	@echo "================================================================="
 
 # ----------------------------------------------------------------------------
@@ -103,16 +110,16 @@ binning_fit:
 		--target $(IMPUTE_TARGET_COL) \
 		--outdir $(BINNING_OUT_DIR) \
 		--artifacts $(BINNING_ARTIFACTS_DIR) \
-		--max-bins-num 6 \
-		--min-bin-size-num 200 \
+		--max-bins-num 10 \
+		--min-bin-size-num 300 \
 		--n-quantiles-num 50
 
 # ----------------------------------------------------------------------------
-# 4. MODEL TRAINING (Master Scale)
+# 4. MODEL TRAINING (Master Scale + SCORING TRAIN/VAL)
 # ----------------------------------------------------------------------------
 .PHONY: model_train
 model_train:
-	@echo "\n[4/5] ENTRAÎNEMENT DU MODÈLE & CRÉATION GRILLE..."
+	@echo "\n[4/5] ENTRAÎNEMENT DU MODÈLE & CRÉATION GRILLE + SCORING TRAIN/VAL..."
 	$(PY) src/train_model.py \
 		--train $(MODEL_TRAIN_DATA) \
 		--validation $(MODEL_VAL_DATA) \
@@ -121,36 +128,15 @@ model_train:
 		--cv-folds 5 \
 		--corr-threshold 0.85 \
 		--calibration isotonic \
-		--n-buckets 10
+		--n-buckets 10 \
+		--scored-outdir $(SCORED_OUT_DIR)
 
 # ----------------------------------------------------------------------------
-# 5. REPORTING (TRAIN + VALIDATION dans un SEUL HTML)
+# 5. REPORTING (TRAIN + VALIDATION déjà scorés)
 # ----------------------------------------------------------------------------
 .PHONY: report
 report:
-	@echo "\n[5/5] GENERATION DU RAPPORT GLOBAL..."
-
-	@echo "-> Scoring TRAIN..."
-	$(PY) src/apply_model.py \
-		--data $(MODEL_TRAIN_DATA) \
-		--out $(SCORED_TRAIN_DATA) \
-		--imputer $(IMPUTE_ARTIFACTS_DIR)/imputer.joblib \
-		--bins $(BINNING_ARTIFACTS_DIR)/bins.json \
-		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib \
-		--buckets $(MODEL_ARTIFACTS_DIR)/risk_buckets.json \
-		--target $(IMPUTE_TARGET_COL) \
-		--id-col loan_sequence_number
-
-	@echo "-> Scoring VALIDATION..."
-	$(PY) src/apply_model.py \
-		--data $(MODEL_VAL_DATA) \
-		--out $(SCORED_VAL_DATA) \
-		--imputer $(IMPUTE_ARTIFACTS_DIR)/imputer.joblib \
-		--bins $(BINNING_ARTIFACTS_DIR)/bins.json \
-		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib \
-		--buckets $(MODEL_ARTIFACTS_DIR)/risk_buckets.json \
-		--target $(IMPUTE_TARGET_COL) \
-		--id-col loan_sequence_number
+	@echo "\n[5/5] GENERATION DU RAPPORT GLOBAL (Train + Validation scored)..."
 
 	@echo "-> Création du RAPPORT UNIQUE (Train + Validation)..."
 	$(PY) src/generate_report.py \
@@ -158,7 +144,7 @@ report:
 		--validation $(SCORED_VAL_DATA) \
 		--out $(REPORTS_DIR)/model_validation_report.html \
 		--target $(IMPUTE_TARGET_COL) \
-		--score score --pd pd --grade grade \
+		--score score_ttc --pd pd --grade grade \
 		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib
 
 	@echo "✔ Rapport généré : $(REPORTS_DIR)/model_validation_report.html"
@@ -177,25 +163,59 @@ pipeline: labels impute binning_fit model_train report
 # MODULES STANDALONE (HORS PIPELINE AUTOMATIQUE)
 # ============================================================================
 
-# --- OOS SCORING ---
+# --- OOS SCORING (FULL PIPELINE SUR OOS) ---
 .PHONY: oos_score
 oos_score:
-	@echo "\n[MANUEL] SCORING ECHANTILLON OOS (Out-of-Sample)..."
+	@echo "\n[MANUEL] SCORING ECHANTILLON OOS (Out-of-Sample, full pipeline)..."
 	@test -f "$(OOS_LABELS_PARQUET)" || (echo "[ERR] Fichier OOS manquant : $(OOS_LABELS_PARQUET)"; exit 1)
 	$(PY) src/apply_model.py \
 		--data $(OOS_LABELS_PARQUET) \
-		--out $(SCORED_OUT_DIR)/oos_scored.parquet \
+		--out $(OOS_SCORED) \
 		--imputer $(IMPUTE_ARTIFACTS_DIR)/imputer.joblib \
 		--bins $(BINNING_ARTIFACTS_DIR)/bins.json \
 		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib \
 		--buckets $(MODEL_ARTIFACTS_DIR)/risk_buckets.json \
 		--target $(IMPUTE_TARGET_COL) \
 		--id-col loan_sequence_number
-	@echo "✔ Scoring terminé : $(SCORED_OUT_DIR)/oos_scored.parquet"
+	@echo "✔ Scoring terminé : $(OOS_SCORED)"
+
+# --- OOS SCORING + VINTAGE/GRADE REPORT ---
+.PHONY: oos_vintage_report
+oos_vintage_report: oos_score
+	@echo "\n[MANUEL] VINTAGE / GRADE REPORT SUR OOS..."
+	$(PY) src/generate_vintage_grade_report.py \
+		--data $(OOS_SCORED) \
+		--out $(VINTAGE_REPORT_OOS) \
+		--vintage-col vintage \
+		--grade-col grade \
+		--pd-col pd \
+		--target $(IMPUTE_TARGET_COL) \
+		--sample-name "OOS" \
+		--bucket-stats artifacts/model_from_binned/bucket_stats.json
+	@echo "✔ Rapport OOS Vintage / Grade généré : $(VINTAGE_REPORT_OOS)"
+	@open $(VINTAGE_REPORT_OOS) 2>/dev/null || true
+
+# --- VALIDATION VINTAGE/GRADE REPORT ---
+.PHONY: val_vintage_report
+val_vintage_report:
+	@echo "\n[MANUEL] VINTAGE / GRADE REPORT SUR VALIDATION..."
+	@test -f "$(SCORED_VAL_DATA)" || (echo "[ERR] Fichier validation_scored manquant : $(SCORED_VAL_DATA)"; exit 1)
+	$(PY) src/generate_vintage_grade_report.py \
+		--data $(SCORED_VAL_DATA) \
+		--out $(VINTAGE_REPORT_VAL) \
+		--vintage-col vintage \
+		--grade-col grade \
+		--pd-col pd \
+		--target $(IMPUTE_TARGET_COL) \
+		--sample-name "Validation" \
+		--bucket-stats artifacts/model_from_binned/bucket_stats.json
+	@echo "✔ Rapport Validation Vintage / Grade généré : $(VINTAGE_REPORT_VAL)"
+	@open $(VINTAGE_REPORT_VAL) 2>/dev/null || true
+
 
 # --- SCORING CUSTOM ---
-CUSTOM_DATA ?= $(OOS_LABELS_PARQUET)
-CUSTOM_OUT  ?= $(SCORED_OUT_DIR)/custom_scored.parquet
+CUSTOM_DATA   ?= $(OOS_LABELS_PARQUET)
+CUSTOM_OUT    ?= $(SCORED_OUT_DIR)/custom_scored.parquet
 CUSTOM_TARGET ?= $(IMPUTE_TARGET_COL)
 
 .PHONY: score_custom
