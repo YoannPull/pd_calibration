@@ -103,9 +103,28 @@ def apply_woe(df: pd.DataFrame, woe_maps: dict, bin_suffix: str) -> pd.DataFrame
 # Buckets -> grade
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Buckets -> grade
+# ---------------------------------------------------------------------------
+
 def apply_buckets(scores: np.ndarray, edges: list[float]) -> np.ndarray:
-    # edges[0] = -inf, edges[-1] = +inf en principe
-    return np.digitize(scores, edges[1:], right=True) + 1
+    """
+    Affecte un grade de risque à partir des scores TTC et des edges de la master scale.
+
+    Convention (alignée sur train_model.py) :
+      - grade = 1 : moins risqué (scores les plus ÉLEVÉS)
+      - grade = n : plus risqué (scores les plus FAIBLES)
+    """
+    # Bucket "brut" : 1 = scores les plus faibles (plus risqués)
+    raw_bucket = np.digitize(scores, edges[1:], right=True) + 1
+
+    # Nombre total de buckets (len(edges) = n_buckets + 1)
+    n_buckets = len(edges) - 1
+
+    # Convention finale : 1 = moins risqué, n = plus risqué
+    grade = n_buckets + 1 - raw_bucket
+    return grade
+
 
 
 # ---------------------------------------------------------------------------
