@@ -13,7 +13,7 @@ data:
              "2022Q1","2022Q2","2022Q3","2022Q4"]
 
 labels:
-  window_months: 24
+  window_months: 12
   delinquency_threshold: 3
   liquidation_codes: ["02","03","09"]
   include_ra: true
