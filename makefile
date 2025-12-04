@@ -17,10 +17,13 @@ DATA_DIR      := data/processed
 ARTIFACTS_DIR := artifacts
 REPORTS_DIR   := reports
 
+# Répertoire des séries macro brutes (FRED)
+MACRO_RAW_DIR := data/raw/macro
+
 # --- 3. Configuration Globale ---
 # Labels
 LABELS_CONFIG  ?= config.yml
-LABELS_WINDOW  ?= 24
+LABELS_WINDOW  ?= 12
 LABELS_OUTDIR   = $(DATA_DIR)/default_labels
 
 # Imputation
@@ -44,6 +47,9 @@ MODEL_VAL_DATA      = $(BINNING_OUT_DIR)/validation.parquet
 SCORED_TRAIN_DATA   = $(SCORED_OUT_DIR)/train_scored.parquet
 SCORED_VAL_DATA     = $(SCORED_OUT_DIR)/validation_scored.parquet
 
+# PD TTC macro (sortie de estimate_ttc_macro.py)
+PD_TTC_MACRO_JSON   = $(MODEL_ARTIFACTS_DIR)/pd_ttc_macro.json
+
 # OOS & Reporting
 OOS_LABELS_PARQUET  = $(LABELS_OUTDIR)/window=$(LABELS_WINDOW)m/oos.parquet
 OOS_SCORED          = $(SCORED_OUT_DIR)/oos_scored.parquet
@@ -61,13 +67,14 @@ help:
 	@echo "================================================================="
 	@echo "   PIPELINE RISQUE DE CRÉDIT -- FOCUS CALIBRATION"
 	@echo "================================================================="
-	@echo "  make pipeline            : Labels -> Impute -> Binning -> Model -> Report"
+	@echo "  make pipeline            : Labels -> Impute -> Binning -> Model -> TTC_macro -> Report"
 	@echo "-----------------------------------------------------------------"
 	@echo "  make labels              : 1. Génère les labels"
 	@echo "  make impute              : 2. Impute (Fit Train / Transform All)"
 	@echo "  make binning_fit         : 3. Discrétise (Max Gini + Monotonicité)"
 	@echo "  make model_train         : 4. Entraîne (LR + Calibration + Grille, + scored)"
-	@echo "  make report              : 5. Génère le rapport HTML (Train & Val scored)"
+	@echo "  make ttc_macro           : 5. Estime la PD TTC macro par grade (pd_ttc_macro)"
+	@echo "  make report              : 6. Génère le rapport HTML (Train & Val scored)"
 	@echo "-----------------------------------------------------------------"
 	@echo "  make oos_score           : [MANUEL] Scoring OOS (fichier oos.parquet)"
 	@echo "  make oos_vintage_report  : [MANUEL] Scoring OOS + Vintage/Grade report"
@@ -81,15 +88,15 @@ help:
 # ----------------------------------------------------------------------------
 .PHONY: labels
 labels:
-	@echo "\n[1/5] GÉNÉRATION DES LABELS..."
-	$(PY) src/make_labels.py --config $(LABELS_CONFIG) --workers 6
+	@echo "\n[1/6] GÉNÉRATION DES LABELS..."
+	$(PY) src/make_labels.py --config $(LABELS_CONFIG) --workers 12
 
 # ----------------------------------------------------------------------------
 # 2. IMPUTATION (Anti-Leakage)
 # ----------------------------------------------------------------------------
 .PHONY: impute
 impute:
-	@echo "\n[2/5] IMPUTATION (Fit on Train / Transform All)..."
+	@echo "\n[2/6] IMPUTATION (Fit on Train / Transform All)..."
 	$(PY) src/impute_and_save.py \
 		--labels-window-dir $(LABELS_OUTDIR)/window=$(LABELS_WINDOW)m \
 		--target $(IMPUTE_TARGET_COL) \
@@ -103,7 +110,7 @@ impute:
 # ----------------------------------------------------------------------------
 .PHONY: binning_fit
 binning_fit:
-	@echo "\n[3/5] BINNING (Max Gini + Monotonicity Check)..."
+	@echo "\n[3/6] BINNING (Max Gini + Monotonicity Check)..."
 	$(PY) src/fit_binning.py \
 		--train $(BINNING_TRAIN) \
 		--validation $(BINNING_VAL) \
@@ -117,9 +124,11 @@ binning_fit:
 # ----------------------------------------------------------------------------
 # 4. MODEL TRAINING (Master Scale + SCORING TRAIN/VAL)
 # ----------------------------------------------------------------------------
+# --ttc-mode train_val ou train
+
 .PHONY: model_train
 model_train:
-	@echo "\n[4/5] ENTRAÎNEMENT DU MODÈLE & CRÉATION GRILLE + SCORING TRAIN/VAL..."
+	@echo "\n[4/6] ENTRAÎNEMENT DU MODÈLE & CRÉATION GRILLE + SCORING TRAIN/VAL..."
 	$(PY) src/train_model.py \
 		--train $(MODEL_TRAIN_DATA) \
 		--validation $(MODEL_VAL_DATA) \
@@ -129,14 +138,32 @@ model_train:
 		--corr-threshold 0.85 \
 		--calibration isotonic \
 		--n-buckets 10 \
-		--scored-outdir $(SCORED_OUT_DIR)
+		--scored-outdir $(SCORED_OUT_DIR) \
+		--ttc-mode train
 
 # ----------------------------------------------------------------------------
-# 5. REPORTING (TRAIN + VALIDATION déjà scorés)
+# 5. PD TTC MACRO (grade × temps + macro)
+# ----------------------------------------------------------------------------
+.PHONY: ttc_macro
+ttc_macro:
+	@echo "\n[5/6] ESTIMATION PD TTC MACRO PAR GRADE (pd_ttc_macro)..."
+	@test -f "$(SCORED_TRAIN_DATA)" || (echo "[ERR] Fichier train_scored manquant : $(SCORED_TRAIN_DATA)"; exit 1)
+	@test -f "$(SCORED_VAL_DATA)"   || (echo "[ERR] Fichier validation_scored manquant : $(SCORED_VAL_DATA)"; exit 1)
+	$(PY) src/estimate_ttc_macro.py \
+		--train-scored $(SCORED_TRAIN_DATA) \
+		--val-scored $(SCORED_VAL_DATA) \
+		--macro-dir $(MACRO_RAW_DIR) \
+		--target $(IMPUTE_TARGET_COL) \
+		--time-col vintage \
+		--out-json $(PD_TTC_MACRO_JSON)
+	@echo "✔ PD TTC macro par grade sauvegardée dans : $(PD_TTC_MACRO_JSON)"
+
+# ----------------------------------------------------------------------------
+# 6. REPORTING (TRAIN + VALIDATION déjà scorés)
 # ----------------------------------------------------------------------------
 .PHONY: report
 report:
-	@echo "\n[5/5] GENERATION DU RAPPORT GLOBAL (Train + Validation scored)..."
+	@echo "\n[6/6] GENERATION DU RAPPORT GLOBAL (Train + Validation scored)..."
 
 	@echo "-> Création du RAPPORT UNIQUE (Train + Validation)..."
 	$(PY) src/generate_report.py \
@@ -154,7 +181,7 @@ report:
 # PIPELINE GLOBAL
 # ----------------------------------------------------------------------------
 .PHONY: pipeline
-pipeline: labels impute binning_fit model_train report
+pipeline: labels impute binning_fit model_train ttc_macro report
 	@echo "\n-------------------------------------------------------"
 	@echo "✔ PIPELINE DE VALIDATION TERMINÉ."
 	@echo "-------------------------------------------------------"

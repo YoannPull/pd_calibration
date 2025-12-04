@@ -174,44 +174,197 @@ def select_features(X: pd.DataFrame, corr_thr=0.85):
 
 
 # ---------------------------------------------------------------------------
-# Master Scale
+# Master Scale — version optimisée
 # ---------------------------------------------------------------------------
 
-def create_risk_buckets(scores, y, n_buckets=10, fixed_edges=None):
+def create_risk_buckets(
+    scores,
+    y,
+    n_buckets: int = 10,
+    fixed_edges=None,
+    n_init_bins: int = 100,
+    min_count: int = 5000,
+    min_bad: int = 50,
+):
+    """
+    Construction des grades à partir du score TTC.
+
+    - Si fixed_edges est fourni : on applique simplement ces edges (cas validation
+      ou rerun avec grille figée).
+    - Sinon : on construit une grille optimisée sur le TRAIN uniquement :
+        * bins fins par quantiles (n_init_bins),
+        * fusion adjacente pour imposer la monotonicité PD(score),
+        * fusion pour respecter des minima de volumétrie (min_count, min_bad),
+        * fusion pour arriver à exactement n_buckets grades.
+    """
+
+    scores = np.asarray(scores)
+    y = np.asarray(y).astype(int)
+
+    # ------------------------------------------------------------------
+    # Cas 1 : edges fournis → on ne fait qu'appliquer / calculer les stats
+    # ------------------------------------------------------------------
+    if fixed_edges is not None:
+        edges = np.array(fixed_edges, dtype=float)
+        edges[0] = -np.inf
+        edges[-1] = np.inf
+
+        raw_bucket = np.digitize(scores, edges[1:], right=True) + 1
+        # Convention finale : 1 = meilleur grade (score le plus élevé)
+        bucket = n_buckets + 1 - raw_bucket
+
+        df = pd.DataFrame({"bucket": bucket, "y": y, "score": scores})
+        stats = df.groupby("bucket").agg(
+            count=("y", "size"),
+            bad=("y", "sum"),
+            min_score=("score", "min"),
+            max_score=("score", "max"),
+        ).reset_index().sort_values("bucket")
+        stats["pd"] = stats["bad"] / stats["count"]
+
+        mono = bool(np.all(np.diff(stats["pd"].values) >= -1e-12))
+        return edges.tolist(), stats, mono
+
+    # ------------------------------------------------------------------
+    # Cas 2 : optimisation des buckets sur le TRAIN
+    # ------------------------------------------------------------------
     df = pd.DataFrame({"score": scores, "y": y})
 
-    if fixed_edges is None:
-        qs = np.linspace(0, 1, n_buckets + 1)
-        edges = np.quantile(scores, qs)
-        edges[0] = -np.inf
-        edges[-1] = np.inf
-    else:
-        edges = np.array(fixed_edges)
-        edges[0] = -np.inf
-        edges[-1] = np.inf
+    # Binning initial fin par quantiles de score
+    n_init_bins = min(n_init_bins, max(2, df["score"].nunique()))
+    df["init_bin"] = pd.qcut(
+        df["score"], q=n_init_bins, labels=False, duplicates="drop"
+    )
 
-    # Bucket "brut" : 1 = scores les plus faibles (plus risqués)
-    raw_bucket = np.digitize(df["score"], edges[1:], right=True) + 1
+    grp = (
+        df.groupby("init_bin")
+        .agg(
+            count=("y", "size"),
+            bad=("y", "sum"),
+            min_score=("score", "min"),
+            max_score=("score", "max"),
+        )
+        .reset_index()
+        .sort_values("min_score")  # scores croissants
+    )
 
-    # Convention finale :
-    #   bucket 1 = moins risqué (scores les plus élevés)
-    #   bucket n = plus risqué (scores les plus faibles)
-    df["bucket"] = n_buckets + 1 - raw_bucket
+    # On travaille sur une liste de "blocs" adjacents sur l'axe du score
+    blocks: List[Dict[str, float]] = []
+    for _, row in grp.iterrows():
+        blocks.append(
+            {
+                "count": int(row["count"]),
+                "bad": int(row["bad"]),
+                "min_score": float(row["min_score"]),
+                "max_score": float(row["max_score"]),
+            }
+        )
 
-    stats = df.groupby("bucket").agg(
-        count=("y", "size"),
-        bad=("y", "sum"),
-        min_score=("score", "min"),
-        max_score=("score", "max"),
-    ).reset_index()
+    def pd_block(b):
+        return b["bad"] / b["count"] if b["count"] > 0 else 0.0
 
+    # 1) Monotonicité PD(score) décroissante lorsque le score augmente
+    #    (score élevé = moins risqué, donc PD plus faible).
+    i = 0
+    while i < len(blocks) - 1:
+        if pd_block(blocks[i + 1]) > pd_block(blocks[i]):
+            # Violation : la PD du bloc "plus bon score" est > PD du bloc précédent
+            b1, b2 = blocks[i], blocks[i + 1]
+            merged = {
+                "count": b1["count"] + b2["count"],
+                "bad": b1["bad"] + b2["bad"],
+                "min_score": min(b1["min_score"], b2["min_score"]),
+                "max_score": max(b1["max_score"], b2["max_score"]),
+            }
+            blocks[i] = merged
+            del blocks[i + 1]
+            if i > 0:
+                i -= 1
+        else:
+            i += 1
+
+    # 2) Contraintes de volumétrie (min_count, min_bad) tant qu'on a
+    #    plus de blocs que n_buckets (sinon on n'a plus de marge de fusion).
+    changed = True
+    while changed and len(blocks) > n_buckets:
+        changed = False
+        for i, b in enumerate(blocks):
+            if (b["count"] < min_count) or (b["bad"] < min_bad):
+                if len(blocks) == 1:
+                    break
+                # Choix du voisin le plus proche en PD pour limiter les ruptures
+                if i == 0:
+                    j = 1
+                elif i == len(blocks) - 1:
+                    j = i - 1
+                else:
+                    pd_i = pd_block(b)
+                    pd_left = pd_block(blocks[i - 1])
+                    pd_right = pd_block(blocks[i + 1])
+                    j = i - 1 if abs(pd_i - pd_left) <= abs(pd_i - pd_right) else i + 1
+
+                b2 = blocks[j]
+                merged = {
+                    "count": b["count"] + b2["count"],
+                    "bad": b["bad"] + b2["bad"],
+                    "min_score": min(b["min_score"], b2["min_score"]),
+                    "max_score": max(b["max_score"], b2["max_score"]),
+                }
+                lo, hi = sorted([i, j])
+                blocks[lo] = merged
+                del blocks[hi]
+                changed = True
+                break
+
+    # 3) Réduction à exactement n_buckets en fusionnant les blocs
+    #    adjacents ayant les PD les plus proches.
+    while len(blocks) > n_buckets:
+        pds = [pd_block(b) for b in blocks]
+        diffs = [abs(pds[i + 1] - pds[i]) for i in range(len(blocks) - 1)]
+        k = int(np.argmin(diffs))
+        b1, b2 = blocks[k], blocks[k + 1]
+        merged = {
+            "count": b1["count"] + b2["count"],
+            "bad": b1["bad"] + b2["bad"],
+            "min_score": min(b1["min_score"], b2["min_score"]),
+            "max_score": max(b1["max_score"], b2["max_score"]),
+        }
+        blocks[k] = merged
+        del blocks[k + 1]
+
+    # ------------------------------------------------------------------
+    # Construction des edges à partir des blocs agrégés
+    # ------------------------------------------------------------------
+    blocks_sorted = sorted(blocks, key=lambda b: b["min_score"])  # scores croissants
+
+    edges = [-np.inf]
+    for i in range(len(blocks_sorted) - 1):
+        hi = blocks_sorted[i]["max_score"]
+        lo_next = blocks_sorted[i + 1]["min_score"]
+        thr = (hi + lo_next) / 2.0  # seuil entre deux blocs
+        edges.append(thr)
+    edges.append(np.inf)
+    edges = np.array(edges)
+
+    # Attribution des buckets comme dans ton code original
+    raw_bucket = np.digitize(scores, edges[1:], right=True) + 1  # 1 = scores les plus bas
+    bucket = n_buckets + 1 - raw_bucket  # 1 = meilleur grade
+
+    df2 = pd.DataFrame({"bucket": bucket, "y": y, "score": scores})
+    stats = (
+        df2.groupby("bucket")
+        .agg(
+            count=("y", "size"),
+            bad=("y", "sum"),
+            min_score=("score", "min"),
+            max_score=("score", "max"),
+        )
+        .reset_index()
+        .sort_values("bucket")
+    )
     stats["pd"] = stats["bad"] / stats["count"]
 
-    # On s'assure que les buckets sont triés
-    stats = stats.sort_values("bucket")
-
-    # Maintenant la PD doit être CROISSANTE avec le numéro de bucket
-    mono = bool(np.all(np.diff(stats["pd"].values) >= 0))
+    mono = bool(np.all(np.diff(stats["pd"].values) >= -1e-12))
 
     return edges.tolist(), stats, mono
 
@@ -301,7 +454,7 @@ def train_pipeline(
         lr = LogisticRegression(max_iter=1000, solver="lbfgs")
 
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        gs = GridSearchCV(lr, grid, cv=cv, scoring="neg_log_loss", n_jobs=-1)
+        gs = GridSearchCV(lr, grid, cv=cv, scoring="roc_auc", n_jobs=-1)
         gs.fit(X_model_kept, y_model.values)
 
         best_lr = gs.best_estimator_
