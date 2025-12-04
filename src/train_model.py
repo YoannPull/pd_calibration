@@ -12,9 +12,12 @@ Principes :
 - Score TTC basé sur log-odds non calibrés (standard bancaire).
 - PD calibrée via isotonic regression.
 - Master Scale (10 buckets) monotone.
-- Code propre, lisible, industrialisable.
 - Sauvegarde train_scored / validation_scored avec vintage & loan_sequence_number
   dans data/processed/scored (et plus dans artifacts).
+
+Option PD TTC :
+- --ttc-mode train      : PD TTC par grade = PD observée sur TRAIN uniquement
+- --ttc-mode train_val  : PD TTC par grade = PD observée sur TRAIN + VALIDATION
 """
 
 from __future__ import annotations
@@ -383,6 +386,13 @@ def parse_args():
         help="Répertoire où écrire train_scored / validation_scored (parquet).",
     )
     p.add_argument("--timing", action="store_true")
+    p.add_argument(
+        "--ttc-mode",
+        choices=["train", "train_val"],
+        default="train",
+        help="Source pour la PD TTC par grade dans bucket_stats.json : "
+             "'train' = train uniquement (par défaut), 'train_val' = train + validation (long run).",
+    )
     return p.parse_args()
 
 
@@ -425,6 +435,39 @@ def main():
     print("\n[MONOTONICITÉ TRAIN] :", "OK" if mono_tr else "NON MONOTONE")
     print("[MONOTONICITÉ VAL]   :", "OK" if mono_va else "NON MONOTONE")
 
+    # ------------------------------------------------------------------
+    # Construction d'une PD TTC "long run" train + validation (optionnel)
+    # ------------------------------------------------------------------
+    # stats_tr / stats_va ont : bucket, count, bad, min_score, max_score, pd
+    stats_tr_base = stats_tr.copy()
+    stats_va_base = stats_va.copy()
+
+    stats_longrun = stats_tr_base[["bucket", "count", "bad", "min_score", "max_score"]].merge(
+        stats_va_base[["bucket", "count", "bad", "min_score", "max_score"]],
+        on="bucket",
+        how="outer",
+        suffixes=("_tr", "_va")
+    )
+
+    # Remplir les NaN pour les compteurs
+    for col in ["count_tr", "count_va", "bad_tr", "bad_va"]:
+        stats_longrun[col] = stats_longrun[col].fillna(0)
+
+    stats_longrun["count"] = stats_longrun["count_tr"] + stats_longrun["count_va"]
+    stats_longrun["bad"] = stats_longrun["bad_tr"] + stats_longrun["bad_va"]
+    stats_longrun["min_score"] = stats_longrun[["min_score_tr", "min_score_va"]].min(axis=1)
+    stats_longrun["max_score"] = stats_longrun[["max_score_tr", "max_score_va"]].max(axis=1)
+    stats_longrun["pd"] = stats_longrun["bad"] / stats_longrun["count"]
+    stats_longrun = stats_longrun[["bucket", "count", "bad", "min_score", "max_score", "pd"]].sort_values("bucket")
+
+    # ------------------------------------------------------------------
+    # Choix de la PD TTC utilisée dans la clé 'train' de bucket_stats.json
+    # ------------------------------------------------------------------
+    if args.ttc_mode == "train":
+        stats_train_for_json = stats_tr_base
+    else:  # "train_val"
+        stats_train_for_json = stats_longrun
+
     # Sauvegarde du modèle + artefacts grille (toujours dans artifacts)
     dump({
         "model_pd": out["model_pd"],
@@ -435,11 +478,23 @@ def main():
     }, artifacts / "model_best.joblib")
 
     save_json({"edges": edges}, artifacts / "risk_buckets.json")
-    save_json({
-        "train": stats_tr.to_dict(orient="records"),
-        "validation": stats_va.to_dict(orient="records"),
+
+    # bucket_stats.json contient :
+    # - 'train'           : PD TTC utilisée (train ou long-run selon ttc_mode)
+    # - 'train_raw'       : stats train seules
+    # - 'train_val_longrun' : stats train+validation
+    # - 'validation'      : stats validation
+    # - 'metrics'         : métriques de perf du modèle
+    # - 'ttc_mode'        : mode utilisé
+    bucket_stats_payload = {
+        "train": stats_train_for_json.to_dict(orient="records"),
+        "train_raw": stats_tr_base.to_dict(orient="records"),
+        "train_val_longrun": stats_longrun.to_dict(orient="records"),
+        "validation": stats_va_base.to_dict(orient="records"),
         "metrics": out["metrics"],
-    }, artifacts / "bucket_stats.json")
+        "ttc_mode": args.ttc_mode,
+    }
+    save_json(bucket_stats_payload, artifacts / "bucket_stats.json")
 
     # ------------------------------------------------------------------
     # train_scored / validation_scored -> data/processed/scored
@@ -453,7 +508,6 @@ def main():
 
     # Train scored
     train_scored = out["meta_tr"].copy()
-    # on garde la vraie cible sous son nom
     train_scored[args.target] = out["y_tr"]
     train_scored["score_ttc"] = out["score_tr"]
     train_scored["pd"] = out["pd_tr"]
@@ -473,6 +527,8 @@ def main():
     validation_scored_path = scored_dir / "validation_scored.parquet"
     validation_scored.to_parquet(validation_scored_path, index=False)
     print(f"✔ validation_scored sauvegardé : {validation_scored_path}")
+
+    print(f"\nMode PD TTC utilisé pour 'train' dans bucket_stats.json : {args.ttc_mode}")
 
 
 if __name__ == "__main__":
