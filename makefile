@@ -265,3 +265,32 @@ score_custom:
 clean_all:
 	rm -rf $(DATA_DIR) $(ARTIFACTS_DIR) $(REPORTS_DIR)
 	@echo "✔ Tout est nettoyé."
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================================
+# SIMULATIONS
+# ============================================================================
+
+
+.PHONY: beta_binom_sim beta_binom_plots beta_binom_all
+
+# Monte Carlo Beta-Binomiale (génère le CSV)
+beta_binom_sim:
+\tpoetry run python experiments/beta_binom_jeffreys/sim_beta_binom.py
+
+# Génération des graphiques à partir du CSV
+beta_binom_plots:
+\tpoetry run python experiments/beta_binom_jeffreys/plot_beta_binom.py
+
+# Tout (simus + graphiques)
+beta_binom_all: beta_binom_sim beta_binom_plots
