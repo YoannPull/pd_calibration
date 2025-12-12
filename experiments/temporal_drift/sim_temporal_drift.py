@@ -4,12 +4,13 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from experiments.beta_binom_jeffreys.intervals import (
+from experiments.common.intervals import (
     jeffreys_alpha2,
     exact_cp,
     approx_normal,
     in_interval,
 )
+
 
 
 def temporal_pd_path(T, T0, p_hat, delta):
@@ -156,7 +157,7 @@ if __name__ == "__main__":
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # Paramètres de la simulation (à adapter à ton papier)
-    T = 60          # par ex. 60 mois
+    T = 68          # par ex. 60 mois
     T0 = 24         # drift à partir de t > 24
     n = 100         # taille du portefeuille par période
     p_hat = 0.01    # PD de modèle

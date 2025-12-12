@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from intervals import (
+from experiments.common.intervals import (
     jeffreys_alpha2,
     approx_normal,
     exact_cp,
@@ -107,8 +107,8 @@ if __name__ == "__main__":
     data_dir = base_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    ns = [50, 100, 200]   # par ex.
-    np_targets = [0.001, 0.005,
+    ns = [50, 100, 200, 1000, 10_000]   # par ex.
+    np_targets = [0.001,
     0.01, 0.02, 0.03, 0.04, 0.05,
     0.07, 0.10, 0.15, 0.20, 0.25,
     0.30, 0.35, 0.40, 0.45, 0.50,
