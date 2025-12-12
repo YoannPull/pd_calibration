@@ -26,17 +26,24 @@ def beta_binom_params(p, rho):
 
 def simulate_beta_binomial(n, p, rho, n_sim, rng=None):
     """
-    Simule d ~ Beta-Binomiale(n, alpha, beta) via :
-        theta ~ Beta(alpha, beta)
-        d | theta ~ Bin(n, theta)
+    Simule d selon :
+      - Binomiale(n, p) si rho = 0
+      - Beta-Binomiale(n, alpha, beta) si 0 < rho < 1
     """
     if rng is None:
         rng = np.random.default_rng()
 
+    # Cas Binomial pur : pas de surdispersion
+    if rho == 0:
+        d = rng.binomial(n, p, size=n_sim)
+        return d
+
+    # Cas surdispersé : Beta-Binomiale
     alpha, beta_param = beta_binom_params(p, rho)
     theta = rng.beta(alpha, beta_param, size=n_sim)
     d = rng.binomial(n, theta)
     return d
+
 
 
 def simulate_comparison_beta_binom(
@@ -96,31 +103,39 @@ def simulate_comparison_beta_binom(
 
 
 if __name__ == "__main__":
-    # Répertoire de base = dossier du script
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Grille de paramètres pour le papier
-    ns = [50, 100, 500]
-    p_trues = [0.001, 0.01]        # 0.1%, 1%
-    rhos = [0.0, 0.01, 0.02, 0.05]  # 0 = Binomial pur
-    n_sim = 50_000
+    ns = [50, 100, 200]   # par ex.
+    np_targets = [0.001, 0.005,
+    0.01, 0.02, 0.03, 0.04, 0.05,
+    0.07, 0.10, 0.15, 0.20, 0.25,
+    0.30, 0.35, 0.40, 0.45, 0.50,
+    0.60, 0.70, 0.80, 0.90, 1.00,
+    1.25, 1.50, 1.75, 2.00, 2.50,
+    3.00, 3.50, 4.00, 5.00, 6.00,
+    7.50, 10.00,
+]
+   # valeurs de n*p
+    rhos = [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.20]          
+    n_sim = 5000
     conf = 0.95
 
     rows = []
     rng = np.random.default_rng(123)
 
     for n in ns:
-        for p_true in p_trues:
+        for np_target in np_targets:
+            p_true = np_target / n
             for rho in rhos:
-                print(f"Simu: n={n}, p_true={p_true}, rho={rho}")
+                print(f"Simu: n={n}, p_true={p_true}, n*p={np_target}, rho={rho}")
                 res = simulate_comparison_beta_binom(
                     n=n,
                     p_true=p_true,
                     rho=rho,
                     n_sim=n_sim,
-                    p_star=p_true,          # cas "modèle calibré en moyenne"
+                    p_star=p_true,          # cas calibré en moyenne
                     confidence_level=conf,
                     rng=rng,
                 )
@@ -128,6 +143,7 @@ if __name__ == "__main__":
                     rows.append({
                         "n": n,
                         "p_true": p_true,
+                        "np_target": np_target,
                         "rho": rho,
                         "method": method,
                         "coverage": stats["coverage"],
