@@ -1,90 +1,118 @@
 # ============================================================================
 # Makefile – Pipeline Risque de Crédit (Bank-Grade)
 # ============================================================================
+# Objectif :
+#   - Pipeline principal : Labels -> Impute -> Binning -> Model -> TTC Macro -> Report
+#   - Modules manuels : scoring OOS, reports vintage/grade, scoring custom
+#   - Recalibration (type 1) : update table grade -> PD (mean ou isotonic)
+#   - Application Master Scale : ajoute une PD "pd_ms" aux jeux scorés
+# ============================================================================
 
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
 .DEFAULT_GOAL := help
 
-# --- 1. Environnement ---
+
+# ============================================================================
+# 0) ENVIRONNEMENT
+# ============================================================================
 export OMP_NUM_THREADS ?= 1
 export MKL_NUM_THREADS ?= 1
 export OPENBLAS_NUM_THREADS ?= 1
 PY ?= PYTHONPATH=src poetry run python
 
-# --- 2. Répertoires ---
+
+# ============================================================================
+# 1) RÉPERTOIRES
+# ============================================================================
 DATA_DIR      := data/processed
 ARTIFACTS_DIR := artifacts
 REPORTS_DIR   := reports
 
-# Répertoire des séries macro brutes (FRED)
+# Séries macro brutes (FRED)
 MACRO_RAW_DIR := data/raw/macro
 
-# --- 3. Configuration Globale ---
-# Labels
+
+# ============================================================================
+# 2) CONFIGURATION GLOBALE
+# ============================================================================
+
+# 2.1 Labels
 LABELS_CONFIG  ?= config.yml
 LABELS_WINDOW  ?= 12
 LABELS_OUTDIR   = $(DATA_DIR)/default_labels
 
-# Imputation
+# 2.2 Imputation
 IMPUTE_TARGET_COL    = default_$(LABELS_WINDOW)m
 IMPUTE_OUT_DIR       = $(DATA_DIR)/imputed
 IMPUTE_ARTIFACTS_DIR = $(ARTIFACTS_DIR)/imputer
 
-# Binning
+# 2.3 Binning
 BINNING_OUT_DIR       = $(DATA_DIR)/binned
 BINNING_ARTIFACTS_DIR = $(ARTIFACTS_DIR)/binning_maxgini
 BINNING_TRAIN         = $(IMPUTE_OUT_DIR)/train.parquet
 BINNING_VAL           = $(IMPUTE_OUT_DIR)/validation.parquet
 
-# Modeling
+# 2.4 Modeling
 MODEL_ARTIFACTS_DIR = $(ARTIFACTS_DIR)/model_from_binned
 SCORED_OUT_DIR      = $(DATA_DIR)/scored
 MODEL_TRAIN_DATA    = $(BINNING_OUT_DIR)/train.parquet
 MODEL_VAL_DATA      = $(BINNING_OUT_DIR)/validation.parquet
 
-# Scored (produits par train_model.py)
+# 2.5 Scored (sorties de train_model.py)
 SCORED_TRAIN_DATA   = $(SCORED_OUT_DIR)/train_scored.parquet
 SCORED_VAL_DATA     = $(SCORED_OUT_DIR)/validation_scored.parquet
 
-# PD TTC macro (sortie de estimate_ttc_macro.py)
+# 2.6 TTC Macro
 PD_TTC_MACRO_JSON   = $(MODEL_ARTIFACTS_DIR)/pd_ttc_macro.json
 
-# OOS & Reporting
+# 2.7 OOS & Reporting
 OOS_LABELS_PARQUET  = $(LABELS_OUTDIR)/window=$(LABELS_WINDOW)m/oos.parquet
 OOS_SCORED          = $(SCORED_OUT_DIR)/oos_scored.parquet
-REPORT_TRAIN_HTML   = $(REPORTS_DIR)/train_report.html
-REPORT_VAL_HTML     = $(REPORTS_DIR)/validation_report.html
+
+REPORT_HTML         = $(REPORTS_DIR)/model_validation_report.html
 VINTAGE_REPORT_OOS  = $(REPORTS_DIR)/vintage_grade_oos.html
 VINTAGE_REPORT_VAL  = $(REPORTS_DIR)/vintage_grade_validation.html
 
-# ============================================================================
-# CIBLES (TARGETS)
-# ============================================================================
 
+# ============================================================================
+# 3) AIDE
+# ============================================================================
 .PHONY: help
 help:
 	@echo "================================================================="
 	@echo "   PIPELINE RISQUE DE CRÉDIT -- FOCUS CALIBRATION"
 	@echo "================================================================="
-	@echo "  make pipeline            : Labels -> Impute -> Binning -> Model -> TTC_macro -> Report"
+	@echo "  make pipeline                 : (1) labels -> (2) impute -> (3) binning -> (4) model -> (5) ttc_macro -> (6) report"
 	@echo "-----------------------------------------------------------------"
-	@echo "  make labels              : 1. Génère les labels"
-	@echo "  make impute              : 2. Impute (Fit Train / Transform All)"
-	@echo "  make binning_fit         : 3. Discrétise (Max Gini + Monotonicité)"
-	@echo "  make model_train         : 4. Entraîne (LR + Calibration + Grille, + scored)"
-	@echo "  make ttc_macro           : 5. Estime la PD TTC macro par grade (pd_ttc_macro)"
-	@echo "  make report              : 6. Génère le rapport HTML (Train & Val scored)"
+	@echo "  [PIPELINE]"
+	@echo "    make labels                 : 1) Génère les labels"
+	@echo "    make impute                 : 2) Impute (Fit Train / Transform All)"
+	@echo "    make binning_fit            : 3) Discrétise (Max Gini + Monotonicité)"
+	@echo "    make model_train            : 4) Entraîne (LR + Calibration + Grille + scored)"
+	@echo "    make ttc_macro              : 5) Estime la PD TTC macro par grade"
+	@echo "    make report                 : 6) Génère le rapport HTML (Train+Val scorés)"
 	@echo "-----------------------------------------------------------------"
-	@echo "  make oos_score           : [MANUEL] Scoring OOS (fichier oos.parquet)"
-	@echo "  make oos_vintage_report  : [MANUEL] Scoring OOS + Vintage/Grade report"
-	@echo "  make val_vintage_report  : [MANUEL] Vintage/Grade report sur Validation"
-	@echo "  make score_custom        : [MANUEL] Scorer un fichier spécifique"
-	@echo "  make clean_all           : Nettoyage complet"
+	@echo "  [RECALIBRATION MASTER SCALE]"
+	@echo "    make recalibrate_pd         : Recalibration type (1) (grade->PD) sur fenêtre glissante"
+	@echo "    make val_apply_ms           : Applique la master scale recalibrée sur Validation (ajoute pd_ms)"
+	@echo "    make oos_apply_ms           : Applique la master scale recalibrée sur OOS (ajoute pd_ms)"
+	@echo "-----------------------------------------------------------------"
+	@echo "  [MODULES MANUELS]"
+	@echo "    make oos_score              : Scoring OOS (fichier oos.parquet)"
+	@echo "    make oos_vintage_report     : Scoring OOS + report vintage/grade"
+	@echo "    make val_vintage_report     : Report vintage/grade sur Validation"
+	@echo "    make score_custom           : Scorer un fichier spécifique"
+	@echo "    make clean_all              : Nettoyage complet"
 	@echo "================================================================="
 
+
+# ============================================================================
+# 4) PIPELINE PRINCIPAL (1 -> 6)
+# ============================================================================
+
 # ----------------------------------------------------------------------------
-# 1. LABELS
+# 4.1) LABELS
 # ----------------------------------------------------------------------------
 .PHONY: labels
 labels:
@@ -92,7 +120,7 @@ labels:
 	$(PY) src/make_labels.py --config $(LABELS_CONFIG) --workers 12
 
 # ----------------------------------------------------------------------------
-# 2. IMPUTATION (Anti-Leakage)
+# 4.2) IMPUTATION (Anti-Leakage)
 # ----------------------------------------------------------------------------
 .PHONY: impute
 impute:
@@ -106,7 +134,7 @@ impute:
 		--fail-on-nan
 
 # ----------------------------------------------------------------------------
-# 3. BINNING (Monotone)
+# 4.3) BINNING (Monotone)
 # ----------------------------------------------------------------------------
 .PHONY: binning_fit
 binning_fit:
@@ -122,10 +150,8 @@ binning_fit:
 		--n-quantiles-num 50
 
 # ----------------------------------------------------------------------------
-# 4. MODEL TRAINING (Master Scale + SCORING TRAIN/VAL)
+# 4.4) MODEL TRAINING (Master Scale + SCORING TRAIN/VAL)
 # ----------------------------------------------------------------------------
-# --ttc-mode train_val ou train
-
 .PHONY: model_train
 model_train:
 	@echo "\n[4/6] ENTRAÎNEMENT DU MODÈLE & CRÉATION GRILLE + SCORING TRAIN/VAL..."
@@ -142,7 +168,7 @@ model_train:
 		--ttc-mode train
 
 # ----------------------------------------------------------------------------
-# 5. PD TTC MACRO (grade × temps + macro)
+# 4.5) PD TTC MACRO (grade × temps + macro)
 # ----------------------------------------------------------------------------
 .PHONY: ttc_macro
 ttc_macro:
@@ -159,26 +185,23 @@ ttc_macro:
 	@echo "✔ PD TTC macro par grade sauvegardée dans : $(PD_TTC_MACRO_JSON)"
 
 # ----------------------------------------------------------------------------
-# 6. REPORTING (TRAIN + VALIDATION déjà scorés)
+# 4.6) REPORTING (TRAIN + VALIDATION déjà scorés)
 # ----------------------------------------------------------------------------
 .PHONY: report
 report:
-	@echo "\n[6/6] GENERATION DU RAPPORT GLOBAL (Train + Validation scored)..."
-
-	@echo "-> Création du RAPPORT UNIQUE (Train + Validation)..."
+	@echo "\n[6/6] GENERATION DU RAPPORT GLOBAL (Train + Validation scorés)..."
 	$(PY) src/generate_report.py \
 		--train $(SCORED_TRAIN_DATA) \
 		--validation $(SCORED_VAL_DATA) \
-		--out $(REPORTS_DIR)/model_validation_report.html \
+		--out $(REPORT_HTML) \
 		--target $(IMPUTE_TARGET_COL) \
 		--score score_ttc --pd pd --grade grade \
 		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib
-
-	@echo "✔ Rapport généré : $(REPORTS_DIR)/model_validation_report.html"
-	@open $(REPORTS_DIR)/model_validation_report.html 2>/dev/null || true
+	@echo "✔ Rapport généré : $(REPORT_HTML)"
+	@open $(REPORT_HTML) 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
-# PIPELINE GLOBAL
+# 4.X) PIPELINE GLOBAL
 # ----------------------------------------------------------------------------
 .PHONY: pipeline
 pipeline: labels impute binning_fit model_train ttc_macro report
@@ -186,11 +209,78 @@ pipeline: labels impute binning_fit model_train ttc_macro report
 	@echo "✔ PIPELINE DE VALIDATION TERMINÉ."
 	@echo "-------------------------------------------------------"
 
+
 # ============================================================================
-# MODULES STANDALONE (HORS PIPELINE AUTOMATIQUE)
+# 5) RECALIBRATION MASTER SCALE (Type 1 : update grade -> PD)
 # ============================================================================
 
-# --- OOS SCORING (FULL PIPELINE SUR OOS) ---
+# Paramètres recalibration
+RECAL_METHOD ?= mean        # mean | isotonic
+RECAL_AGG    ?= time_mean   # pooled | time_mean
+RECAL_YEARS  ?= 5
+
+BUCKET_STATS_RECAL := $(MODEL_ARTIFACTS_DIR)/bucket_stats_recalibrated.json
+
+.PHONY: recalibrate_pd
+recalibrate_pd:
+	@echo "\n[REC] Recalibration PD par grade (method=$(RECAL_METHOD), agg=$(RECAL_AGG), years=$(RECAL_YEARS))..."
+	@test -f "$(SCORED_TRAIN_DATA)" || (echo "[ERR] Missing: $(SCORED_TRAIN_DATA)"; exit 1)
+	@test -f "$(SCORED_VAL_DATA)"   || (echo "[ERR] Missing: $(SCORED_VAL_DATA)"; exit 1)
+	$(PY) src/recalibrate_master_scale.py \
+		--scored $(SCORED_TRAIN_DATA) \
+		--scored $(SCORED_VAL_DATA) \
+		--target $(IMPUTE_TARGET_COL) \
+		--grade-col grade \
+		--time-col vintage \
+		--time-freq Q \
+		--method $(RECAL_METHOD) \
+		--aggregation $(RECAL_AGG) \
+		--window-years $(RECAL_YEARS) \
+		--out-json $(BUCKET_STATS_RECAL)
+	@echo "✔ Bucket stats recalibrés : $(BUCKET_STATS_RECAL)"
+
+
+# ============================================================================
+# 6) APPLICATION MASTER SCALE (ajoute pd_ms aux fichiers scorés)
+# ============================================================================
+
+SCORED_VAL_MS := $(SCORED_OUT_DIR)/validation_scored_ms.parquet
+OOS_SCORED_MS := $(SCORED_OUT_DIR)/oos_scored_ms.parquet
+
+.PHONY: val_apply_ms
+val_apply_ms:
+	@echo "\n[MS] Application master scale recalibrée sur Validation..."
+	@test -f "$(SCORED_VAL_DATA)"      || (echo "[ERR] Missing: $(SCORED_VAL_DATA)"; exit 1)
+	@test -f "$(BUCKET_STATS_RECAL)"   || (echo "[ERR] Missing: $(BUCKET_STATS_RECAL)"; exit 1)
+	$(PY) src/apply_master_scale.py \
+		--in-scored $(SCORED_VAL_DATA) \
+		--out $(SCORED_VAL_MS) \
+		--bucket-stats $(BUCKET_STATS_RECAL) \
+		--grade-col grade \
+		--pd-col-out pd_ms
+	@echo "✔ Validation enrichie : $(SCORED_VAL_MS)"
+
+.PHONY: oos_apply_ms
+oos_apply_ms: oos_score
+	@echo "\n[MS] Application master scale recalibrée sur OOS..."
+	@test -f "$(OOS_SCORED)"          || (echo "[ERR] Missing: $(OOS_SCORED)"; exit 1)
+	@test -f "$(BUCKET_STATS_RECAL)" || (echo "[ERR] Missing: $(BUCKET_STATS_RECAL)"; exit 1)
+	$(PY) src/apply_master_scale.py \
+		--in-scored $(OOS_SCORED) \
+		--out $(OOS_SCORED_MS) \
+		--bucket-stats $(BUCKET_STATS_RECAL) \
+		--grade-col grade \
+		--pd-col-out pd_ms
+	@echo "✔ OOS enrichi : $(OOS_SCORED_MS)"
+
+
+# ============================================================================
+# 7) MODULES STANDALONE (HORS PIPELINE AUTOMATIQUE)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 7.1) OOS SCORING (Full pipeline OOS)
+# ----------------------------------------------------------------------------
 .PHONY: oos_score
 oos_score:
 	@echo "\n[MANUEL] SCORING ECHANTILLON OOS (Out-of-Sample, full pipeline)..."
@@ -206,7 +296,9 @@ oos_score:
 		--id-col loan_sequence_number
 	@echo "✔ Scoring terminé : $(OOS_SCORED)"
 
-# --- OOS SCORING + VINTAGE/GRADE REPORT ---
+# ----------------------------------------------------------------------------
+# 7.2) OOS: Vintage/Grade report
+# ----------------------------------------------------------------------------
 .PHONY: oos_vintage_report
 oos_vintage_report: oos_score
 	@echo "\n[MANUEL] VINTAGE / GRADE REPORT SUR OOS..."
@@ -218,11 +310,13 @@ oos_vintage_report: oos_score
 		--pd-col pd \
 		--target $(IMPUTE_TARGET_COL) \
 		--sample-name "OOS" \
-		--bucket-stats artifacts/model_from_binned/bucket_stats.json
+		--bucket-stats $(MODEL_ARTIFACTS_DIR)/bucket_stats.json
 	@echo "✔ Rapport OOS Vintage / Grade généré : $(VINTAGE_REPORT_OOS)"
 	@open $(VINTAGE_REPORT_OOS) 2>/dev/null || true
 
-# --- VALIDATION VINTAGE/GRADE REPORT ---
+# ----------------------------------------------------------------------------
+# 7.3) Validation: Vintage/Grade report
+# ----------------------------------------------------------------------------
 .PHONY: val_vintage_report
 val_vintage_report:
 	@echo "\n[MANUEL] VINTAGE / GRADE REPORT SUR VALIDATION..."
@@ -235,12 +329,14 @@ val_vintage_report:
 		--pd-col pd \
 		--target $(IMPUTE_TARGET_COL) \
 		--sample-name "Validation" \
-		--bucket-stats artifacts/model_from_binned/bucket_stats.json
+		--bucket-stats $(MODEL_ARTIFACTS_DIR)/bucket_stats.json
 	@echo "✔ Rapport Validation Vintage / Grade généré : $(VINTAGE_REPORT_VAL)"
 	@open $(VINTAGE_REPORT_VAL) 2>/dev/null || true
 
 
-# --- SCORING CUSTOM ---
+# ----------------------------------------------------------------------------
+# 7.4) SCORING CUSTOM
+# ----------------------------------------------------------------------------
 CUSTOM_DATA   ?= $(OOS_LABELS_PARQUET)
 CUSTOM_OUT    ?= $(SCORED_OUT_DIR)/custom_scored.parquet
 CUSTOM_TARGET ?= $(IMPUTE_TARGET_COL)
@@ -260,68 +356,50 @@ score_custom:
 		--id-col loan_sequence_number
 	@echo "✔ Résultat : $(CUSTOM_OUT)"
 
-# --- NETTOYAGE ---
+
+# ----------------------------------------------------------------------------
+# 7.5) NETTOYAGE
+# ----------------------------------------------------------------------------
 .PHONY: clean_all
 clean_all:
 	rm -rf $(DATA_DIR) $(ARTIFACTS_DIR) $(REPORTS_DIR)
 	@echo "✔ Tout est nettoyé."
 
 
-
-
-
-
-
 # ============================================================================
-# SIMULATIONS
+# 8) SIMULATIONS
 # ============================================================================
 
-# Binomial distribution
+# --- Binomial ---
 .PHONY: binom_sim binom_plots binom_tables binom_all
-
 binom_sim:
 	poetry run python -m experiments.binom_coverage.sim_binom
-
 binom_plots:
 	poetry run python -m experiments.binom_coverage.plot_binom
-
 binom_tables:
 	poetry run python -m experiments.binom_coverage.make_table_binom
-
 binom_all: binom_sim binom_plots binom_tables
 
-
-# Beta-binomial simulation
+# --- Beta-binomial ---
 .PHONY: beta_binom_sim beta_binom_plots beta_binom_tables beta_binom_all
-
 beta_binom_sim:
 	poetry run python -m experiments.beta_binom_jeffreys.sim_beta_binom
-
 beta_binom_plots:
 	poetry run python -m experiments.beta_binom_jeffreys.plot_beta_binom
-
 beta_binom_tables:
 	poetry run python -m experiments.beta_binom_jeffreys.make_table_beta_binom
-
 beta_binom_all: beta_binom_sim beta_binom_plots beta_binom_tables
 
-
-# Temporal drift simulation
+# --- Temporal drift ---
 .PHONY: temporal_drift_sim temporal_drift_plots temporal_drift_tables temporal_drift_all
-
 temporal_drift_sim:
 	poetry run python -m experiments.temporal_drift.sim_temporal_drift
-
 temporal_drift_plots:
 	poetry run python -m experiments.temporal_drift.plot_temporal_drift
-
 temporal_drift_tables:
 	poetry run python -m experiments.temporal_drift.make_table_temporal_drift
-
 temporal_drift_all: temporal_drift_sim temporal_drift_plots temporal_drift_tables
 
-
-# Tout lancer d'un coup (simus + plots + tables pour les 3 blocs)
+# --- Tout lancer ---
 .PHONY: sims_all
-
 sims_all: beta_binom_all temporal_drift_all binom_all
