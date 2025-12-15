@@ -272,28 +272,56 @@ clean_all:
 
 
 
-
-
-
-
-
 # ============================================================================
 # SIMULATIONS
 # ============================================================================
-.PHONY: beta_binom_sim beta_binom_plots beta_binom_all
+
+# Binomial distribution
+.PHONY: binom_sim binom_plots binom_tables binom_all
+
+binom_sim:
+	poetry run python -m experiments.binom_coverage.sim_binom
+
+binom_plots:
+	poetry run python -m experiments.binom_coverage.plot_binom
+
+binom_tables:
+	poetry run python -m experiments.binom_coverage.make_table_binom
+
+binom_all: binom_sim binom_plots binom_tables
+
+
+# Beta-binomial simulation
+.PHONY: beta_binom_sim beta_binom_plots beta_binom_tables beta_binom_all
 
 beta_binom_sim:
-	poetry run python experiments/beta_binom_jeffreys/sim_beta_binom.py
+	poetry run python -m experiments.beta_binom_jeffreys.sim_beta_binom
 
 beta_binom_plots:
-	poetry run python experiments/beta_binom_jeffreys/plot_beta_binom.py
+	poetry run python -m experiments.beta_binom_jeffreys.plot_beta_binom
 
-beta_binom_all: beta_binom_sim beta_binom_plots
+beta_binom_tables:
+	poetry run python -m experiments.beta_binom_jeffreys.make_table_beta_binom
+
+beta_binom_all: beta_binom_sim beta_binom_plots beta_binom_tables
 
 
-
-.PHONY: temporal_drift_sim
+# Temporal drift simulation
+.PHONY: temporal_drift_sim temporal_drift_plots temporal_drift_tables temporal_drift_all
 
 temporal_drift_sim:
-	poetry run python experiments/temporal_drift/sim_temporal_drift.py
+	poetry run python -m experiments.temporal_drift.sim_temporal_drift
 
+temporal_drift_plots:
+	poetry run python -m experiments.temporal_drift.plot_temporal_drift
+
+temporal_drift_tables:
+	poetry run python -m experiments.temporal_drift.make_table_temporal_drift
+
+temporal_drift_all: temporal_drift_sim temporal_drift_plots temporal_drift_tables
+
+
+# Tout lancer d'un coup (simus + plots + tables pour les 3 blocs)
+.PHONY: sims_all
+
+sims_all: beta_binom_all temporal_drift_all binom_all
