@@ -1,22 +1,25 @@
 # experiments/beta_binom_jeffreys/plot_beta_binom.py
+
 from pathlib import Path
 
 import pandas as pd
-import matplotlib.pyplot as plt
+
+from experiments.plots.style import (
+    new_figure,
+    finalize_ax,
+    save_figure,
+    METHOD_STYLES,
+)
 
 
 def plot_coverage_vs_p_all_methods_all_combinations(
     df,
     save_dir=None,
-    prefix="beta_binom",
+    prefix: str = "beta_binom",
 ):
     """
     Pour chaque combinaison (n, rho), trace la probabilité de couverture
-    en fonction de p pour toutes les méthodes.
-
-    - df       : DataFrame (beta_binom_results.csv)
-    - save_dir : Path vers le dossier où sauver les PNG (ou None pour plt.show())
-    - prefix   : préfixe des noms de fichiers
+    en fonction de p pour toutes les méthodes, avec le style commun.
     """
     conf_levels = df["conf_level"].unique()
     if len(conf_levels) != 1:
@@ -32,54 +35,55 @@ def plot_coverage_vs_p_all_methods_all_combinations(
             if sub.empty:
                 continue
 
-            # Ordonner par p_true
             sub = sub.sort_values("p_true")
 
-            plt.figure(figsize=(24, 12))
+            fig, ax = new_figure()
 
             for method in sorted(sub["method"].unique()):
                 tmp = sub[sub["method"] == method]
-                x_p = tmp["p_true"]
-                y_cov = tmp["coverage"]
+                x_p = tmp["p_true"].values
+                y_cov = tmp["coverage"].values
 
-                plt.plot(
+                style = METHOD_STYLES.get(method, {})
+                label = style.get("label", method)
+                color = style.get("color", None)
+
+                ax.plot(
                     x_p,
                     y_cov,
-                    marker="o",
-                    label=method,
+                    label=label,
+                    color=color,
                 )
 
                 # Info de debug / résumé dans le terminal : min coverage
                 min_cov = y_cov.min()
-                idx_min = y_cov.idxmin()
-                p_at_min = tmp.loc[idx_min, "p_true"]
-                np_at_min = tmp.loc[idx_min, "n"] * p_at_min
+                idx_min = y_cov.argmin()
+                p_at_min = x_p[idx_min]
+                np_at_min = n * p_at_min
                 print(
                     f"[n={n}, rho={rho}, method={method}] "
                     f"min coverage = {min_cov:.4f} / p = {p_at_min:.6f} / n*p = {np_at_min:.4f}"
                 )
 
-            # Ligne horizontale : niveau nominal
-            plt.axhline(y=conf, color="black", linestyle="--", label="Nominal level")
+            rho_str = str(rho).replace(".", "_")
 
-            plt.xlabel(r"$p$")
-            plt.ylabel("Coverage probability")
-            plt.title(
-                f"Coverage vs $p$ (n={n}, rho={rho})"
+            finalize_ax(
+                ax,
+                xlabel=r"$p$",
+                ylabel="Coverage probability",
+                title=f"Coverage vs $p$ (n={n}, rho={rho})",
+                nominal_level=conf,
+                nominal_label="Nominal level",
             )
-            plt.legend()
-            plt.grid(True)
 
             if save_dir is not None:
-                rho_str = str(rho).replace(".", "_")
                 fname = f"{prefix}_coverage_all_methods_n{n}_rho{rho_str}.png"
                 out_path = save_dir / fname
-                plt.savefig(out_path, dpi=300, bbox_inches="tight")
-                print(f"Saved {out_path}")
+                save_figure(fig, out_path)
             else:
+                import matplotlib.pyplot as plt
                 plt.show()
-
-            plt.close()
+                plt.close(fig)
 
 
 if __name__ == "__main__":

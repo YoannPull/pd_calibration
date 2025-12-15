@@ -3,11 +3,10 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from experiments.common.intervals import (
+from experiments.stats.intervals import (
     jeffreys_alpha2,
     approx_normal,
     exact_cp,
-    in_interval,
 )
 
 
@@ -33,17 +32,32 @@ def simulate_beta_binomial(n, p, rho, n_sim, rng=None):
     if rng is None:
         rng = np.random.default_rng()
 
-    # Cas Binomial pur : pas de surdispersion
     if rho == 0:
-        d = rng.binomial(n, p, size=n_sim)
-        return d
+        return rng.binomial(n, p, size=n_sim)
 
-    # Cas surdispersé : Beta-Binomiale
     alpha, beta_param = beta_binom_params(p, rho)
     theta = rng.beta(alpha, beta_param, size=n_sim)
-    d = rng.binomial(n, theta)
-    return d
+    return rng.binomial(n, theta)
 
+
+def _summarize_bounds(lb: np.ndarray, ub: np.ndarray) -> dict[str, float]:
+    lb = np.asarray(lb, dtype=float)
+    ub = np.asarray(ub, dtype=float)
+    length = ub - lb
+    return {
+        "lb_mean": float(np.mean(lb)),
+        "ub_mean": float(np.mean(ub)),
+        "lb_var": float(np.var(lb, ddof=0)),
+        "ub_var": float(np.var(ub, ddof=0)),
+        "len_mean": float(np.mean(length)),
+        "len_var": float(np.var(length, ddof=0)),
+    }
+
+
+def _coverage(lb: np.ndarray, ub: np.ndarray, p_true: float) -> float:
+    lb = np.asarray(lb, dtype=float)
+    ub = np.asarray(ub, dtype=float)
+    return float(((lb <= p_true) & (p_true <= ub)).mean())
 
 
 def simulate_comparison_beta_binom(
@@ -58,6 +72,10 @@ def simulate_comparison_beta_binom(
     """
     Compare Jeffreys / Clopper-Pearson / Normale sous un DGP Beta-Binomial,
     en appliquant les procédures comme si le modèle était Binomial(n, p).
+
+    Enregistre en plus:
+      - moyenne/variance des bornes LB/UB
+      - moyenne/variance de la longueur
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -66,38 +84,50 @@ def simulate_comparison_beta_binom(
 
     d_samples = simulate_beta_binomial(n, p_true, rho, n_sim, rng=rng)
 
-    results = {
-        "jeffreys": {"cover": 0, "length_sum": 0.0, "reject_star": 0},
-        "cp":       {"cover": 0, "length_sum": 0.0, "reject_star": 0},
-        "normal":   {"cover": 0, "length_sum": 0.0, "reject_star": 0},
+    # On calcule toutes les bornes en arrays (plus rapide, plus simple)
+    lb_j = np.empty(n_sim, dtype=float)
+    ub_j = np.empty(n_sim, dtype=float)
+    lb_cp = np.empty(n_sim, dtype=float)
+    ub_cp = np.empty(n_sim, dtype=float)
+    lb_n = np.empty(n_sim, dtype=float)
+    ub_n = np.empty(n_sim, dtype=float)
+
+    for i, d in enumerate(d_samples):
+        a, b = jeffreys_alpha2(n, d, confidence_level)
+        lb_j[i], ub_j[i] = a, b
+
+        a, b = exact_cp(n, d, confidence_level)
+        lb_cp[i], ub_cp[i] = a, b
+
+        a, b = approx_normal(n, d, confidence_level)
+        lb_n[i] = max(0.0, a)
+        ub_n[i] = min(1.0, b)
+
+    results = {}
+
+    # Jeffreys
+    results["jeffreys"] = {
+        "coverage": _coverage(lb_j, ub_j, p_true),
+        "avg_length": float(np.mean(ub_j - lb_j)),
+        "reject_star_rate": float(((p_star < lb_j) | (p_star > ub_j)).mean()),
+        **_summarize_bounds(lb_j, ub_j),
     }
 
-    for d in d_samples:
-        # Jeffreys
-        lb_j, ub_j = jeffreys_alpha2(n, d, confidence_level)
-        results["jeffreys"]["cover"] += in_interval(lb_j, ub_j, p_true)
-        results["jeffreys"]["length_sum"] += (ub_j - lb_j)
-        results["jeffreys"]["reject_star"] += int((p_star < lb_j) or (p_star > ub_j))
+    # CP
+    results["cp"] = {
+        "coverage": _coverage(lb_cp, ub_cp, p_true),
+        "avg_length": float(np.mean(ub_cp - lb_cp)),
+        "reject_star_rate": float(((p_star < lb_cp) | (p_star > ub_cp)).mean()),
+        **_summarize_bounds(lb_cp, ub_cp),
+    }
 
-        # Clopper–Pearson exact
-        lb_cp, ub_cp = exact_cp(n, d, confidence_level)
-        results["cp"]["cover"] += in_interval(lb_cp, ub_cp, p_true)
-        results["cp"]["length_sum"] += (ub_cp - lb_cp)
-        results["cp"]["reject_star"] += int((p_star < lb_cp) or (p_star > ub_cp))
-
-        # Approximation normale
-        lb_n, ub_n = approx_normal(n, d, confidence_level)
-        lb_n = max(0.0, lb_n)
-        ub_n = min(1.0, ub_n)
-        results["normal"]["cover"] += in_interval(lb_n, ub_n, p_true)
-        results["normal"]["length_sum"] += (ub_n - lb_n)
-        results["normal"]["reject_star"] += int((p_star < lb_n) or (p_star > ub_n))
-
-    for key, stats in results.items():
-        stats["coverage"] = stats["cover"] / n_sim
-        stats["avg_length"] = stats["length_sum"] / n_sim
-        stats["reject_star_rate"] = stats["reject_star"] / n_sim
-        del stats["cover"], stats["length_sum"], stats["reject_star"]
+    # Normal approx
+    results["normal"] = {
+        "coverage": _coverage(lb_n, ub_n, p_true),
+        "avg_length": float(np.mean(ub_n - lb_n)),
+        "reject_star_rate": float(((p_star < lb_n) | (p_star > ub_n)).mean()),
+        **_summarize_bounds(lb_n, ub_n),
+    }
 
     return results
 
@@ -107,18 +137,18 @@ if __name__ == "__main__":
     data_dir = base_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    ns = [50, 100, 200, 1000, 10_000]   # par ex.
-    np_targets = [0.001,
-    0.01, 0.02, 0.03, 0.04, 0.05,
-    0.07, 0.10, 0.15, 0.20, 0.25,
-    0.30, 0.35, 0.40, 0.45, 0.50,
-    0.60, 0.70, 0.80, 0.90, 1.00,
-    1.25, 1.50, 1.75, 2.00, 2.50,
-    3.00, 3.50, 4.00, 5.00, 6.00,
-    7.50, 10.00,
-]
-   # valeurs de n*p
-    rhos = [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.20]          
+    ns = [50, 100, 200, 1000, 10_000]
+    np_targets = [
+        0.001,
+        0.01, 0.02, 0.03, 0.04, 0.05,
+        0.07, 0.10, 0.15, 0.20, 0.25,
+        0.30, 0.35, 0.40, 0.45, 0.50,
+        0.60, 0.70, 0.80, 0.90, 1.00,
+        1.25, 1.50, 1.75, 2.00, 2.50,
+        3.00, 3.50, 4.00, 5.00, 6.00,
+        7.50, 10.00,
+    ]  # valeurs de n*p
+    rhos = [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.20]
     n_sim = 5000
     conf = 0.95
 
@@ -135,23 +165,32 @@ if __name__ == "__main__":
                     p_true=p_true,
                     rho=rho,
                     n_sim=n_sim,
-                    p_star=p_true,          # cas calibré en moyenne
+                    p_star=p_true,
                     confidence_level=conf,
                     rng=rng,
                 )
                 for method, stats in res.items():
-                    rows.append({
-                        "n": n,
-                        "p_true": p_true,
-                        "np_target": np_target,
-                        "rho": rho,
-                        "method": method,
-                        "coverage": stats["coverage"],
-                        "avg_length": stats["avg_length"],
-                        "reject_star_rate": stats["reject_star_rate"],
-                        "conf_level": conf,
-                        "n_sim": n_sim,
-                    })
+                    rows.append(
+                        {
+                            "n": n,
+                            "p_true": p_true,
+                            "np_target": np_target,
+                            "rho": rho,
+                            "method": method,
+                            "coverage": stats["coverage"],
+                            "avg_length": stats["avg_length"],  # gardé pour compat
+                            "reject_star_rate": stats["reject_star_rate"],
+                            # nouvelles colonnes
+                            "lb_mean": stats["lb_mean"],
+                            "ub_mean": stats["ub_mean"],
+                            "lb_var": stats["lb_var"],
+                            "ub_var": stats["ub_var"],
+                            "len_mean": stats["len_mean"],
+                            "len_var": stats["len_var"],
+                            "conf_level": conf,
+                            "n_sim": n_sim,
+                        }
+                    )
 
     df = pd.DataFrame(rows)
     out_path = data_dir / "beta_binom_results.csv"

@@ -4,13 +4,12 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-from experiments.common.intervals import (
+from experiments.stats.intervals import (
     jeffreys_alpha2,
     exact_cp,
     approx_normal,
     in_interval,
 )
-
 
 
 def temporal_pd_path(T, T0, p_hat, delta):
@@ -27,9 +26,8 @@ def temporal_pd_path(T, T0, p_hat, delta):
     t = np.arange(1, T + 1)
 
     p_true = np.empty(T, dtype=float)
-    # avant ou à T0 : modèle bien calibré
     p_true[t <= T0] = p_hat
-    # après T0 : drift linéaire
+
     mask_drift = t > T0
     if np.any(mask_drift):
         p_true[mask_drift] = p_hat + delta * (t[mask_drift] - T0) / (T - T0)
@@ -57,66 +55,111 @@ def monte_carlo_temporal_drift(
         pour tester H0: p = p_hat et construire un intervalle pour p.
 
     On agrège ensuite, pour chaque méthode et chaque t :
-      - la couverture empirique de p_true(t),
-      - la longueur moyenne de l'intervalle,
-      - la fréquence de rejet de H0: p = p_hat.
+      - couverture empirique de p_true(t),
+      - longueur moyenne + variance de longueur,
+      - moyenne + variance des bornes (LB/UB),
+      - fréquence de rejet de H0: p = p_hat.
 
     Retourne :
-      Un DataFrame avec une ligne par (méthode, t) contenant les statistiques
-      agrégées + les paramètres de la simulation.
+      Un DataFrame avec une ligne par (méthode, t) contenant les statistiques.
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    # Trajectoire déterministe de la vraie PD
     p_true_t = temporal_pd_path(T=T, T0=T0, p_hat=p_hat, delta=delta)
 
     methods = ["jeffreys", "cp", "normal"]
     m_index = {name: i for i, name in enumerate(methods)}
     M = len(methods)
 
-    # Accumulateurs : (méthode, temps)
+    # Accumulateurs (méthode, temps)
     coverage_counts = np.zeros((M, T), dtype=float)
-    length_sums = np.zeros((M, T), dtype=float)
     reject_counts = np.zeros((M, T), dtype=float)
+
+    # Bornes : sommes et sommes des carrés
+    lb_sum = np.zeros((M, T), dtype=float)
+    lb_sumsq = np.zeros((M, T), dtype=float)
+    ub_sum = np.zeros((M, T), dtype=float)
+    ub_sumsq = np.zeros((M, T), dtype=float)
+
+    # Longueur : somme et somme des carrés
+    len_sum = np.zeros((M, T), dtype=float)
+    len_sumsq = np.zeros((M, T), dtype=float)
 
     alpha = 1.0 - confidence_level
 
-    for sim in range(n_sim):
-        # Simule une trajectoire de défauts d(t) ~ Bin(n, p_true(t))
+    for _ in range(n_sim):
         d_t = rng.binomial(n, p_true_t)
 
         for t_idx in range(T):
             p_true = p_true_t[t_idx]
             d = d_t[t_idx]
 
+            # -----------------------------
             # Jeffreys (intervalle central)
+            # -----------------------------
             m = m_index["jeffreys"]
             lb, ub = jeffreys_alpha2(n, d, confidence_level)
+            length = ub - lb
+
             coverage_counts[m, t_idx] += in_interval(lb, ub, p_true)
-            length_sums[m, t_idx] += (ub - lb)
             reject_counts[m, t_idx] += int((p_hat < lb) or (p_hat > ub))
 
+            lb_sum[m, t_idx] += lb
+            lb_sumsq[m, t_idx] += lb * lb
+            ub_sum[m, t_idx] += ub
+            ub_sumsq[m, t_idx] += ub * ub
+            len_sum[m, t_idx] += length
+            len_sumsq[m, t_idx] += length * length
+
+            # -----------------------------
             # Clopper–Pearson exact
+            # -----------------------------
             m = m_index["cp"]
-            lb_cp, ub_cp = exact_cp(n, d, confidence_level)
-            coverage_counts[m, t_idx] += in_interval(lb_cp, ub_cp, p_true)
-            length_sums[m, t_idx] += (ub_cp - lb_cp)
-            reject_counts[m, t_idx] += int((p_hat < lb_cp) or (p_hat > ub_cp))
+            lb, ub = exact_cp(n, d, confidence_level)
+            length = ub - lb
 
-            # Approximation normale
+            coverage_counts[m, t_idx] += in_interval(lb, ub, p_true)
+            reject_counts[m, t_idx] += int((p_hat < lb) or (p_hat > ub))
+
+            lb_sum[m, t_idx] += lb
+            lb_sumsq[m, t_idx] += lb * lb
+            ub_sum[m, t_idx] += ub
+            ub_sumsq[m, t_idx] += ub * ub
+            len_sum[m, t_idx] += length
+            len_sumsq[m, t_idx] += length * length
+
+            # -----------------------------
+            # Approximation normale (clippée)
+            # -----------------------------
             m = m_index["normal"]
-            lb_n, ub_n = approx_normal(n, d, confidence_level)
-            lb_n = max(0.0, lb_n)
-            ub_n = min(1.0, ub_n)
-            coverage_counts[m, t_idx] += in_interval(lb_n, ub_n, p_true)
-            length_sums[m, t_idx] += (ub_n - lb_n)
-            reject_counts[m, t_idx] += int((p_hat < lb_n) or (p_hat > ub_n))
+            lb, ub = approx_normal(n, d, confidence_level)
+            lb = max(0.0, lb)
+            ub = min(1.0, ub)
+            length = ub - lb
 
-    # Moyennes sur les réplications
+            coverage_counts[m, t_idx] += in_interval(lb, ub, p_true)
+            reject_counts[m, t_idx] += int((p_hat < lb) or (p_hat > ub))
+
+            lb_sum[m, t_idx] += lb
+            lb_sumsq[m, t_idx] += lb * lb
+            ub_sum[m, t_idx] += ub
+            ub_sumsq[m, t_idx] += ub * ub
+            len_sum[m, t_idx] += length
+            len_sumsq[m, t_idx] += length * length
+
+    # Moyennes
     coverage_rates = coverage_counts / n_sim
-    avg_lengths = length_sums / n_sim
     reject_rates = reject_counts / n_sim
+
+    lb_mean = lb_sum / n_sim
+    ub_mean = ub_sum / n_sim
+    len_mean = len_sum / n_sim
+
+    # Variances (population) : Var(X)=E[X^2]-E[X]^2
+    lb_var = (lb_sumsq / n_sim) - lb_mean**2
+    ub_var = (ub_sumsq / n_sim) - ub_mean**2
+    len_var = (len_sumsq / n_sim) - len_mean**2
 
     # Mise en forme en DataFrame
     rows = []
@@ -128,63 +171,84 @@ def monte_carlo_temporal_drift(
         for t_idx, t in enumerate(times):
             rows.append(
                 {
-                    "t": t,
+                    "t": int(t),
                     "phase": phases[t_idx],
                     "method": method,
-                    "p_true": p_true_t[t_idx],
-                    "coverage": coverage_rates[m, t_idx],
-                    "avg_length": avg_lengths[m, t_idx],
-                    "reject_rate": reject_rates[m, t_idx],
-                    "T": T,
-                    "T0": T0,
-                    "n": n,
-                    "p_hat": p_hat,
-                    "delta": delta,
-                    "n_sim": n_sim,
-                    "conf_level": confidence_level,
-                    "alpha_nominal": alpha,
+                    "p_true": float(p_true_t[t_idx]),
+                    "coverage": float(coverage_rates[m, t_idx]),
+                    "avg_length": float(len_mean[m, t_idx]),  # compat plots existants
+                    "reject_rate": float(reject_rates[m, t_idx]),
+                    # Nouvelles stats
+                    "lb_mean": float(lb_mean[m, t_idx]),
+                    "ub_mean": float(ub_mean[m, t_idx]),
+                    "lb_var": float(lb_var[m, t_idx]),
+                    "ub_var": float(ub_var[m, t_idx]),
+                    "len_mean": float(len_mean[m, t_idx]),
+                    "len_var": float(len_var[m, t_idx]),
+                    # Paramètres de simu
+                    "T": int(T),
+                    "T0": int(T0),
+                    "n": int(n),
+                    "p_hat": float(p_hat),
+                    "delta": float(delta),
+                    "n_sim": int(n_sim),
+                    "conf_level": float(confidence_level),
+                    "alpha_nominal": float(alpha),
                 }
             )
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
-    # Répertoire de base = dossier du script
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Paramètres de la simulation (à adapter à ton papier)
-    T = 68          # par ex. 60 mois
-    T0 = 24         # drift à partir de t > 24
-    n = 100         # taille du portefeuille par période
-    p_hat = 0.01    # PD de modèle
-    delta = 0.01    # drift total : p(T) = 0.02 ici
+    # Paramètres globaux
+    T = 68
+    T0 = 24
+    n = 100
     n_sim = 20_000
     conf = 0.95
 
-    df = monte_carlo_temporal_drift(
-        T=T,
-        T0=T0,
-        n=n,
-        p_hat=p_hat,
-        delta=delta,
-        n_sim=n_sim,
-        confidence_level=conf,
-    )
+    # Plusieurs niveaux de PD de modèle (p_hat)
+    # Reco: quelques valeurs couvrant PD faible -> moyenne
+    p_hats = [0.005, 0.01, 0.02]
+
+    # Drift relatif: delta = k * p_hat (ici: fin à 2x p_hat)
+    k_delta = 1.0
+
+    rng = np.random.default_rng(123)
+
+    dfs = []
+    for p_hat in p_hats:
+        delta = k_delta * p_hat
+
+        df_hat = monte_carlo_temporal_drift(
+            T=T,
+            T0=T0,
+            n=n,
+            p_hat=p_hat,
+            delta=delta,
+            n_sim=n_sim,
+            confidence_level=conf,
+            rng=rng,
+        )
+        dfs.append(df_hat)
+
+    df = pd.concat(dfs, ignore_index=True)
 
     out_path = data_dir / "temporal_drift_results.csv"
     df.to_csv(out_path, index=False)
     print(f"Résultats sauvegardés dans {out_path}")
 
-    # Petit résumé console : moyenne des taux de rejet avant/après drift par méthode
+    # Petit résumé console : moyenne des taux de rejet avant/après drift par méthode et p_hat
     summary = (
-        df.groupby(["method", "phase"])["reject_rate"]
+        df.groupby(["p_hat", "method", "phase"])["reject_rate"]
         .mean()
         .reset_index()
-        .pivot(index="method", columns="phase", values="reject_rate")
+        .pivot(index=["p_hat", "method"], columns="phase", values="reject_rate")
     )
-    print("\nTaux de rejet moyen de H0: p = p_hat (par méthode, avant/après drift) :")
+    print("\nTaux de rejet moyen de H0: p = p_hat (par méthode, avant/après drift, par p_hat) :")
     print(summary)

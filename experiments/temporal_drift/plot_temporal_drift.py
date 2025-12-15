@@ -1,140 +1,203 @@
 # experiments/temporal_drift/plot_temporal_drift.py
 
 from pathlib import Path
-
 import pandas as pd
-import matplotlib.pyplot as plt
+
+from experiments.plots.style import (
+    new_figure,
+    finalize_ax,
+    save_figure,
+    METHOD_STYLES,
+)
 
 
-def plot_reject_rate_vs_time(df, save_dir=None, prefix="temporal_drift"):
+def _fmt_p_hat(p_hat: float) -> str:
     """
-    Taux de rejet de H0 : p = p_hat en fonction du temps, une courbe par méthode.
-    On sépare visuellement avant / après le début du drift.
+    Format court et safe pour les noms de fichiers.
+    Ex: 0.01 -> "0p01"
     """
-    T0 = df["T0"].iloc[0]
-    T = df["T"].iloc[0]
+    s = f"{p_hat:.6g}"
+    return s.replace(".", "p")
 
-    plt.figure(figsize=(18, 9))
 
-    for method in sorted(df["method"].unique()):
-        sub = df[df["method"] == method].sort_values("t")
-        plt.plot(
-            sub["t"],
-            sub["reject_rate"],
-            marker="o",
-            label=method,
+def plot_reject_rate_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
+    """
+    Taux de rejet de H0 : p = p_hat en fonction du temps.
+    Si plusieurs p_hat sont présents, produit un plot par p_hat.
+    """
+    if "p_hat" in df.columns:
+        p_hats = sorted(df["p_hat"].unique())
+    else:
+        p_hats = [None]
+
+    for p_hat in p_hats:
+        sub_df = df if p_hat is None else df[df["p_hat"] == p_hat]
+
+        T0 = int(sub_df["T0"].iloc[0])
+        T = int(sub_df["T"].iloc[0])
+        alpha_nominal = float(sub_df["alpha_nominal"].iloc[0])
+
+        fig, ax = new_figure()
+
+        for method in sorted(sub_df["method"].unique()):
+            sub = sub_df[sub_df["method"] == method].sort_values("t")
+            style = METHOD_STYLES.get(method, {})
+            label = style.get("label", method)
+            color = style.get("color", None)
+
+            ax.plot(
+                sub["t"],
+                sub["reject_rate"],
+                label=label,
+                color=color,
+                linewidth=1.5,
+            )
+
+        ax.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
+        ax.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
+
+        title = "Temporal evolution of rejection rates under drift"
+        if p_hat is not None:
+            title += f" (p_hat={p_hat:g})"
+
+        finalize_ax(
+            ax,
+            xlabel="Time period t",
+            ylabel=r"Rejection rate of $H_0: p = \hat p$",
+            title=title,
+            nominal_level=alpha_nominal,
+            nominal_label=f"Nominal level (α = {alpha_nominal:.2f})",
         )
 
-    # Ligne verticale : début du drift
-    plt.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
+        if save_dir is not None:
+            suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
+            out_path = save_dir / f"{prefix}_reject_rate_vs_time{suffix}.png"
+            save_figure(fig, out_path)
+        else:
+            import matplotlib.pyplot as plt
+            plt.show()
+            plt.close(fig)
 
-    # (optionnel) bande verticale pour la phase post-drift
-    plt.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
 
-    alpha_nominal = df["alpha_nominal"].iloc[0]
-    plt.axhline(
-        y=alpha_nominal,
-        color="black",
-        linestyle=":",
-        label=f"Nominal level (α = {alpha_nominal:.2f})",
-    )
-
-    plt.xlabel("Time period t")
-    plt.ylabel(r"Rejection rate of $H_0: p = \hat p$")
-    plt.title("Temporal evolution of rejection rates under drift")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-
-    if save_dir is not None:
-        out_path = save_dir / f"{prefix}_reject_rate_vs_time.png"
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"Saved {out_path}")
+def plot_coverage_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
+    """
+    Couverture empirique de p_true(t) en fonction du temps.
+    Si plusieurs p_hat sont présents, produit un plot par p_hat.
+    """
+    if "p_hat" in df.columns:
+        p_hats = sorted(df["p_hat"].unique())
     else:
-        plt.show()
+        p_hats = [None]
 
-    plt.close()
+    for p_hat in p_hats:
+        sub_df = df if p_hat is None else df[df["p_hat"] == p_hat]
 
+        T0 = int(sub_df["T0"].iloc[0])
+        T = int(sub_df["T"].iloc[0])
+        conf = float(sub_df["conf_level"].iloc[0])
 
-def plot_coverage_vs_time(df, save_dir=None, prefix="temporal_drift"):
-    """
-    Couverture empirique de p_true(t) en fonction du temps, une courbe par méthode.
-    """
-    T0 = df["T0"].iloc[0]
-    T = df["T"].iloc[0]
-    conf = df["conf_level"].iloc[0]
+        fig, ax = new_figure()
 
-    plt.figure(figsize=(18, 9))
+        for method in sorted(sub_df["method"].unique()):
+            sub = sub_df[sub_df["method"] == method].sort_values("t")
+            style = METHOD_STYLES.get(method, {})
+            label = style.get("label", method)
+            color = style.get("color", None)
 
-    for method in sorted(df["method"].unique()):
-        sub = df[df["method"] == method].sort_values("t")
-        plt.plot(
-            sub["t"],
-            sub["coverage"],
-            marker="o",
-            label=method,
+            ax.plot(
+                sub["t"],
+                sub["coverage"],
+                label=label,
+                color=color,
+                linewidth=1.5,
+            )
+
+        ax.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
+        ax.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
+
+        title = "Temporal evolution of coverage under drift"
+        if p_hat is not None:
+            title += f" (p_hat={p_hat:g})"
+
+        finalize_ax(
+            ax,
+            xlabel="Time period t",
+            ylabel=r"Coverage of $p(t)$",
+            title=title,
+            nominal_level=conf,
+            nominal_label=f"Nominal coverage ({conf:.2f})",
         )
 
-    plt.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
-    plt.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
+        if save_dir is not None:
+            suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
+            out_path = save_dir / f"{prefix}_coverage_vs_time{suffix}.png"
+            save_figure(fig, out_path)
+        else:
+            import matplotlib.pyplot as plt
+            plt.show()
+            plt.close(fig)
 
-    plt.axhline(
-        y=conf,
-        color="black",
-        linestyle=":",
-        label=f"Nominal coverage ({conf:.2f})",
-    )
 
-    plt.xlabel("Time period t")
-    plt.ylabel(r"Coverage of $p(t)$")
-    plt.title("Temporal evolution of coverage under drift")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
+def plot_length_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
+    """
+    Longueur moyenne des intervalles en fonction du temps.
+    Si plusieurs p_hat sont présents, produit un plot par p_hat.
 
-    if save_dir is not None:
-        out_path = save_dir / f"{prefix}_coverage_vs_time.png"
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"Saved {out_path}")
+    Remarque: on utilise 'avg_length' pour compat, mais si tu veux
+    passer à 'len_mean', ça marche aussi.
+    """
+    if "p_hat" in df.columns:
+        p_hats = sorted(df["p_hat"].unique())
     else:
-        plt.show()
+        p_hats = [None]
 
-    plt.close()
+    length_col = "avg_length" if "avg_length" in df.columns else "len_mean"
 
+    for p_hat in p_hats:
+        sub_df = df if p_hat is None else df[df["p_hat"] == p_hat]
 
-def plot_length_vs_time(df, save_dir=None, prefix="temporal_drift"):
-    """
-    Longueur moyenne des intervalles en fonction du temps, une courbe par méthode.
-    """
-    T0 = df["T0"].iloc[0]
-    T = df["T"].iloc[0]
+        T0 = int(sub_df["T0"].iloc[0])
+        T = int(sub_df["T"].iloc[0])
 
-    plt.figure(figsize=(18, 9))
+        fig, ax = new_figure()
 
-    for method in sorted(df["method"].unique()):
-        sub = df[df["method"] == method].sort_values("t")
-        plt.plot(
-            sub["t"],
-            sub["avg_length"],
-            marker="o",
-            label=method,
+        for method in sorted(sub_df["method"].unique()):
+            sub = sub_df[sub_df["method"] == method].sort_values("t")
+            style = METHOD_STYLES.get(method, {})
+            label = style.get("label", method)
+            color = style.get("color", None)
+
+            ax.plot(
+                sub["t"],
+                sub[length_col],
+                label=label,
+                color=color,
+                linewidth=1.5,
+            )
+
+        ax.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
+        ax.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
+
+        title = "Temporal evolution of interval lengths under drift"
+        if p_hat is not None:
+            title += f" (p_hat={p_hat:g})"
+
+        finalize_ax(
+            ax,
+            xlabel="Time period t",
+            ylabel="Average interval length",
+            title=title,
+            nominal_level=None,
         )
 
-    plt.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
-    plt.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
-
-    plt.xlabel("Time period t")
-    plt.ylabel("Average interval length")
-    plt.title("Temporal evolution of interval lengths under drift")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-
-    if save_dir is not None:
-        out_path = save_dir / f"{prefix}_length_vs_time.png"
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"Saved {out_path}")
-    else:
-        plt.show()
-
-    plt.close()
+        if save_dir is not None:
+            suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
+            out_path = save_dir / f"{prefix}_length_vs_time{suffix}.png"
+            save_figure(fig, out_path)
+        else:
+            import matplotlib.pyplot as plt
+            plt.show()
+            plt.close(fig)
 
 
 if __name__ == "__main__":
