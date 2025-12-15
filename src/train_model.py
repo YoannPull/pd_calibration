@@ -13,29 +13,40 @@ Principes :
 - PD calibrée via isotonic regression.
 - Master Scale (10 buckets) monotone.
 - Sauvegarde train_scored / validation_scored avec vintage & loan_sequence_number
-  dans data/processed/scored (et plus dans artifacts).
+  dans data/processed/scored.
 
-Option PD TTC :
-- --ttc-mode train      : PD TTC par grade = PD observée sur TRAIN uniquement
-- --ttc-mode train_val  : PD TTC par grade = PD observée sur TRAIN + VALIDATION
+NOUVEAU (grille + TTC windowées) :
+- Si --risk-buckets-in n'est PAS fourni :
+  - la grille (edges) est construite sur une fenêtre glissante (par défaut 10 ans)
+    terminant au dernier trimestre (vintage) présent dans VALIDATION.
+  - les PD TTC par grade (bucket_stats['train'] / 'train_val_longrun_window') sont aussi
+    calculées sur la même fenêtre glissante.
+
+Option PD TTC (dans bucket_stats.json) :
+- --ttc-mode train      : PD TTC par grade = PD observée sur TRAIN (window)
+- --ttc-mode train_val  : PD TTC par grade = PD observée sur TRAIN+VALIDATION (window)
 """
 
 from __future__ import annotations
+
 import argparse
-import json
-from pathlib import Path
 import contextlib
+import json
 import time
-from typing import Dict, Any, List
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
+import statsmodels.api as sm
 from joblib import dump
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.frozen import FrozenEstimator
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +58,7 @@ def load_any(path: str) -> pd.DataFrame:
     if p.suffix in (".parquet", ".pq"):
         return pd.read_parquet(p)
     return pd.read_csv(p)
+
 
 def save_json(obj: dict, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,11 +83,66 @@ class Timer:
 
 
 # ---------------------------------------------------------------------------
+# Time helpers (vintage window)
+# ---------------------------------------------------------------------------
+
+
+
+def parse_vintage_to_period(s: pd.Series, freq: str = "Q") -> pd.PeriodIndex:
+    """
+    Convertit une colonne vintage en PeriodIndex (Q ou M).
+    Supporte :
+      - '2015Q1' ou '2015-Q1'
+      - dates parseables (ex '2015-03-31') -> conversion en trimestre/mois
+      - Period déjà présent
+    """
+    freq = freq.upper()
+
+    if isinstance(s.dtype, pd.PeriodDtype):
+        return s.astype(f"period[{freq}]").array
+
+    s_str = s.astype(str)
+
+    # formats type 'YYYYQn' ou 'YYYY-Qn'
+    m = s_str.str.match(r"^\d{4}[- ]?Q[1-4]$")
+    if m.all() and freq.startswith("Q"):
+        cleaned = s_str.str.replace(" ", "", regex=False).str.replace("-", "", regex=False)
+        return pd.PeriodIndex(cleaned, freq="Q")
+
+    # fallback: parse date
+    dt = pd.to_datetime(s_str, errors="coerce")
+    if dt.notna().mean() < 0.95:
+        bad = s_str[dt.isna()].head(5).tolist()
+        raise ValueError(f"Impossible de parser vintage. Exemples non parseables: {bad}")
+
+    return dt.dt.to_period(freq)
+
+
+def window_mask_from_end(vintage_series: pd.Series, end: pd.Period, years: int, freq: str = "Q") -> np.ndarray:
+    freq = freq.upper()
+    per = parse_vintage_to_period(vintage_series, freq=freq)
+
+    if freq.startswith("Q"):
+        n = years * 4
+    elif freq.startswith("M"):
+        n = years * 12
+    else:
+        raise ValueError("freq doit être 'Q' ou 'M'.")
+
+    start = end - (n - 1)
+
+    mask = (per >= start) & (per <= end)
+    return np.asarray(mask)   # <-- au lieu de .to_numpy()
+
+
+
+# ---------------------------------------------------------------------------
 # WOE utilities
 # ---------------------------------------------------------------------------
 
 def raw_name_from_bin(col: str, tag: str) -> str:
     return col.replace(tag, "") if tag in col else col
+
 
 def build_woe_maps(
     df: pd.DataFrame,
@@ -107,6 +174,7 @@ def build_woe_maps(
             "default": global_woe,
         }
     return maps
+
 
 def apply_woe(df: pd.DataFrame, woe_maps: Dict[str, Any], bin_suffix: str) -> pd.DataFrame:
     cols = []
@@ -186,7 +254,7 @@ def create_risk_buckets(scores, y, n_buckets=10, fixed_edges=None):
         edges[0] = -np.inf
         edges[-1] = np.inf
     else:
-        edges = np.array(fixed_edges)
+        edges = np.array(fixed_edges, dtype=float)
         edges[0] = -np.inf
         edges[-1] = np.inf
 
@@ -206,11 +274,9 @@ def create_risk_buckets(scores, y, n_buckets=10, fixed_edges=None):
     ).reset_index()
 
     stats["pd"] = stats["bad"] / stats["count"]
-
-    # On s'assure que les buckets sont triés
     stats = stats.sort_values("bucket")
 
-    # Maintenant la PD doit être CROISSANTE avec le numéro de bucket
+    # La PD doit être CROISSANTE avec le numéro de bucket
     mono = bool(np.all(np.diff(stats["pd"].values) >= 0))
 
     return edges.tolist(), stats, mono
@@ -233,7 +299,6 @@ def train_pipeline(
     calibration_method: str,
     timer: Timer,
 ):
-
     # -------------------------------------------------
     # Meta (pour analyse future, pas features)
     # -------------------------------------------------
@@ -303,8 +368,24 @@ def train_pipeline(
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
         gs = GridSearchCV(lr, grid, cv=cv, scoring="neg_log_loss", n_jobs=-1)
         gs.fit(X_model_kept, y_model.values)
-
         best_lr = gs.best_estimator_
+
+    # -------------------------------------------------
+    # Coefficients + erreurs standard + z + p-value (statsmodels)
+    # -------------------------------------------------
+    with timer.section("Coefficient statistics (statsmodels)"):
+        X_sm = sm.add_constant(X_model_kept, has_constant="add")
+        logit_sm = sm.Logit(y_model.values, X_sm)
+        res_sm = logit_sm.fit(disp=False)
+
+        feature_names = ["Intercept"] + kept_features
+        coef_table = pd.DataFrame({
+            "feature": feature_names,
+            "coef": res_sm.params,
+            "std_err": res_sm.bse,
+            "z": res_sm.tvalues,
+            "p_value": res_sm.pvalues,
+        })
 
     # -------------------------------------------------
     # Score TTC (log-odds sur TOUT le train + TOUTE la validation)
@@ -321,21 +402,18 @@ def train_pipeline(
     # -------------------------------------------------
     with timer.section("Calibration"):
         if calibration_method != "none":
-            calibrator = CalibratedClassifierCV(best_lr, method=calibration_method, cv="prefit")
+            calibrator = CalibratedClassifierCV(FrozenEstimator(best_lr), method=calibration_method)
             calibrator.fit(X_cal_kept, y_cal.values)
             model_pd = calibrator
         else:
             model_pd = best_lr
 
-        # PD pour les jeux utilisés pour les métriques
         pd_tr_model = model_pd.predict_proba(X_model_kept)[:, 1]
         pd_va_full = model_pd.predict_proba(Xva_full_kept)[:, 1]
-
-        # PD sur TOUT le train (pour train_scored)
         pd_tr_full = model_pd.predict_proba(Xtr_full_kept)[:, 1]
 
     # -------------------------------------------------
-    # Metrics (sur subset modèle pour le train, full pour la val)
+    # Metrics
     # -------------------------------------------------
     metrics = {
         "train_auc": float(roc_auc_score(y_model, pd_tr_model)),
@@ -353,14 +431,15 @@ def train_pipeline(
         "woe_maps": woe_maps,
         "kept_features": kept_features,
         "metrics": metrics,
-        "score_tr": score_tr_full,      # score TTC full train
-        "score_va": score_va_full,      # score TTC full val
-        "pd_tr": pd_tr_full,            # PD full train
-        "pd_va": pd_va_full,            # PD full val
+        "score_tr": score_tr_full,
+        "score_va": score_va_full,
+        "pd_tr": pd_tr_full,
+        "pd_va": pd_va_full,
         "y_tr": ytr_full.values,
         "y_va": yva_full.values,
         "meta_tr": meta_tr,
         "meta_va": meta_va,
+        "coef_table": coef_table,
     }
 
 
@@ -391,8 +470,19 @@ def parse_args():
         choices=["train", "train_val"],
         default="train",
         help="Source pour la PD TTC par grade dans bucket_stats.json : "
-             "'train' = train uniquement (par défaut), 'train_val' = train + validation (long run).",
+             "'train' = train uniquement (window), 'train_val' = train + validation (window).",
     )
+
+    # --- NOUVEAU : fenêtre de grille/TTC ancrée sur dernier vintage de validation ---
+    p.add_argument("--grid-window-years", type=int, default=10,
+                   help="Fenêtre (années) pour construire la grille (edges), ancrée sur le dernier vintage de validation.")
+    p.add_argument("--grid-time-col", default="vintage",
+                   help="Colonne temporelle utilisée pour la fenêtre (ex: vintage).")
+    p.add_argument("--grid-time-freq", default="Q", choices=["Q", "M"],
+                   help="Fréquence de la colonne temporelle (Q ou M).")
+    p.add_argument("--ttc-window-years", type=int, default=10,
+                   help="Fenêtre (années) pour calculer les PD TTC par grade (bucket_stats), ancrée sur le dernier vintage de validation.")
+
     return p.parse_args()
 
 
@@ -415,18 +505,50 @@ def main():
         args.cv_folds, args.calibration, timer
     )
 
-    # MASTER SCALE (buckets sur scores TTC full train / full val)
+    # Sauvegarde des stats de coefficients
+    coef_path = artifacts / "coefficients_stats.csv"
+    out["coef_table"].to_csv(coef_path, index=False)
+    print(f"✔ coefficients + erreurs standard + z + p-value sauvegardés : {coef_path}")
+
+    # ------------------------------------------------------------------
+    # MASTER SCALE (edges)
+    # - si --risk-buckets-in fourni : on fige les edges
+    # - sinon : edges appris sur fenêtre 10 ans finissant au dernier vintage de validation
+    # ------------------------------------------------------------------
     fixed_edges = None
     if args.risk_buckets_in and Path(args.risk_buckets_in).exists():
-        fixed_edges = json.loads(Path(args.risk_buckets_in).read_text())["edges"]
+        fixed_edges = json.loads(Path(args.risk_buckets_in).read_text(encoding="utf-8"))["edges"]
 
-    edges, stats_tr, mono_tr = create_risk_buckets(
-        out["score_tr"], out["y_tr"], args.n_buckets, fixed_edges
-    )
+    time_col = args.grid_time_col
+    freq = args.grid_time_freq
 
-    _, stats_va, mono_va = create_risk_buckets(
-        out["score_va"], out["y_va"], args.n_buckets, edges
-    )
+    if fixed_edges is None:
+        if time_col not in out["meta_va"].columns or time_col not in out["meta_tr"].columns:
+            raise ValueError(f"Colonne '{time_col}' absente des meta; impossible de windower la grille.")
+
+        va_periods = parse_vintage_to_period(out["meta_va"][time_col], freq=freq)
+        end_period = va_periods.max()
+
+        mask_tr_grid = window_mask_from_end(out["meta_tr"][time_col], end_period, args.grid_window_years, freq=freq)
+        mask_va_grid = window_mask_from_end(out["meta_va"][time_col], end_period, args.grid_window_years, freq=freq)
+
+        scores_grid = np.concatenate([out["score_tr"][mask_tr_grid], out["score_va"][mask_va_grid]])
+        y_grid = np.concatenate([out["y_tr"][mask_tr_grid], out["y_va"][mask_va_grid]])
+
+        if len(y_grid) == 0:
+            raise ValueError("Fenêtre de grille vide. Vérifie vintage/freq et les bornes.")
+
+        edges, stats_grid, mono_grid = create_risk_buckets(
+            scores_grid, y_grid, args.n_buckets, fixed_edges=None
+        )
+        print(f"\n[GRILLE] window={args.grid_window_years}y | end={end_period} | monotone(grid)={'OK' if mono_grid else 'NON'}")
+    else:
+        edges = fixed_edges
+        print("\n[GRILLE] edges fournis via --risk-buckets-in (grille figée)")
+
+    # Stats TRAIN/VAL (full) avec ces edges
+    _, stats_tr_full, mono_tr = create_risk_buckets(out["score_tr"], out["y_tr"], args.n_buckets, edges)
+    _, stats_va_full, mono_va = create_risk_buckets(out["score_va"], out["y_va"], args.n_buckets, edges)
 
     print("\n[MÉTRIQUES]")
     for k, v in out["metrics"].items():
@@ -436,63 +558,84 @@ def main():
     print("[MONOTONICITÉ VAL]   :", "OK" if mono_va else "NON MONOTONE")
 
     # ------------------------------------------------------------------
-    # Construction d'une PD TTC "long run" train + validation (optionnel)
+    # PD TTC (bucket_stats) : fenêtre 10 ans finissant au dernier vintage de validation
     # ------------------------------------------------------------------
-    # stats_tr / stats_va ont : bucket, count, bad, min_score, max_score, pd
-    stats_tr_base = stats_tr.copy()
-    stats_va_base = stats_va.copy()
+    if time_col not in out["meta_va"].columns or time_col not in out["meta_tr"].columns:
+        raise ValueError(f"Colonne '{time_col}' absente; impossible de calculer TTC window.")
 
-    stats_longrun = stats_tr_base[["bucket", "count", "bad", "min_score", "max_score"]].merge(
-        stats_va_base[["bucket", "count", "bad", "min_score", "max_score"]],
+    va_periods = parse_vintage_to_period(out["meta_va"][time_col], freq=freq)
+    end_period = va_periods.max()
+
+    mask_tr_ttc = window_mask_from_end(out["meta_tr"][time_col], end_period, args.ttc_window_years, freq=freq)
+    mask_va_ttc = window_mask_from_end(out["meta_va"][time_col], end_period, args.ttc_window_years, freq=freq)
+
+    _, stats_tr_win, _ = create_risk_buckets(out["score_tr"][mask_tr_ttc], out["y_tr"][mask_tr_ttc], args.n_buckets, edges)
+    _, stats_va_win, _ = create_risk_buckets(out["score_va"][mask_va_ttc], out["y_va"][mask_va_ttc], args.n_buckets, edges)
+
+    # Long-run window (train + validation)
+    stats_longrun_win = stats_tr_win[["bucket", "count", "bad", "min_score", "max_score"]].merge(
+        stats_va_win[["bucket", "count", "bad", "min_score", "max_score"]],
         on="bucket",
         how="outer",
         suffixes=("_tr", "_va")
     )
 
-    # Remplir les NaN pour les compteurs
     for col in ["count_tr", "count_va", "bad_tr", "bad_va"]:
-        stats_longrun[col] = stats_longrun[col].fillna(0)
+        stats_longrun_win[col] = stats_longrun_win[col].fillna(0)
 
-    stats_longrun["count"] = stats_longrun["count_tr"] + stats_longrun["count_va"]
-    stats_longrun["bad"] = stats_longrun["bad_tr"] + stats_longrun["bad_va"]
-    stats_longrun["min_score"] = stats_longrun[["min_score_tr", "min_score_va"]].min(axis=1)
-    stats_longrun["max_score"] = stats_longrun[["max_score_tr", "max_score_va"]].max(axis=1)
-    stats_longrun["pd"] = stats_longrun["bad"] / stats_longrun["count"]
-    stats_longrun = stats_longrun[["bucket", "count", "bad", "min_score", "max_score", "pd"]].sort_values("bucket")
+    stats_longrun_win["count"] = stats_longrun_win["count_tr"] + stats_longrun_win["count_va"]
+    stats_longrun_win["bad"] = stats_longrun_win["bad_tr"] + stats_longrun_win["bad_va"]
+    stats_longrun_win["min_score"] = stats_longrun_win[["min_score_tr", "min_score_va"]].min(axis=1)
+    stats_longrun_win["max_score"] = stats_longrun_win[["max_score_tr", "max_score_va"]].max(axis=1)
+    stats_longrun_win["pd"] = stats_longrun_win["bad"] / stats_longrun_win["count"]
+    stats_longrun_win = stats_longrun_win[["bucket", "count", "bad", "min_score", "max_score", "pd"]].sort_values("bucket")
 
-    # ------------------------------------------------------------------
-    # Choix de la PD TTC utilisée dans la clé 'train' de bucket_stats.json
-    # ------------------------------------------------------------------
+    # Choix de la PD TTC utilisée dans 'train' (sur la fenêtre !)
     if args.ttc_mode == "train":
-        stats_train_for_json = stats_tr_base
-    else:  # "train_val"
-        stats_train_for_json = stats_longrun
+        stats_train_for_json = stats_tr_win
+    else:
+        stats_train_for_json = stats_longrun_win
 
-    # Sauvegarde du modèle + artefacts grille (toujours dans artifacts)
+    # ------------------------------------------------------------------
+    # Sauvegarde modèle + artefacts
+    # ------------------------------------------------------------------
     dump({
         "model_pd": out["model_pd"],
         "best_lr": out["best_lr"],
         "woe_maps": out["woe_maps"],
         "kept_features": out["kept_features"],
         "calibration": args.calibration,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
     }, artifacts / "model_best.joblib")
 
     save_json({"edges": edges}, artifacts / "risk_buckets.json")
 
-    # bucket_stats.json contient :
-    # - 'train'           : PD TTC utilisée (train ou long-run selon ttc_mode)
-    # - 'train_raw'       : stats train seules
-    # - 'train_val_longrun' : stats train+validation
-    # - 'validation'      : stats validation
-    # - 'metrics'         : métriques de perf du modèle
-    # - 'ttc_mode'        : mode utilisé
     bucket_stats_payload = {
+        # PD TTC "officielle" (window, train ou train_val selon ttc_mode)
         "train": stats_train_for_json.to_dict(orient="records"),
-        "train_raw": stats_tr_base.to_dict(orient="records"),
-        "train_val_longrun": stats_longrun.to_dict(orient="records"),
-        "validation": stats_va_base.to_dict(orient="records"),
+
+        # Debug / transparence
+        "train_raw_full": stats_tr_full.to_dict(orient="records"),
+        "validation_full": stats_va_full.to_dict(orient="records"),
+        "train_window": stats_tr_win.to_dict(orient="records"),
+        "validation_window": stats_va_win.to_dict(orient="records"),
+        "train_val_longrun_window": stats_longrun_win.to_dict(orient="records"),
+
         "metrics": out["metrics"],
         "ttc_mode": args.ttc_mode,
+
+        "grid_window": {
+            "time_col": time_col,
+            "freq": freq,
+            "end": str(end_period),
+            "years": args.grid_window_years,
+        },
+        "ttc_window": {
+            "time_col": time_col,
+            "freq": freq,
+            "end": str(end_period),
+            "years": args.ttc_window_years,
+        },
     }
     save_json(bucket_stats_payload, artifacts / "bucket_stats.json")
 
@@ -500,8 +643,8 @@ def main():
     # train_scored / validation_scored -> data/processed/scored
     # ------------------------------------------------------------------
     # Grades : 1 = moins risqué, n = plus risqué
-    raw_grade_tr = np.digitize(out["score_tr"], edges[1:], right=True) + 1
-    raw_grade_va = np.digitize(out["score_va"], edges[1:], right=True) + 1
+    raw_grade_tr = np.digitize(out["score_tr"], np.array(edges)[1:], right=True) + 1
+    raw_grade_va = np.digitize(out["score_va"], np.array(edges)[1:], right=True) + 1
 
     grade_tr = args.n_buckets + 1 - raw_grade_tr
     grade_va = args.n_buckets + 1 - raw_grade_va
@@ -511,7 +654,7 @@ def main():
     train_scored[args.target] = out["y_tr"]
     train_scored["score_ttc"] = out["score_tr"]
     train_scored["pd"] = out["pd_tr"]
-    train_scored["grade"] = grade_tr
+    train_scored["grade"] = grade_tr.astype(int)
 
     train_scored_path = scored_dir / "train_scored.parquet"
     train_scored.to_parquet(train_scored_path, index=False)
@@ -522,13 +665,14 @@ def main():
     validation_scored[args.target] = out["y_va"]
     validation_scored["score_ttc"] = out["score_va"]
     validation_scored["pd"] = out["pd_va"]
-    validation_scored["grade"] = grade_va
+    validation_scored["grade"] = grade_va.astype(int)
 
     validation_scored_path = scored_dir / "validation_scored.parquet"
     validation_scored.to_parquet(validation_scored_path, index=False)
     print(f"✔ validation_scored sauvegardé : {validation_scored_path}")
 
     print(f"\nMode PD TTC utilisé pour 'train' dans bucket_stats.json : {args.ttc_mode}")
+    print(f"Fenêtre grille: {args.grid_window_years}y fin={end_period} | Fenêtre TTC: {args.ttc_window_years}y fin={end_period}")
 
 
 if __name__ == "__main__":
