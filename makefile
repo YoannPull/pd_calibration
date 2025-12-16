@@ -152,6 +152,29 @@ binning_fit:
 # ----------------------------------------------------------------------------
 # 4.4) MODEL TRAINING (Master Scale + SCORING TRAIN/VAL)
 # ----------------------------------------------------------------------------
+# Tu peux surcharger ces paramètres à l'appel:
+#   make model_train C_NUM=80 C_MIN_EXP=-8 C_MAX_EXP=4 SEARCH=halving GRID_YEARS=10 TTC_YEARS=10 COEF_STATS=none
+#
+SEARCH        ?= halving     # grid | halving
+C_MIN_EXP     ?= -8
+C_MAX_EXP     ?= 4
+C_NUM         ?= 60
+HALVING_FACTOR?= 3
+LR_SOLVER     ?= lbfgs       # lbfgs | saga | newton-cg
+LR_MAX_ITER   ?= 3000
+COEF_STATS    ?= none # statsmodels | none
+
+GRID_YEARS    ?= 10
+TTC_YEARS     ?= 10
+GRID_TIME_COL ?= vintage
+GRID_TIME_FREQ?= Q           # Q | M
+
+N_BUCKETS     ?= 10
+# optionnel : choisir automatiquement n_buckets (ex: 7,10,12,15)
+# N_BUCKETS_CANDIDATES ?= 7,10,12,15
+MIN_BUCKET_COUNT ?= 300
+MIN_BUCKET_BAD   ?= 5
+
 .PHONY: model_train
 model_train:
 	@echo "\n[4/6] ENTRAÎNEMENT DU MODÈLE & CRÉATION GRILLE + SCORING TRAIN/VAL..."
@@ -163,7 +186,19 @@ model_train:
 		--cv-folds 5 \
 		--corr-threshold 0.85 \
 		--calibration isotonic \
-		--n-buckets 10 \
+		--search $(SEARCH) \
+		--c-min-exp $(C_MIN_EXP) \
+		--c-max-exp $(C_MAX_EXP) \
+		--c-num $(C_NUM) \
+		--halving-factor $(HALVING_FACTOR) \
+		--lr-solver $(LR_SOLVER) \
+		--lr-max-iter $(LR_MAX_ITER) \
+		--coef-stats $(COEF_STATS) \
+		--n-buckets $(N_BUCKETS) \
+		--grid-window-years $(GRID_YEARS) \
+		--grid-time-col $(GRID_TIME_COL) \
+		--grid-time-freq $(GRID_TIME_FREQ) \
+		--ttc-window-years $(TTC_YEARS) \
 		--scored-outdir $(SCORED_OUT_DIR) \
 		--ttc-mode train
 
