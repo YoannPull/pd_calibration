@@ -150,34 +150,95 @@ binning_fit:
 		--n-quantiles-num 50
 
 # ----------------------------------------------------------------------------
-# 4.4) MODEL TRAINING (Master Scale + SCORING TRAIN/VAL)
+# 4.4) MODEL TRAINING (Master Scale + SCORING TRAIN/VAL) — FINAL RECOMMENDED
 # ----------------------------------------------------------------------------
-# Tu peux surcharger ces paramètres à l'appel:
-#   make model_train C_NUM=80 C_MIN_EXP=-8 C_MAX_EXP=4 SEARCH=halving GRID_YEARS=10 TTC_YEARS=10 COEF_STATS=none
+# Usage (itération rapide):
+#   make model_train_iter
 #
-SEARCH        ?= halving     # grid | halving
-C_MIN_EXP     ?= -8
-C_MAX_EXP     ?= 4
-C_NUM         ?= 60
-HALVING_FACTOR?= 3
-LR_SOLVER     ?= lbfgs       # lbfgs | saga | newton-cg
-LR_MAX_ITER   ?= 3000
-COEF_STATS    ?= none # statsmodels | none
+# Usage (modèle final reproductible):
+#   make model_train_final
+#
+# Tu peux surcharger à l'appel, ex:
+#   make model_train_iter CALIBRATION=sigmoid CAL_SIZE=0.25 NO_INTERACTIONS=1
+#   make model_train_final N_BUCKETS_CANDIDATES="7,8,9,10" MIN_BUCKET_BAD=10
+#
 
-GRID_YEARS    ?= 10
-TTC_YEARS     ?= 10
-GRID_TIME_COL ?= vintage
-GRID_TIME_FREQ?= Q           # Q | M
+# ----------------------------
+# Search space (LARGE)
+# ----------------------------
+SEARCH          ?= halving      # halving | grid
+C_MIN_EXP       ?= -12
+C_MAX_EXP       ?= 6
+C_NUM           ?= 120
+HALVING_FACTOR  ?= 3
+SEARCH_VERBOSE  ?= 0
 
-N_BUCKETS     ?= 10
-# optionnel : choisir automatiquement n_buckets (ex: 7,10,12,15)
-# N_BUCKETS_CANDIDATES ?= 7,10,12,15
+LR_SOLVER       ?= lbfgs        # lbfgs | saga | newton-cg
+LR_MAX_ITER     ?= 4000
+COEF_STATS      ?= none         # statsmodels | none
+
+# ----------------------------
+# Time-aware CV / calibration
+# ----------------------------
+CV_SCHEME       ?= time         # time | stratified
+CAL_SPLIT       ?= time_last    # time_last | stratified
+CAL_SIZE        ?= 0.40         # recommandé: 0.20–0.30 (éviter 0.50)
+CV_TIME_COL     ?= vintage
+CV_TIME_FREQ    ?= Q            # Q | M
+
+CALIBRATION     ?= isotonic      # none | sigmoid | isotonic (sigmoid en baseline robuste)
+
+# ----------------------------
+# Windows for grid/TTC
+# ----------------------------
+GRID_YEARS      ?= 12
+TTC_YEARS       ?= 12
+GRID_TIME_COL   ?= vintage
+GRID_TIME_FREQ  ?= Q            # Q | M
+
+# ----------------------------
+# Master scale (buckets)
+# ----------------------------
+N_BUCKETS       ?= 10
+# Optionnel: activer la sélection auto sous contraintes (recommandé si tests OOS instables)
+N_BUCKETS_CANDIDATES ?=
 MIN_BUCKET_COUNT ?= 300
 MIN_BUCKET_BAD   ?= 5
 
-.PHONY: model_train
-model_train:
-	@echo "\n[4/6] ENTRAÎNEMENT DU MODÈLE & CRÉATION GRILLE + SCORING TRAIN/VAL..."
+# ----------------------------
+# Switches (0/1)
+# ----------------------------
+NO_INTERACTIONS ?= 0
+TIMING          ?= 1
+
+ifeq ($(NO_INTERACTIONS),1)
+  NO_INTERACTIONS_FLAG := --no-interactions
+else
+  NO_INTERACTIONS_FLAG :=
+endif
+
+ifeq ($(TIMING),1)
+  TIMING_FLAG := --timing
+else
+  TIMING_FLAG :=
+endif
+
+ifneq ($(strip $(N_BUCKETS_CANDIDATES)),)
+  N_BUCKETS_CANDIDATES_FLAG := --n-buckets-candidates "$(N_BUCKETS_CANDIDATES)" \
+                               --min-bucket-count $(MIN_BUCKET_COUNT) \
+                               --min-bucket-bad $(MIN_BUCKET_BAD)
+else
+  N_BUCKETS_CANDIDATES_FLAG :=
+endif
+
+
+# ----------------------------
+# Targets
+# ----------------------------
+
+.PHONY: model_train_iter
+model_train_iter:
+	@echo "\n[4/6] MODEL TRAIN (ITER) — halving, large search space..."
 	$(PY) src/train_model.py \
 		--train $(MODEL_TRAIN_DATA) \
 		--validation $(MODEL_VAL_DATA) \
@@ -185,22 +246,66 @@ model_train:
 		--artifacts $(MODEL_ARTIFACTS_DIR) \
 		--cv-folds 5 \
 		--corr-threshold 0.85 \
-		--calibration isotonic \
-		--search $(SEARCH) \
+		--calibration $(CALIBRATION) \
+		--search halving \
 		--c-min-exp $(C_MIN_EXP) \
 		--c-max-exp $(C_MAX_EXP) \
 		--c-num $(C_NUM) \
 		--halving-factor $(HALVING_FACTOR) \
+		--search-verbose $(SEARCH_VERBOSE) \
 		--lr-solver $(LR_SOLVER) \
 		--lr-max-iter $(LR_MAX_ITER) \
 		--coef-stats $(COEF_STATS) \
+		--cv-scheme $(CV_SCHEME) \
+		--calibration-split $(CAL_SPLIT) \
+		--calibration-size $(CAL_SIZE) \
+		--cv-time-col $(CV_TIME_COL) \
+		--cv-time-freq $(CV_TIME_FREQ) \
 		--n-buckets $(N_BUCKETS) \
+		$(N_BUCKETS_CANDIDATES_FLAG) \
 		--grid-window-years $(GRID_YEARS) \
 		--grid-time-col $(GRID_TIME_COL) \
 		--grid-time-freq $(GRID_TIME_FREQ) \
 		--ttc-window-years $(TTC_YEARS) \
 		--scored-outdir $(SCORED_OUT_DIR) \
-		--ttc-mode train
+		--ttc-mode train \
+		$(NO_INTERACTIONS_FLAG) \
+		$(TIMING_FLAG)
+
+
+.PHONY: model_train_final
+model_train_final:
+	@echo "\n[4/6] MODEL TRAIN (FINAL) — grid, reproductible..."
+	$(PY) src/train_model.py \
+		--train $(MODEL_TRAIN_DATA) \
+		--validation $(MODEL_VAL_DATA) \
+		--target $(IMPUTE_TARGET_COL) \
+		--artifacts $(MODEL_ARTIFACTS_DIR) \
+		--cv-folds 5 \
+		--corr-threshold 0.85 \
+		--calibration $(CALIBRATION) \
+		--search grid \
+		--c-min-exp $(C_MIN_EXP) \
+		--c-max-exp $(C_MAX_EXP) \
+		--c-num $(C_NUM) \
+		--lr-solver $(LR_SOLVER) \
+		--lr-max-iter $(LR_MAX_ITER) \
+		--coef-stats $(COEF_STATS) \
+		--cv-scheme $(CV_SCHEME) \
+		--calibration-split $(CAL_SPLIT) \
+		--calibration-size $(CAL_SIZE) \
+		--cv-time-col $(CV_TIME_COL) \
+		--cv-time-freq $(CV_TIME_FREQ) \
+		--n-buckets $(N_BUCKETS) \
+		$(N_BUCKETS_CANDIDATES_FLAG) \
+		--grid-window-years $(GRID_YEARS) \
+		--grid-time-col $(GRID_TIME_COL) \
+		--grid-time-freq $(GRID_TIME_FREQ) \
+		--ttc-window-years $(TTC_YEARS) \
+		--scored-outdir $(SCORED_OUT_DIR) \
+		--ttc-mode train \
+		$(NO_INTERACTIONS_FLAG) \
+		$(TIMING_FLAG)
 
 # ----------------------------------------------------------------------------
 # 4.5) PD TTC MACRO (grade × temps + macro)

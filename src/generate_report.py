@@ -2,11 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-generate_report.py — DARK MODE PREMIUM + GRADE TTC TABLES
-----------------------------------------------------------
+generate_report.py — DARK MODE PREMIUM + DEFAULT RATES + DEFAULT SHARES BY GRADE
+-------------------------------------------------------------------------------
 Rapport bancaire complet Train vs Validation
 Comparaisons graphiques superposées
 Dark mode professionnel + tableaux TTC par grade
+
+Ajouts :
+- Default rate global (Train / Validation) + N + #defaults
+- Par grade : default rate (obs), part des défauts (pct_defauts), part des expositions (pct_individus)
 
 Convention de grade (alignée sur le pipeline de training) :
     - grade 1 = classe la moins risquée
@@ -85,6 +89,42 @@ def _sort_grades_like_numbers(values):
         return sorted(values, key=lambda x: float(x))
     except Exception:
         return sorted(values)
+
+
+def add_global_default_info(metrics: dict, y: np.ndarray) -> dict:
+    """Ajoute N, #defaults et default rate observé."""
+    y = np.asarray(y).astype(int)
+    n = int(len(y))
+    n_def = int(y.sum())
+    dr = float(n_def / n) if n > 0 else float("nan")
+    metrics = dict(metrics)
+    metrics["n"] = n
+    metrics["n_defaults"] = n_def
+    metrics["default_rate"] = dr
+    return metrics
+
+
+def add_grade_default_shares(gdf: pd.DataFrame, total_n: int, total_bad: int) -> pd.DataFrame:
+    """
+    Ajoute :
+      - pct_individus = count / total_n
+      - pct_defauts   = bad / total_bad
+    """
+    out = gdf.copy()
+    out["pct_individus"] = (out["count"] / total_n) if total_n > 0 else np.nan
+    out["pct_defauts"] = (out["bad"] / total_bad) if total_bad > 0 else np.nan
+    return out
+
+
+def html_table_with_percentages(df: pd.DataFrame, pct_cols=None, round_cols=6):
+    """Rendu HTML en % sur certaines colonnes, sans changer les calculs upstream."""
+    if pct_cols is None:
+        pct_cols = []
+    d = df.copy()
+    for c in pct_cols:
+        if c in d.columns:
+            d[c] = 100.0 * d[c]
+    return d.round(round_cols).to_html(index=False)
 
 # =============================================================================
 # Calibration Error (ECE)
@@ -176,19 +216,29 @@ def plot_score_distribution(train_df, val_df, score_col, target_col):
 def plot_master_scale(train_df, val_df, grade_col, target_col, pd_col):
     fig, ax1 = plt.subplots(figsize=(10, 5))
 
+    # Agrégats par grade
     gtr = train_df.groupby(grade_col).agg(
-        count=("loan_sequence_number", "size"),
+        count=(grade_col, "size"),
         bad=(target_col, "sum"),
         pred=(pd_col, "mean"),
     ).reset_index()
     gtr["obs"] = gtr["bad"] / gtr["count"]
 
     gva = val_df.groupby(grade_col).agg(
-        count=("loan_sequence_number", "size"),
+        count=(grade_col, "size"),
         bad=(target_col, "sum"),
         pred=(pd_col, "mean"),
     ).reset_index()
     gva["obs"] = gva["bad"] / gva["count"]
+
+    # Ajout des parts de défauts et d'expositions
+    total_n_tr = int(len(train_df))
+    total_bad_tr = int(train_df[target_col].sum())
+    total_n_va = int(len(val_df))
+    total_bad_va = int(val_df[target_col].sum())
+
+    gtr = add_grade_default_shares(gtr, total_n=total_n_tr, total_bad=total_bad_tr)
+    gva = add_grade_default_shares(gva, total_n=total_n_va, total_bad=total_bad_va)
 
     # Tri des grades pour respecter 1 (moins risqué) → N (plus risqué)
     try:
@@ -248,40 +298,55 @@ def plot_coefficients(df_coef):
 
 def build_ttc_table(gdf, pd_ttc_map=None):
     """
-    gdf must contain columns: grade, count, bad, obs, pred
+    gdf must contain columns: grade, count, bad, obs, pred (+ optional pct_individus/pct_defauts)
     pd_ttc_map: dict {grade -> PD_TTC_master_scale}
         - si fourni : PD TTC issue de la master scale (bucket_stats.json)
         - sinon : on prend 'pred' (PD moyenne de l'échantillon)
-
-    Convention :
-        grade 1 = moins risqué, grade N = plus risqué.
     """
     df = gdf.copy()
 
     if pd_ttc_map is not None:
         df["pd_ttc"] = df["grade"].map(pd_ttc_map)
     else:
-        # fallback : ancienne logique — PD TTC = PD moyenne prédite par grade
         df["pd_ttc"] = df["pred"]
 
     df["delta_abs"] = df["obs"] - df["pd_ttc"]
     df["delta_rel"] = 100 * df["delta_abs"] / df["pd_ttc"].replace(0, np.nan)
 
-    df_final = df.rename(columns={
+    # Colonnes optionnelles : parts
+    cols = ["grade", "count", "bad", "obs", "pd_ttc", "delta_abs", "delta_rel"]
+    rename = {
         "count": "n_individus",
         "bad": "n_defauts",
-        "obs": "pd_obs"
-    })[
-        ["grade", "n_individus", "n_defauts", "pd_obs", "pd_ttc", "delta_abs", "delta_rel"]
-    ]
+        "obs": "pd_obs",
+    }
 
-    # Tri des lignes par grade pour respecter 1 → N
+    if "pct_individus" in df.columns:
+        df["pct_individus"] = 100 * df["pct_individus"]
+        cols.insert(3, "pct_individus")
+        rename["pct_individus"] = "%_individus"
+
+    if "pct_defauts" in df.columns:
+        df["pct_defauts"] = 100 * df["pct_defauts"]
+        # juste après n_defauts
+        insert_at = cols.index("bad") + 1
+        cols.insert(insert_at, "pct_defauts")
+        rename["pct_defauts"] = "%_defauts"
+
+    df_final = df[cols].rename(columns=rename)
+
+    # Tri
     try:
         df_final["grade"] = df_final["grade"].astype(float)
     except Exception:
         pass
     df_final = df_final.sort_values("grade")
 
+    # Arrondis
+    if "%_individus" in df_final.columns:
+        df_final["%_individus"] = df_final["%_individus"].round(2)
+    if "%_defauts" in df_final.columns:
+        df_final["%_defauts"] = df_final["%_defauts"].round(2)
     df_final["delta_rel"] = df_final["delta_rel"].round(2)
 
     return df_final.to_html(index=False)
@@ -308,7 +373,6 @@ def load_pd_ttc_from_master_scale(bucket_stats_path: Path):
         return None
 
     df_train = pd.DataFrame(train_stats)
-    # On s'attend à avoir au moins les colonnes: 'bucket' et 'pd'
     if "bucket" not in df_train.columns or "pd" not in df_train.columns:
         print(f"[WARN] Colonnes 'bucket'/'pd' manquantes dans bucket_stats.json.", file=sys.stderr)
         return None
@@ -330,7 +394,6 @@ def parse_args():
     p.add_argument("--pd", default="pd")
     p.add_argument("--grade", default="grade")
     p.add_argument("--model", required=True)
-    # optionnel: chemin explicite vers bucket_stats.json
     p.add_argument("--bucket-stats", default=None,
                    help="Path to bucket_stats.json (for PD TTC master scale). Default: same folder as model.")
     return p.parse_args()
@@ -430,11 +493,14 @@ def build_html(
                 <th>Train</th>
                 <th>Validation</th>
             </tr>
+            <tr><td>N</td><td>{train_metrics['n']}</td><td>{val_metrics['n']}</td></tr>
+            <tr><td># Defaults</td><td>{train_metrics['n_defaults']}</td><td>{val_metrics['n_defaults']}</td></tr>
+            <tr><td>Default Rate</td><td>{train_metrics['default_rate']:.6f}</td><td>{val_metrics['default_rate']:.6f}</td></tr>
             <tr><td>AUC</td><td>{train_metrics['auc']:.4f}</td><td>{val_metrics['auc']:.4f}</td></tr>
             <tr><td>Gini</td><td>{train_metrics['gini']:.4f}</td><td>{val_metrics['gini']:.4f}</td></tr>
             <tr><td>LogLoss</td><td>{train_metrics['logloss']:.4f}</td><td>{val_metrics['logloss']:.4f}</td></tr>
-            <tr><td>Brier Score</td><td>{train_metrics['brier']:.4f}</td><td>{val_metrics['brier']:.4f}</td></tr>
-            <tr><td>ECE</td><td>{train_metrics['ece']:.4f}</td><td>{val_metrics['ece']:.4f}</td></tr>
+            <tr><td>Brier Score</td><td>{train_metrics['brier']:.6f}</td><td>{val_metrics['brier']:.6f}</td></tr>
+            <tr><td>ECE</td><td>{train_metrics['ece']:.6f}</td><td>{val_metrics['ece']:.6f}</td></tr>
         </table>
     </div>
 
@@ -461,10 +527,10 @@ def build_html(
         <h2>5. Master Scale Analysis (Train + Validation)</h2>
         <img src="{ms_img}">
 
-        <h3>Train Grades</h3>
+        <h3>Train Grades (incl. % individuals / % defaults)</h3>
         {gtr_table_html}
 
-        <h3>Validation Grades</h3>
+        <h3>Validation Grades (incl. % individuals / % defaults)</h3>
         {gva_table_html}
 
         <h3>Train TTC Table (PD TTC = Master Scale)</h3>
@@ -522,6 +588,7 @@ def main():
         brier=brier_score_loss(y_tr, pd_tr),
         ece=expected_calibration_error(y_tr, pd_tr),
     )
+    train_metrics = add_global_default_info(train_metrics, y_tr)
 
     val_metrics = dict(
         auc=roc_auc_score(y_va, pd_va),
@@ -530,6 +597,7 @@ def main():
         brier=brier_score_loss(y_va, pd_va),
         ece=expected_calibration_error(y_va, pd_va),
     )
+    val_metrics = add_global_default_info(val_metrics, y_va)
 
     # PLOTS + MASTER SCALE
     roc_img, _, _ = plot_roc(y_tr, pd_tr, y_va, pd_va)
@@ -552,12 +620,11 @@ def main():
     if args.bucket_stats is not None:
         bucket_stats_path = Path(args.bucket_stats)
     else:
-        # par défaut: même dossier que le modèle
         bucket_stats_path = Path(args.model).with_name("bucket_stats.json")
 
     pd_ttc_map = load_pd_ttc_from_master_scale(bucket_stats_path)
 
-    # TTC TABLES
+    # TTC TABLES (incluent aussi % individus / % défauts si présents dans gtr/gva)
     gtr2 = gtr.copy()
     gtr2["grade"] = gtr2[args.grade]
     gva2 = gva.copy()
@@ -566,9 +633,48 @@ def main():
     ttc_train_html = build_ttc_table(gtr2, pd_ttc_map=pd_ttc_map)
     ttc_val_html = build_ttc_table(gva2, pd_ttc_map=pd_ttc_map)
 
-    # Tables gtr/gva triées par grade pour l'HTML
-    gtr_html = gtr.sort_values(by=args.grade).to_html(index=False)
-    gva_html = gva.sort_values(by=args.grade).to_html(index=False)
+    # Tables gtr/gva (avec %)
+    # On renomme un peu pour lisibilité
+    gtr_disp = gtr.copy().rename(columns={
+        args.grade: "grade",
+        "count": "n_individus",
+        "bad": "n_defauts",
+        "pred": "pd_pred_mean",
+        "obs": "pd_obs",
+        "pct_individus": "%_individus",
+        "pct_defauts": "%_defauts",
+    })
+    gva_disp = gva.copy().rename(columns={
+        args.grade: "grade",
+        "count": "n_individus",
+        "bad": "n_defauts",
+        "pred": "pd_pred_mean",
+        "obs": "pd_obs",
+        "pct_individus": "%_individus",
+        "pct_defauts": "%_defauts",
+    })
+
+    # convertir en pourcentages
+    if "%_individus" in gtr_disp.columns:
+        gtr_disp["%_individus"] = 100 * gtr_disp["%_individus"]
+    if "%_defauts" in gtr_disp.columns:
+        gtr_disp["%_defauts"] = 100 * gtr_disp["%_defauts"]
+    if "%_individus" in gva_disp.columns:
+        gva_disp["%_individus"] = 100 * gva_disp["%_individus"]
+    if "%_defauts" in gva_disp.columns:
+        gva_disp["%_defauts"] = 100 * gva_disp["%_defauts"]
+
+    # Tri par grade
+    try:
+        gtr_disp["grade"] = gtr_disp["grade"].astype(float)
+        gva_disp["grade"] = gva_disp["grade"].astype(float)
+    except Exception:
+        pass
+    gtr_disp = gtr_disp.sort_values("grade")
+    gva_disp = gva_disp.sort_values("grade")
+
+    gtr_html = gtr_disp.round(6).to_html(index=False)
+    gva_html = gva_disp.round(6).to_html(index=False)
 
     # OUTPUT HTML
     out_path = Path(args.out)

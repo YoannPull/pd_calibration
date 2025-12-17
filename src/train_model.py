@@ -2,45 +2,47 @@
 # -*- coding: utf-8 -*-
 
 """
-TRAINING PIPELINE — CLEAN & ROBUST VERSION (BANK-GRADE)
-=======================================================
+TRAINING PIPELINE — BANK-GRADE (TIME-AWARE CV + OPTIONAL INTERACTIONS)
+=====================================================================
 
 Principes :
-- WOE appris sur 100 % du TRAIN (comme dans les vrais modèles IRB).
-- Calibration sur un split interne (20 %) non vu par la LR.
-- Logistic Regression L2 propre (pas de class_weight='balanced').
-- Score TTC basé sur log-odds non calibrés (standard bancaire).
+- WOE appris sur 100 % du TRAIN.
+- Split calibration interne (par défaut "time_last" pour coller au OOT).
+- Logistic Regression L2 (pas de class_weight='balanced').
+- Score TTC basé sur log-odds non calibrés.
 - PD calibrée via CalibratedClassifierCV + FrozenEstimator (isotonic/sigmoid).
 - Master Scale (n_buckets) monotone (contrôle de monotonie).
 - Sauvegarde train_scored / validation_scored avec vintage & loan_sequence_number.
 
-NOUVEAU (grille + TTC windowées) :
-- Si --risk-buckets-in n'est PAS fourni :
-  - la grille (edges) est construite sur une fenêtre glissante (grid-window-years)
-    terminant au dernier trimestre (vintage) présent dans VALIDATION.
-  - les PD TTC par grade (bucket_stats['train'] / 'train_val_longrun_window') sont aussi
-    calculées sur une fenêtre glissante (ttc-window-years) ancrée au même end.
+NOUVEAU :
+- Recherche large sur C via logspace :
+    --search grid    : exhaustif
+    --search halving : Successive Halving (explore large, prune tôt)
+- CV "time-aware" pour choisir C :
+    --cv-scheme time : expanding window sur vintage (recommandé OOT)
+    --cv-scheme stratified : StratifiedKFold (fallback)
+- Split calibration time-aware :
+    --calibration-split time_last : derniers vintages du train (recommandé)
+    --calibration-split stratified : aléatoire stratifié
+- Interactions optionnelles :
+    --no-interactions : désactive les interactions WOE
 
-Espace de recherche (modèle) :
-- Recherche large sur C via logspace, avec deux modes :
-  - --search grid    : exhaustif
-  - --search halving : Successive Halving (explore large, élimine tôt)
+Windows (grille + TTC) :
+- Si --risk-buckets-in n'est PAS fourni :
+  - edges appris sur une fenêtre glissante (grid-window-years) finissant au dernier vintage de validation
+  - PD TTC par grade calculées sur une fenêtre glissante (ttc-window-years) finissant au même end
 
 Option Statsmodels :
-- --coef-stats statsmodels : calcule coef/std_err/z/p_value via sm.Logit (plus lent)
+- --coef-stats statsmodels : coef/std_err/z/p_value via sm.Logit (plus lent)
 - --coef-stats none        : skip (accélère)
 
-Timer / progress :
-- --timing : affiche les sections + temps cumulé
-- --sklearn-verbose : verbose GridSearch/Halving (attention aux logs trop bavards)
-
 Outputs:
-- artifacts/model_from_binned/model_best.joblib
-- artifacts/model_from_binned/risk_buckets.json
-- artifacts/model_from_binned/bucket_stats.json
-- artifacts/model_from_binned/coefficients_stats.csv
-- data/processed/scored/train_scored.parquet
-- data/processed/scored/validation_scored.parquet
+- artifacts/.../model_best.joblib
+- artifacts/.../risk_buckets.json
+- artifacts/.../bucket_stats.json
+- artifacts/.../coefficients_stats.csv
+- data/.../train_scored.parquet
+- data/.../validation_scored.parquet
 """
 
 from __future__ import annotations
@@ -56,18 +58,22 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-import statsmodels.api as sm
 from joblib import dump
-
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
-from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 
-# Successive Halving (sklearn >= 0.24, mais activé via experimental)
+# Successive Halving (sklearn >= 0.24, activé via experimental)
 from sklearn.experimental import enable_halving_search_cv  # noqa: F401
 from sklearn.model_selection import HalvingGridSearchCV
+
+# optionnel (coef stats)
+try:
+    import statsmodels.api as sm
+except Exception:
+    sm = None
 
 
 # ---------------------------------------------------------------------------
@@ -86,48 +92,25 @@ def save_json(obj: dict, path: Path):
     path.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
 
 
-def _fmt_seconds(s: float) -> str:
-    s = int(round(s))
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    if h > 0:
-        return f"{h:d}h{m:02d}m{s:02d}s"
-    return f"{m:d}m{s:02d}s"
-
-
 class Timer:
-    """
-    Timer de sections avec temps cumulé.
-    Coût négligeable (perf_counter + prints si live).
-    """
     def __init__(self, live: bool = False):
         self.records: Dict[str, float] = {}
         self.live = live
-        self.t0 = time.perf_counter()
 
     @contextlib.contextmanager
     def section(self, name: str):
         t0 = time.perf_counter()
         if self.live:
-            total = time.perf_counter() - self.t0
-            print(f"▶ {name}  (total={_fmt_seconds(total)})", flush=True)
+            print(f"▶ {name} ...")
         yield
         dt = time.perf_counter() - t0
         self.records[name] = dt
         if self.live:
-            total = time.perf_counter() - self.t0
-            print(f"  ✓ {name:35s} {dt:9.3f}s   (total={_fmt_seconds(total)})", flush=True)
-
-    def summary(self, top: int = 20) -> str:
-        items = sorted(self.records.items(), key=lambda kv: kv[1], reverse=True)[:top]
-        lines = ["\n[TIMING SUMMARY]"]
-        for k, v in items:
-            lines.append(f"  - {k:35s} {v:9.3f}s")
-        return "\n".join(lines)
+            print(f"  ✓ {name:40s} {dt:.3f}s")
 
 
 # ---------------------------------------------------------------------------
-# Time helpers (vintage window)
+# Time helpers (vintage window + time-aware CV)
 # ---------------------------------------------------------------------------
 
 def parse_vintage_to_period(s: pd.Series, freq: str = "Q") -> pd.PeriodIndex:
@@ -165,7 +148,7 @@ def parse_vintage_to_period(s: pd.Series, freq: str = "Q") -> pd.PeriodIndex:
 
 def window_mask_from_end(vintage_series: pd.Series, end: pd.Period, years: int, freq: str = "Q") -> np.ndarray:
     """
-    Masque booléen sélectionnant une fenêtre [end - (years*freq) + 1, end].
+    Retourne un masque booléen sélectionnant une fenêtre [end - (years*freq) + 1, end].
     """
     freq = freq.upper()
     per = parse_vintage_to_period(vintage_series, freq=freq)
@@ -180,6 +163,94 @@ def window_mask_from_end(vintage_series: pd.Series, end: pd.Period, years: int, 
     start = end - (n - 1)
     mask = (per >= start) & (per <= end)
     return np.asarray(mask)
+
+
+class VintageExpandingWindowSplit:
+    """
+    Expanding window CV sur des périodes (vintages).
+    - fold i : train = périodes <= start(test_i)-1 ; test = block de périodes
+    """
+    def __init__(self, n_splits: int = 5):
+        if n_splits < 2:
+            raise ValueError("n_splits doit être >= 2")
+        self.n_splits = n_splits
+
+    def split(self, X, y=None, groups=None):
+        if groups is None:
+            raise ValueError("VintageExpandingWindowSplit nécessite groups=periods.")
+        g = np.asarray(groups)
+
+        uniq = np.unique(g)
+        uniq = np.sort(uniq)
+
+        # on découpe les périodes en n_splits blocs de test (de la plus ancienne à la plus récente)
+        blocks = np.array_split(uniq, self.n_splits)
+
+        # pour avoir expanding window : on commence à i=1 (sinon train vide)
+        for i in range(1, len(blocks)):
+            test_periods = blocks[i]
+            train_periods = np.concatenate(blocks[:i])
+
+            test_idx = np.where(np.isin(g, test_periods))[0]
+            train_idx = np.where(np.isin(g, train_periods))[0]
+
+            if len(train_idx) == 0 or len(test_idx) == 0:
+                continue
+
+            yield train_idx, test_idx
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits - 1
+
+
+def _time_aware_calibration_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    vintages: pd.Series,
+    frac: float,
+    freq: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """
+    Split calibration "time_last" :
+    - calibration = dernières périodes (approx frac en nb de périodes)
+    - model = le reste
+    """
+    per = parse_vintage_to_period(vintages, freq=freq)
+    uniq = np.sort(per.unique())
+
+    if len(uniq) < 3:
+        # pas assez de périodes -> fallback stratifié simple
+        return _stratified_calibration_split(X, y, frac=frac, seed=42)
+
+    n_cal = max(1, int(np.ceil(len(uniq) * frac)))
+    cal_periods = set(uniq[-n_cal:])
+
+    mask_cal = per.isin(cal_periods)
+    mask_model = ~mask_cal
+
+    X_model = X.loc[mask_model]
+    y_model = y.loc[mask_model]
+    X_cal = X.loc[mask_cal]
+    y_cal = y.loc[mask_cal]
+
+    # si calibration trop petite ou 1 seule classe -> fallback stratifié
+    if len(X_cal) < 100 or y_cal.nunique() < 2 or y_model.nunique() < 2:
+        return _stratified_calibration_split(X, y, frac=frac, seed=42)
+
+    return X_model, X_cal, y_model, y_cal
+
+
+def _stratified_calibration_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    frac: float,
+    seed: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    from sklearn.model_selection import train_test_split
+    X_model, X_cal, y_model, y_cal = train_test_split(
+        X, y, test_size=frac, stratify=y, random_state=seed
+    )
+    return X_model, X_cal, y_model, y_cal
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +271,7 @@ def build_woe_maps(
     y = df[target].astype(int)
     tot_bad = float(y.sum())
     tot_good = float(len(y) - y.sum())
+
     global_woe = float(np.log((tot_bad + smooth) / (tot_good + smooth)))
 
     maps: Dict[str, Any] = {}
@@ -221,7 +293,7 @@ def build_woe_maps(
 
 def apply_woe(df: pd.DataFrame, woe_maps: Dict[str, Any], bin_suffix: str, dtype=np.float32) -> pd.DataFrame:
     """
-    Applique les mappings WOE. Optimisé pour éviter concat de centaines de Series.
+    Applique les mappings WOE. Optimisé : pas de concat de centaines de Series.
     """
     out = pd.DataFrame(index=df.index)
     for raw, info in woe_maps.items():
@@ -269,7 +341,7 @@ def scale_score(log_odds: np.ndarray, base_points: int = 600, base_odds: int = 5
 
 
 # ---------------------------------------------------------------------------
-# Feature selection (optimisée — évite X.corr() O(p^2))
+# Feature selection (évite X.corr() O(p^2))
 # ---------------------------------------------------------------------------
 
 def select_features(X: pd.DataFrame, corr_thr: float = 0.85) -> List[str]:
@@ -337,19 +409,18 @@ def create_risk_buckets(
     if fixed_edges is None:
         qs = np.linspace(0, 1, n_buckets + 1)
         edges = np.quantile(scores, qs)
-
         edges[0] = -np.inf
         edges[-1] = np.inf
 
         if len(np.unique(edges)) < len(edges):
-            print("[WARN] Quantile edges contiennent des doublons. Risque de buckets vides.", flush=True)
+            print("[WARN] Quantile edges contiennent des doublons (risque de buckets vides).")
     else:
         edges = np.array(fixed_edges, dtype=float)
         edges[0] = -np.inf
         edges[-1] = np.inf
 
-    raw_bucket = np.digitize(scores, edges[1:], right=True) + 1
-    bucket = (n_buckets + 1 - raw_bucket).astype(int)
+    raw_bucket = np.digitize(scores, edges[1:], right=True) + 1  # 1=faible score (risqué)
+    bucket = (n_buckets + 1 - raw_bucket).astype(int)            # 1=haut score (moins risqué)
 
     df = pd.DataFrame({"bucket": bucket, "y": y, "score": scores})
 
@@ -399,6 +470,55 @@ def choose_n_buckets(
 META_COLS = ["vintage", "loan_sequence_number"]  # conservés, jamais utilisés comme features
 
 
+def _build_cv_splitter(
+    scheme: str,
+    X_model: pd.DataFrame,
+    y_model: pd.Series,
+    meta_tr: pd.DataFrame,
+    time_col: str,
+    freq: str,
+    cv_folds: int,
+) -> Tuple[object, Optional[np.ndarray]]:
+    """
+    Retourne (cv_splitter, groups) :
+      - stratified -> StratifiedKFold, groups=None
+      - time -> VintageExpandingWindowSplit + groups=ordinal periods
+    """
+    scheme = scheme.lower()
+    if scheme == "stratified":
+        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        return cv, None
+
+    # time-aware
+    if time_col not in meta_tr.columns:
+        print(f"[WARN] cv-scheme=time mais colonne '{time_col}' absente. Fallback stratified.")
+        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        return cv, None
+
+    vint = meta_tr.loc[X_model.index, time_col]
+    per = parse_vintage_to_period(vint, freq=freq)
+
+    # groups en int ordonnés (stable)
+    uniq = np.sort(per.unique())
+    mapping = {p: i for i, p in enumerate(uniq)}
+    groups = np.array([mapping[p] for p in per], dtype=int)
+
+    cv_time = VintageExpandingWindowSplit(n_splits=cv_folds)
+
+    # sanity: vérifier que les folds ont bien 2 classes côté test
+    bad_fold = False
+    for tr_idx, te_idx in cv_time.split(X_model, y_model, groups=groups):
+        if pd.Series(y_model.to_numpy()[te_idx]).nunique() < 2:
+            bad_fold = True
+            break
+    if bad_fold:
+        print("[WARN] Au moins un fold time-aware n'a qu'une seule classe en test. Fallback stratified.")
+        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        return cv, None
+
+    return cv_time, groups
+
+
 def train_pipeline(
     df_tr: pd.DataFrame,
     df_va: pd.DataFrame,
@@ -414,21 +534,23 @@ def train_pipeline(
     c_max_exp: float,
     c_num: int,
     halving_factor: int,
+    search_verbose: int,
     lr_solver: str,
     lr_max_iter: int,
     coef_stats: str,
-    sklearn_verbose: int,
+    use_interactions: bool,
+    cv_scheme: str,
+    calibration_split: str,
+    calibration_size: float,
+    cv_time_col: str,
+    cv_time_freq: str,
 ):
-    # -------------------------------------------------
-    # Meta (pour analyse future, pas features)
-    # -------------------------------------------------
+    # Meta
     meta_cols_present = [c for c in META_COLS if c in df_tr.columns and c in df_va.columns]
     meta_tr = df_tr[meta_cols_present].copy()
     meta_va = df_va[meta_cols_present].copy()
 
-    # -------------------------------------------------
     # Identify binned features
-    # -------------------------------------------------
     with timer.section("Identify BIN features"):
         bin_cols = [c for c in df_tr.columns if bin_suffix in c]
 
@@ -445,31 +567,42 @@ def train_pipeline(
         bin_cols = [c for c in bin_cols if safe(c)]
         raw_to_bin = {raw_name_from_bin(c, bin_suffix): c for c in bin_cols}
 
-    # -------------------------------------------------
-    # WOE learn on full TRAIN
-    # -------------------------------------------------
+    # WOE learn + apply
     with timer.section("Learn + Apply WOE"):
-        woe_maps = build_woe_maps(df_tr, target, rawaws_to_bin := raw_to_bin)  # noqa: F841
+        woe_maps = build_woe_maps(df_tr, target, raw_to_bin)
 
         Xtr_full = apply_woe(df_tr, woe_maps, bin_suffix)
-        Xtr_full = add_interactions(Xtr_full)
         ytr_full = df_tr[target].astype(int)
 
         Xva_full = apply_woe(df_va, woe_maps, bin_suffix)
-        Xva_full = add_interactions(Xva_full)
         yva_full = df_va[target].astype(int)
 
-    # -------------------------------------------------
-    # Calibration split
-    # -------------------------------------------------
-    with timer.section("Split for Calibration"):
-        X_model, X_cal, y_model, y_cal = train_test_split(
-            Xtr_full, ytr_full, test_size=0.2, stratify=ytr_full, random_state=42
-        )
+        if use_interactions:
+            Xtr_full = add_interactions(Xtr_full)
+            Xva_full = add_interactions(Xva_full)
 
-    # -------------------------------------------------
-    # Feature selection (sur X_model)
-    # -------------------------------------------------
+    # Calibration split
+    with timer.section("Split for Calibration"):
+        if calibration_split == "time_last":
+            if cv_time_col not in meta_tr.columns:
+                print(f"[WARN] calibration-split=time_last mais '{cv_time_col}' absent. Fallback stratified.")
+                X_model, X_cal, y_model, y_cal = _stratified_calibration_split(
+                    Xtr_full, ytr_full, frac=calibration_size, seed=42
+                )
+            else:
+                X_model, X_cal, y_model, y_cal = _time_aware_calibration_split(
+                    Xtr_full,
+                    ytr_full,
+                    vintages=meta_tr[cv_time_col],
+                    frac=calibration_size,
+                    freq=cv_time_freq,
+                )
+        else:
+            X_model, X_cal, y_model, y_cal = _stratified_calibration_split(
+                Xtr_full, ytr_full, frac=calibration_size, seed=42
+            )
+
+    # Feature selection
     with timer.section("Feature Selection"):
         kept_features = select_features(X_model, corr_thr=corr_threshold)
 
@@ -478,16 +611,21 @@ def train_pipeline(
         Xtr_full_kept = Xtr_full[kept_features].to_numpy(dtype=np.float32, copy=False)
         Xva_full_kept = Xva_full[kept_features].to_numpy(dtype=np.float32, copy=False)
 
-    # -------------------------------------------------
-    # Logistic Regression (GridSearch ou Halving)
-    # -------------------------------------------------
+    # CV scheme
+    with timer.section("Build CV splitter"):
+        cv, groups = _build_cv_splitter(
+            scheme=cv_scheme,
+            X_model=X_model,
+            y_model=y_model,
+            meta_tr=meta_tr,
+            time_col=cv_time_col,
+            freq=cv_time_freq,
+            cv_folds=cv_folds,
+        )
+
+    # LR search
     with timer.section("Fit Logistic Regression (search)"):
         C_grid = np.logspace(c_min_exp, c_max_exp, c_num).tolist()
-        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-
-        print(f"[SEARCH] mode={search} | C in 10^[{c_min_exp},{c_max_exp}] ({c_num} pts) | folds={cv_folds}", flush=True)
-        if search == "grid":
-            print(f"[SEARCH] expected fits ~= {len(C_grid)} × {cv_folds} = {len(C_grid)*cv_folds}", flush=True)
 
         lr = LogisticRegression(
             penalty="l2",
@@ -503,7 +641,7 @@ def train_pipeline(
                 cv=cv,
                 n_jobs=-1,
                 factor=halving_factor,
-                verbose=sklearn_verbose,
+                verbose=search_verbose,
             )
         else:
             gs = GridSearchCV(
@@ -512,33 +650,23 @@ def train_pipeline(
                 scoring="neg_log_loss",
                 cv=cv,
                 n_jobs=-1,
-                verbose=sklearn_verbose,
+                verbose=search_verbose,
             )
 
-        gs.fit(X_model_kept, y_model.to_numpy())
+        if groups is not None:
+            gs.fit(X_model_kept, y_model.to_numpy(), groups=groups)
+        else:
+            gs.fit(X_model_kept, y_model.to_numpy())
+
         best_lr: LogisticRegression = gs.best_estimator_
 
-    # -------------------------------------------------
-    # Coefficients stats (optionnel)
-    # -------------------------------------------------
+    # Coef stats
     with timer.section("Coefficient statistics (optional)"):
         feature_names = ["Intercept"] + kept_features
 
         if coef_stats == "statsmodels":
-            try:
-                X_sm = sm.add_constant(X_model_kept, has_constant="add")
-                logit_sm = sm.Logit(y_model.to_numpy(), X_sm)
-                res_sm = logit_sm.fit(disp=False)
-
-                coef_table = pd.DataFrame({
-                    "feature": feature_names,
-                    "coef": res_sm.params,
-                    "std_err": res_sm.bse,
-                    "z": res_sm.tvalues,
-                    "p_value": res_sm.pvalues,
-                })
-            except Exception as e:
-                print(f"[WARN] statsmodels a échoué ({type(e).__name__}: {e}). Fallback coef sklearn.", flush=True)
+            if sm is None:
+                print("[WARN] statsmodels non disponible. Fallback coef sklearn.")
                 coefs = np.r_[best_lr.intercept_[0], best_lr.coef_[0]]
                 coef_table = pd.DataFrame({
                     "feature": feature_names,
@@ -547,6 +675,29 @@ def train_pipeline(
                     "z": np.nan,
                     "p_value": np.nan,
                 })
+            else:
+                try:
+                    X_sm = sm.add_constant(X_model_kept, has_constant="add")
+                    logit_sm = sm.Logit(y_model.to_numpy(), X_sm)
+                    res_sm = logit_sm.fit(disp=False)
+
+                    coef_table = pd.DataFrame({
+                        "feature": feature_names,
+                        "coef": res_sm.params,
+                        "std_err": res_sm.bse,
+                        "z": res_sm.tvalues,
+                        "p_value": res_sm.pvalues,
+                    })
+                except Exception as e:
+                    print(f"[WARN] statsmodels a échoué ({type(e).__name__}: {e}). Fallback coef sklearn.")
+                    coefs = np.r_[best_lr.intercept_[0], best_lr.coef_[0]]
+                    coef_table = pd.DataFrame({
+                        "feature": feature_names,
+                        "coef": coefs,
+                        "std_err": np.nan,
+                        "z": np.nan,
+                        "p_value": np.nan,
+                    })
         else:
             coefs = np.r_[best_lr.intercept_[0], best_lr.coef_[0]]
             coef_table = pd.DataFrame({
@@ -557,9 +708,7 @@ def train_pipeline(
                 "p_value": np.nan,
             })
 
-    # -------------------------------------------------
-    # Score TTC (log-odds sur TOUT le train + TOUTE la validation)
-    # -------------------------------------------------
+    # Score TTC
     with timer.section("Raw score scaling"):
         log_odds_tr_full = best_lr.decision_function(Xtr_full_kept)
         log_odds_va_full = best_lr.decision_function(Xva_full_kept)
@@ -567,9 +716,7 @@ def train_pipeline(
         score_tr_full = scale_score(log_odds_tr_full)
         score_va_full = scale_score(log_odds_va_full)
 
-    # -------------------------------------------------
-    # Calibration (isotonic / sigmoid / none)
-    # -------------------------------------------------
+    # Calibration
     with timer.section("Calibration"):
         if calibration_method != "none":
             calibrator = CalibratedClassifierCV(
@@ -585,9 +732,7 @@ def train_pipeline(
         pd_va_full = model_pd.predict_proba(Xva_full_kept)[:, 1]
         pd_tr_full = model_pd.predict_proba(Xtr_full_kept)[:, 1]
 
-    # -------------------------------------------------
     # Metrics
-    # -------------------------------------------------
     metrics = {
         "train_auc": float(roc_auc_score(y_model, pd_tr_model)),
         "val_auc": float(roc_auc_score(yva_full, pd_va_full)),
@@ -604,8 +749,9 @@ def train_pipeline(
         "solver": lr_solver,
         "coef_stats": coef_stats,
         "calibration": calibration_method,
-        "halving_factor": int(halving_factor),
-        "lr_max_iter": int(lr_max_iter),
+        "cv_scheme": cv_scheme,
+        "calibration_split": calibration_split,
+        "use_interactions": bool(use_interactions),
     }
 
     return {
@@ -646,6 +792,8 @@ def parse_args():
     # feature engineering
     p.add_argument("--bin-suffix", default="__BIN")
     p.add_argument("--corr-threshold", type=float, default=0.85)
+    p.add_argument("--no-interactions", action="store_true",
+                   help="Désactive les interactions WOE (souvent + robuste OOT).")
 
     # model / search
     p.add_argument("--cv-folds", type=int, default=5)
@@ -653,29 +801,35 @@ def parse_args():
 
     p.add_argument("--search", choices=["grid", "halving"], default="halving",
                    help="grid=exhaustif, halving=successive halving (explore large + prune tôt).")
-    p.add_argument("--c-min-exp", type=float, default=-6.0, help="C_min = 10^(c-min-exp)")
-    p.add_argument("--c-max-exp", type=float, default=3.0, help="C_max = 10^(c-max-exp)")
-    p.add_argument("--c-num", type=int, default=30, help="Nombre de points dans la grille logspace(C)")
-    p.add_argument("--halving-factor", type=int, default=3, help="Facteur d'élimination HalvingGridSearchCV")
-    p.add_argument("--lr-solver", choices=["lbfgs", "saga", "newton-cg"], default="lbfgs")
-    p.add_argument("--lr-max-iter", type=int, default=3000)
+    p.add_argument("--c-min-exp", type=float, default=-8.0, help="C_min = 10^(c-min-exp)")
+    p.add_argument("--c-max-exp", type=float, default=4.0, help="C_max = 10^(c-max-exp)")
+    p.add_argument("--c-num", type=int, default=60, help="Nombre de points dans la grille logspace(C)")
+    p.add_argument("--halving-factor", type=int, default=3)
+    p.add_argument("--search-verbose", type=int, default=0)
 
-    # sklearn verbosity
-    p.add_argument("--sklearn-verbose", type=int, default=0,
-                   help="Verbosity sklearn pour (Halving)GridSearchCV. 0=silent, 1=some, 2=chatty.")
+    p.add_argument("--lr-solver", choices=["lbfgs", "saga", "newton-cg"], default="lbfgs")
+    p.add_argument("--lr-max-iter", type=int, default=4000)
+
+    # time-aware CV + calibration split
+    p.add_argument("--cv-scheme", choices=["time", "stratified"], default="time",
+                   help="time=recommandé OOT (expanding window sur vintage).")
+    p.add_argument("--calibration-split", choices=["time_last", "stratified"], default="time_last",
+                   help="time_last=recommandé (calibration sur derniers vintages du train).")
+    p.add_argument("--calibration-size", type=float, default=0.20)
+
+    p.add_argument("--cv-time-col", default="vintage")
+    p.add_argument("--cv-time-freq", choices=["Q", "M"], default="Q")
 
     # statsmodels option
-    p.add_argument("--coef-stats", choices=["statsmodels", "none"], default="statsmodels",
+    p.add_argument("--coef-stats", choices=["statsmodels", "none"], default="none",
                    help="statsmodels=coef/std_err/z/p_value ; none=skip pour accélérer.")
 
     # master scale
     p.add_argument("--n-buckets", type=int, default=10)
-
-    # optional: search best n_buckets under constraints (governance)
     p.add_argument("--n-buckets-candidates", default=None,
                    help="Optionnel: liste CSV ex '7,10,12,15' pour choisir nb buckets max sous contraintes.")
-    p.add_argument("--min-bucket-count", type=int, default=300, help="Contraintes si n-buckets-candidates est utilisé.")
-    p.add_argument("--min-bucket-bad", type=int, default=5, help="Contraintes si n-buckets-candidates est utilisé.")
+    p.add_argument("--min-bucket-count", type=int, default=300)
+    p.add_argument("--min-bucket-bad", type=int, default=5)
 
     # ttc mode
     p.add_argument("--ttc-mode", choices=["train", "train_val"], default="train",
@@ -685,16 +839,13 @@ def parse_args():
     default_window = 5
     p.add_argument("--grid-window-years", type=int, default=default_window,
                    help="Fenêtre (années) pour construire la grille (edges), ancrée sur le dernier vintage de validation.")
-    p.add_argument("--grid-time-col", default="vintage",
-                   help="Colonne temporelle utilisée pour la fenêtre (ex: vintage).")
-    p.add_argument("--grid-time-freq", default="Q", choices=["Q", "M"],
-                   help="Fréquence de la colonne temporelle (Q ou M).")
+    p.add_argument("--grid-time-col", default="vintage")
+    p.add_argument("--grid-time-freq", default="Q", choices=["Q", "M"])
     p.add_argument("--ttc-window-years", type=int, default=default_window,
                    help="Fenêtre (années) pour calculer les PD TTC par grade (bucket_stats), ancrée sur le dernier vintage de validation.")
 
     # misc
     p.add_argument("--timing", action="store_true")
-
     return p.parse_args()
 
 
@@ -730,21 +881,25 @@ def main():
         c_max_exp=args.c_max_exp,
         c_num=args.c_num,
         halving_factor=args.halving_factor,
+        search_verbose=args.search_verbose,
         lr_solver=args.lr_solver,
         lr_max_iter=args.lr_max_iter,
         coef_stats=args.coef_stats,
-        sklearn_verbose=args.sklearn_verbose,
+        use_interactions=not args.no_interactions,
+        cv_scheme=args.cv_scheme,
+        calibration_split=args.calibration_split,
+        calibration_size=args.calibration_size,
+        cv_time_col=args.cv_time_col,
+        cv_time_freq=args.cv_time_freq,
     )
 
     # save coef stats
     coef_path = artifacts / "coefficients_stats.csv"
     out["coef_table"].to_csv(coef_path, index=False)
-    print(f"✔ coefficients stats sauvegardés : {coef_path}", flush=True)
+    print(f"✔ coefficients stats sauvegardés : {coef_path}")
 
     # ------------------------------------------------------------------
     # MASTER SCALE (edges)
-    # - si --risk-buckets-in fourni : edges figés
-    # - sinon : edges appris sur fenêtre (grid-window-years) finissant au dernier vintage de validation
     # ------------------------------------------------------------------
     fixed_edges = None
     if args.risk_buckets_in and Path(args.risk_buckets_in).exists():
@@ -753,13 +908,13 @@ def main():
     time_col = args.grid_time_col
     freq = args.grid_time_freq
 
-    if time_col not in out["meta_va"].columns or time_col not in out["meta_tr"].columns:
-        raise ValueError(f"Colonne '{time_col}' absente des meta; impossible de windower la grille/TTC.")
-
-    va_periods = parse_vintage_to_period(out["meta_va"][time_col], freq=freq)
-    end_period = va_periods.max()
-
     if fixed_edges is None:
+        if time_col not in out["meta_va"].columns or time_col not in out["meta_tr"].columns:
+            raise ValueError(f"Colonne '{time_col}' absente des meta; impossible de windower la grille.")
+
+        va_periods = parse_vintage_to_period(out["meta_va"][time_col], freq=freq)
+        end_period = va_periods.max()
+
         mask_tr_grid = window_mask_from_end(out["meta_tr"][time_col], end_period, args.grid_window_years, freq=freq)
         mask_va_grid = window_mask_from_end(out["meta_va"][time_col], end_period, args.grid_window_years, freq=freq)
 
@@ -769,6 +924,7 @@ def main():
         if len(y_grid) == 0:
             raise ValueError("Fenêtre de grille vide. Vérifie vintage/freq et les bornes.")
 
+        # Optionnel : choisir n_buckets automatiquement sous contraintes
         n_buckets = int(args.n_buckets)
         if args.n_buckets_candidates:
             cands = [int(x.strip()) for x in args.n_buckets_candidates.split(",") if x.strip()]
@@ -781,37 +937,40 @@ def main():
                 min_bucket_count=args.min_bucket_count,
                 min_bucket_bad=args.min_bucket_bad,
             )
-            print(f"[N_BUCKETS] choisi automatiquement = {n_buckets} (candidats={cands})", flush=True)
+            print(f"[N_BUCKETS] choisi automatiquement = {n_buckets} (candidats={cands})")
+            args.n_buckets = n_buckets
 
-        edges, stats_grid, mono_grid = create_risk_buckets(scores_grid, y_grid, n_buckets=n_buckets, fixed_edges=None)
-        print(
-            f"\n[GRILLE] window={args.grid_window_years}y | end={end_period} "
-            f"| monotone(grid)={'OK' if mono_grid else 'NON'}",
-            flush=True
-        )
-
-        args.n_buckets = n_buckets
+        edges, stats_grid, mono_grid = create_risk_buckets(scores_grid, y_grid, n_buckets=args.n_buckets, fixed_edges=None)
+        print(f"\n[GRILLE] window={args.grid_window_years}y | end={end_period} | monotone(grid)={'OK' if mono_grid else 'NON'}")
     else:
         edges = fixed_edges
-        print("\n[GRILLE] edges fournis via --risk-buckets-in (grille figée)", flush=True)
+        va_periods = parse_vintage_to_period(out["meta_va"][time_col], freq=freq)
+        end_period = va_periods.max()
+        print("\n[GRILLE] edges fournis via --risk-buckets-in (grille figée)")
 
-    # Stats TRAIN/VAL (full) avec ces edges
+    # Stats TRAIN/VAL full
     _, stats_tr_full, mono_tr = create_risk_buckets(out["score_tr"], out["y_tr"], n_buckets=args.n_buckets, fixed_edges=edges)
     _, stats_va_full, mono_va = create_risk_buckets(out["score_va"], out["y_va"], n_buckets=args.n_buckets, fixed_edges=edges)
 
-    print("\n[MÉTRIQUES]", flush=True)
+    print("\n[MÉTRIQUES]")
     for k, v in out["metrics"].items():
         if isinstance(v, float):
-            print(f"  {k:22s} : {v:.6f}", flush=True)
+            print(f"  {k:22s} : {v:.6f}")
         else:
-            print(f"  {k:22s} : {v}", flush=True)
+            print(f"  {k:22s} : {v}")
 
-    print("\n[MONOTONICITÉ TRAIN] :", "OK" if mono_tr else "NON MONOTONE", flush=True)
-    print("[MONOTONICITÉ VAL]   :", "OK" if mono_va else "NON MONOTONE", flush=True)
+    print("\n[MONOTONICITÉ TRAIN] :", "OK" if mono_tr else "NON MONOTONE")
+    print("[MONOTONICITÉ VAL]   :", "OK" if mono_va else "NON MONOTONE")
 
     # ------------------------------------------------------------------
-    # PD TTC (bucket_stats) : fenêtre ttc-window-years finissant au dernier vintage de validation
+    # PD TTC window
     # ------------------------------------------------------------------
+    if time_col not in out["meta_va"].columns or time_col not in out["meta_tr"].columns:
+        raise ValueError(f"Colonne '{time_col}' absente; impossible de calculer TTC window.")
+
+    va_periods = parse_vintage_to_period(out["meta_va"][time_col], freq=freq)
+    end_period = va_periods.max()
+
     mask_tr_ttc = window_mask_from_end(out["meta_tr"][time_col], end_period, args.ttc_window_years, freq=freq)
     mask_va_ttc = window_mask_from_end(out["meta_va"][time_col], end_period, args.ttc_window_years, freq=freq)
 
@@ -828,14 +987,12 @@ def main():
         fixed_edges=edges
     )
 
-    # Long-run window (train + validation)
     stats_longrun_win = stats_tr_win[["bucket", "count", "bad", "min_score", "max_score"]].merge(
         stats_va_win[["bucket", "count", "bad", "min_score", "max_score"]],
         on="bucket",
         how="outer",
         suffixes=("_tr", "_va")
     )
-
     for col in ["count_tr", "count_va", "bad_tr", "bad_va"]:
         stats_longrun_win[col] = stats_longrun_win[col].fillna(0)
 
@@ -846,7 +1003,10 @@ def main():
     stats_longrun_win["pd"] = stats_longrun_win["bad"] / stats_longrun_win["count"]
     stats_longrun_win = stats_longrun_win[["bucket", "count", "bad", "min_score", "max_score", "pd"]].sort_values("bucket")
 
-    stats_train_for_json = stats_tr_win if args.ttc_mode == "train" else stats_longrun_win
+    if args.ttc_mode == "train":
+        stats_train_for_json = stats_tr_win
+    else:
+        stats_train_for_json = stats_longrun_win
 
     # ------------------------------------------------------------------
     # Save artifacts
@@ -864,10 +1024,8 @@ def main():
     save_json({"edges": edges}, artifacts / "risk_buckets.json")
 
     bucket_stats_payload = {
-        # PD TTC officielle (window, train ou train_val selon ttc_mode)
         "train": stats_train_for_json.to_dict(orient="records"),
 
-        # transparence / debug
         "train_raw_full": stats_tr_full.to_dict(orient="records"),
         "validation_full": stats_va_full.to_dict(orient="records"),
         "train_window": stats_tr_win.to_dict(orient="records"),
@@ -912,7 +1070,7 @@ def main():
 
     train_scored_path = scored_dir / "train_scored.parquet"
     train_scored.to_parquet(train_scored_path, index=False)
-    print(f"✔ train_scored sauvegardé : {train_scored_path}", flush=True)
+    print(f"✔ train_scored sauvegardé : {train_scored_path}")
 
     validation_scored = out["meta_va"].copy()
     validation_scored[args.target] = out["y_va"]
@@ -922,17 +1080,15 @@ def main():
 
     validation_scored_path = scored_dir / "validation_scored.parquet"
     validation_scored.to_parquet(validation_scored_path, index=False)
-    print(f"✔ validation_scored sauvegardé : {validation_scored_path}", flush=True)
+    print(f"✔ validation_scored sauvegardé : {validation_scored_path}")
 
-    print(f"\nMode PD TTC utilisé pour 'train' : {args.ttc_mode}", flush=True)
-    print(
-        f"Fenêtre grille: {args.grid_window_years}y fin={end_period} | "
-        f"Fenêtre TTC: {args.ttc_window_years}y fin={end_period}",
-        flush=True
-    )
+    print(f"\nMode PD TTC utilisé pour 'train' : {args.ttc_mode}")
+    print(f"Fenêtre grille: {args.grid_window_years}y fin={end_period} | Fenêtre TTC: {args.ttc_window_years}y fin={end_period}")
 
     if args.timing:
-        print(timer.summary(), flush=True)
+        print("\n[TIMING] Sections principales :")
+        for k, v in timer.records.items():
+            print(f"  {k:40s} {v:.3f}s")
 
 
 if __name__ == "__main__":
