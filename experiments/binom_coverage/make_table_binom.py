@@ -27,14 +27,14 @@ METHODS = {
 # Scénarios = couples (n, p) + un nom
 # Ajuste librement : l'idée est juste de donner une petite liste de "cas"
 SCENARIOS = [
-    {"scenario": "Baseline",     "n": 100, "p": 0.01},
-    {"scenario": "Low Default",  "n": 100, "p": 0.002},
-    {"scenario": "Small Sample", "n": 50,  "p": 0.01},
-    {"scenario": "Large Sample", "n": 200, "p": 0.01},
+    {"scenario": "Baseline",     "n": 1000, "p": 0.01},
+    {"scenario": "Low Default",  "n": 1000, "p": 0.001},
+    {"scenario": "Small Sample", "n": 100,  "p": 0.01},
+    {"scenario": "Large Sample", "n": 10000, "p": 0.01},
 ]
 
 # Format d'affichage pour la table "papier"
-DECIMALS = 3  # comme ton exemple (0.012) [0.005, 0.018]
+DECIMALS = 6  
 PICK_NEAREST_P = True  # utile si p n'est pas exactement dans la grille
 
 

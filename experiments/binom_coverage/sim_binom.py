@@ -163,8 +163,8 @@ if __name__ == "__main__":
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # Grille commune à tous les n
-    n_simulation = 1000
-    ns = [50, 100, 200]
+    n_simulation = 10_000
+    ns = [50, 100, 1000, 10_000]
     p_values = np.linspace(0.001, 0.1, 300)
     confidence_level = 0.95
 

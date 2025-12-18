@@ -1,4 +1,5 @@
 # experiments/temporal_drift/plot_temporal_drift.py
+from __future__ import annotations
 
 from pathlib import Path
 import pandas as pd
@@ -8,23 +9,23 @@ from experiments.plots.style import (
     finalize_ax,
     save_figure,
     METHOD_STYLES,
+    add_drift_marker,
 )
 
 
 def _fmt_p_hat(p_hat: float) -> str:
-    """
-    Format court et safe pour les noms de fichiers.
-    Ex: 0.01 -> "0p01"
-    """
     s = f"{p_hat:.6g}"
     return s.replace(".", "p")
 
 
+def _maybe_set_integer_xticks(ax, sub_df: pd.DataFrame):
+    # if t looks integer-like, use all unique ticks (clean for short horizons)
+    ts = sorted(sub_df["t"].unique())
+    if len(ts) <= 30:  # avoid overcrowding for long horizons
+        ax.set_xticks(ts)
+
+
 def plot_reject_rate_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
-    """
-    Taux de rejet de H0 : p = p_hat en fonction du temps.
-    Si plusieurs p_hat sont présents, produit un plot par p_hat.
-    """
     if "p_hat" in df.columns:
         p_hats = sorted(df["p_hat"].unique())
     else:
@@ -50,15 +51,16 @@ def plot_reject_rate_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
                 sub["reject_rate"],
                 label=label,
                 color=color,
-                linewidth=1.5,
+                linewidth=2.0,
+                solid_capstyle="round",
+                zorder=3,
             )
 
-        ax.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
-        ax.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
+        add_drift_marker(ax, T0=T0, T=T)
 
         title = "Temporal evolution of rejection rates under drift"
         if p_hat is not None:
-            title += f" (p_hat={p_hat:g})"
+            title += f" (p̂={p_hat:g})"
 
         finalize_ax(
             ax,
@@ -67,12 +69,16 @@ def plot_reject_rate_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
             title=title,
             nominal_level=alpha_nominal,
             nominal_label=f"Nominal level (α = {alpha_nominal:.2f})",
+            add_legend=True,
+            legend_loc="upper left",
         )
+
+        _maybe_set_integer_xticks(ax, sub_df)
 
         if save_dir is not None:
             suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
             out_path = save_dir / f"{prefix}_reject_rate_vs_time{suffix}.png"
-            save_figure(fig, out_path)
+            save_figure(fig, out_path, also_pdf=True)
         else:
             import matplotlib.pyplot as plt
             plt.show()
@@ -80,10 +86,6 @@ def plot_reject_rate_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
 
 
 def plot_coverage_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
-    """
-    Couverture empirique de p_true(t) en fonction du temps.
-    Si plusieurs p_hat sont présents, produit un plot par p_hat.
-    """
     if "p_hat" in df.columns:
         p_hats = sorted(df["p_hat"].unique())
     else:
@@ -109,15 +111,16 @@ def plot_coverage_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
                 sub["coverage"],
                 label=label,
                 color=color,
-                linewidth=1.5,
+                linewidth=2.0,
+                solid_capstyle="round",
+                zorder=3,
             )
 
-        ax.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
-        ax.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
+        add_drift_marker(ax, T0=T0, T=T)
 
         title = "Temporal evolution of coverage under drift"
         if p_hat is not None:
-            title += f" (p_hat={p_hat:g})"
+            title += f" (p̂={p_hat:g})"
 
         finalize_ax(
             ax,
@@ -125,13 +128,17 @@ def plot_coverage_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
             ylabel=r"Coverage of $p(t)$",
             title=title,
             nominal_level=conf,
-            nominal_label=f"Nominal coverage ({conf:.2f})",
+            nominal_label=f"Nominal coverage ({conf:.0%})",
+            add_legend=True,
+            legend_loc="lower left",
         )
+
+        _maybe_set_integer_xticks(ax, sub_df)
 
         if save_dir is not None:
             suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
             out_path = save_dir / f"{prefix}_coverage_vs_time{suffix}.png"
-            save_figure(fig, out_path)
+            save_figure(fig, out_path, also_pdf=True)
         else:
             import matplotlib.pyplot as plt
             plt.show()
@@ -139,13 +146,6 @@ def plot_coverage_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
 
 
 def plot_length_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
-    """
-    Longueur moyenne des intervalles en fonction du temps.
-    Si plusieurs p_hat sont présents, produit un plot par p_hat.
-
-    Remarque: on utilise 'avg_length' pour compat, mais si tu veux
-    passer à 'len_mean', ça marche aussi.
-    """
     if "p_hat" in df.columns:
         p_hats = sorted(df["p_hat"].unique())
     else:
@@ -172,15 +172,16 @@ def plot_length_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
                 sub[length_col],
                 label=label,
                 color=color,
-                linewidth=1.5,
+                linewidth=2.0,
+                solid_capstyle="round",
+                zorder=3,
             )
 
-        ax.axvline(x=T0 + 0.5, color="red", linestyle="--", label="Drift onset")
-        ax.axvspan(T0 + 0.5, T + 0.5, color="red", alpha=0.05)
+        add_drift_marker(ax, T0=T0, T=T)
 
         title = "Temporal evolution of interval lengths under drift"
         if p_hat is not None:
-            title += f" (p_hat={p_hat:g})"
+            title += f" (p̂={p_hat:g})"
 
         finalize_ax(
             ax,
@@ -188,12 +189,16 @@ def plot_length_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
             ylabel="Average interval length",
             title=title,
             nominal_level=None,
+            add_legend=True,
+            legend_loc="upper left",
         )
+
+        _maybe_set_integer_xticks(ax, sub_df)
 
         if save_dir is not None:
             suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
             out_path = save_dir / f"{prefix}_length_vs_time{suffix}.png"
-            save_figure(fig, out_path)
+            save_figure(fig, out_path, also_pdf=True)
         else:
             import matplotlib.pyplot as plt
             plt.show()
@@ -210,7 +215,6 @@ if __name__ == "__main__":
     df = pd.read_csv(df_path)
 
     prefix = "temporal_drift"
-
     plot_reject_rate_vs_time(df, save_dir=figs_dir, prefix=prefix)
     plot_coverage_vs_time(df, save_dir=figs_dir, prefix=prefix)
     plot_length_vs_time(df, save_dir=figs_dir, prefix=prefix)

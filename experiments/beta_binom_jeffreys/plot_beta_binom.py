@@ -1,7 +1,7 @@
 # experiments/beta_binom_jeffreys/plot_beta_binom.py
+from __future__ import annotations
 
 from pathlib import Path
-
 import pandas as pd
 
 from experiments.plots.style import (
@@ -13,18 +13,16 @@ from experiments.plots.style import (
 
 
 def plot_coverage_vs_p_all_methods_all_combinations(
-    df,
-    save_dir=None,
+    df: pd.DataFrame,
+    save_dir: Path | None = None,
     prefix: str = "beta_binom",
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = (0.80, 1.02),
 ):
-    """
-    Pour chaque combinaison (n, rho), trace la probabilité de couverture
-    en fonction de p pour toutes les méthodes, avec le style commun.
-    """
     conf_levels = df["conf_level"].unique()
     if len(conf_levels) != 1:
-        print("Attention: plusieurs niveaux de confiance différents dans df.")
-    conf = conf_levels[0]
+        print("Warning: multiple conf_levels in df; using the first one.")
+    conf = float(conf_levels[0])
 
     ns = sorted(df["n"].unique())
     rhos = sorted(df["rho"].unique())
@@ -53,12 +51,15 @@ def plot_coverage_vs_p_all_methods_all_combinations(
                     y_cov,
                     label=label,
                     color=color,
+                    linewidth=2.0,
+                    solid_capstyle="round",
+                    zorder=3,
                 )
 
-                # Info de debug / résumé dans le terminal : min coverage
-                min_cov = y_cov.min()
-                idx_min = y_cov.argmin()
-                p_at_min = x_p[idx_min]
+                # debug: min coverage
+                min_cov = float(y_cov.min())
+                idx_min = int(y_cov.argmin())
+                p_at_min = float(x_p[idx_min])
                 np_at_min = n * p_at_min
                 print(
                     f"[n={n}, rho={rho}, method={method}] "
@@ -73,13 +74,17 @@ def plot_coverage_vs_p_all_methods_all_combinations(
                 ylabel="Coverage probability",
                 title=f"Coverage vs $p$ (n={n}, rho={rho})",
                 nominal_level=conf,
-                nominal_label="Nominal level",
+                nominal_label=f"Nominal level ({conf:.0%})",
+                xlim=xlim,
+                ylim=ylim,
+                add_legend=True,
+                legend_loc="lower right",
             )
 
             if save_dir is not None:
                 fname = f"{prefix}_coverage_all_methods_n{n}_rho{rho_str}.png"
                 out_path = save_dir / fname
-                save_figure(fig, out_path)
+                save_figure(fig, out_path, also_pdf=True)
             else:
                 import matplotlib.pyplot as plt
                 plt.show()
@@ -99,4 +104,6 @@ if __name__ == "__main__":
         df,
         save_dir=figs_dir,
         prefix="b_b",
+        xlim=None,
+        ylim=(0.80, 1.02),
     )
