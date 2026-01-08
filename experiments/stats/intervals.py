@@ -174,3 +174,40 @@ def in_interval(lb, ub, p_k):
     Retourne 1 si p_k est dans [lb, ub], sinon 0.
     """
     return int(lb <= p_k <= ub)
+
+
+def jeffreys_pvalue_unilateral(n_k, d_k, p0, tail="upper"):
+    """
+    p-value unilatérale sous posterior Jeffreys Beta(d+1/2, n-d+1/2).
+
+    - tail="upper" : p-value = P(p >= p0 | data) = 1 - F(p0)
+      (utile pour tester "sous-estimation" : H1 : p > p0)
+
+    - tail="lower" : p-value = P(p <= p0 | data) = F(p0)
+      (utile pour tester "sur-estimation" : H1 : p < p0)
+
+    Retourne np.nan si non calculable.
+    """
+    if n_k <= 0:
+        return np.nan
+    if d_k < 0 or d_k > n_k:
+        return np.nan
+    if not np.isfinite(p0):
+        return np.nan
+
+    p0 = float(p0)
+    if p0 <= 0.0:
+        return 1.0 if tail == "upper" else 0.0
+    if p0 >= 1.0:
+        return 0.0 if tail == "upper" else 1.0
+
+    a = d_k + 0.5
+    b = (n_k - d_k) + 0.5
+    cdf = beta.cdf(p0, a, b)
+
+    if tail == "upper":
+        return float(1.0 - cdf)
+    elif tail == "lower":
+        return float(cdf)
+    else:
+        raise ValueError("tail must be 'upper' or 'lower'")

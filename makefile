@@ -182,7 +182,7 @@ COEF_STATS      ?= none         # statsmodels | none
 # ----------------------------
 CV_SCHEME       ?= time         # time | stratified
 CAL_SPLIT       ?= time_last    # time_last | stratified
-CAL_SIZE        ?= 0.30         # recommandé: 0.20–0.30 (éviter 0.50)
+CAL_SIZE        ?= 0.40         # recommandé: 0.20–0.30 (éviter 0.50)
 CV_TIME_COL     ?= vintage
 CV_TIME_FREQ    ?= Q            # Q | M
 
