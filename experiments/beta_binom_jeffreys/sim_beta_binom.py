@@ -141,7 +141,7 @@ if __name__ == "__main__":
     np_targets = [0.25, 0.5, 1, 2, 5, 10]
     rhos = [0.0, 0.01, 0.05, 0.10]
     n_sim = 10_000
-
+    conf = 0.95
 
     rows = []
     rng = np.random.default_rng(123)
