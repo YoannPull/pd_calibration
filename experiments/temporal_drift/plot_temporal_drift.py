@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 from experiments.plots.style import (
-    new_figure,
     finalize_ax,
     save_figure,
     METHOD_STYLES,
@@ -13,54 +15,211 @@ from experiments.plots.style import (
 )
 
 
-def _fmt_p_hat(p_hat: float) -> str:
-    s = f"{p_hat:.6g}"
-    return s.replace(".", "p")
+# -------------------------
+# IO
+# -------------------------
+def _load_temporal_drift_df(data_dir: Path) -> pd.DataFrame:
+    combined = data_dir / "temporal_drift_all_scenarios.csv"
+    if combined.exists():
+        return pd.read_csv(combined)
+
+    files = sorted(data_dir.glob("temporal_drift_*.csv"))
+    files = [p for p in files if p.name != "temporal_drift_all_scenarios.csv"]
+    if not files:
+        raise FileNotFoundError(
+            f"No temporal drift CSV found in {data_dir}. "
+            "Expected temporal_drift_all_scenarios.csv or temporal_drift_*.csv"
+        )
+    return pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
 
 
 def _maybe_set_integer_xticks(ax, sub_df: pd.DataFrame):
-    # if t looks integer-like, use all unique ticks (clean for short horizons)
     ts = sorted(sub_df["t"].unique())
-    if len(ts) <= 30:  # avoid overcrowding for long horizons
+    if len(ts) <= 30:
         ax.set_xticks(ts)
 
 
-def plot_reject_rate_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
-    if "p_hat" in df.columns:
-        p_hats = sorted(df["p_hat"].unique())
-    else:
-        p_hats = [None]
+# -------------------------
+# Style helper (match style.py look)
+# -------------------------
+def _apply_axes_style(ax):
+    ax.grid(alpha=0.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
-    for p_hat in p_hats:
-        sub_df = df if p_hat is None else df[df["p_hat"] == p_hat]
+
+# -------------------------
+# Y-lims helpers
+# -------------------------
+def _centered_ylim_around(
+    target: float,
+    series: pd.Series,
+    min_halfspan: float,
+    max_halfspan: float,
+) -> tuple[float, float]:
+    s = series.dropna().astype(float)
+    if s.empty:
+        return (max(0.0, target - min_halfspan), min(1.0, target + min_halfspan))
+
+    max_dev = float((s - target).abs().quantile(0.98))
+    half = max(min_halfspan, min(max_halfspan, max_dev + 0.01))
+    return (max(0.0, target - half), min(1.0, target + half))
+
+
+def _robust_ylim(series: pd.Series, pad: float, lo: float, hi: float) -> tuple[float, float]:
+    s = series.dropna().astype(float)
+    if s.empty:
+        return (lo, hi)
+
+    q1 = float(s.quantile(0.02))
+    q2 = float(s.quantile(0.98))
+    if q1 == q2:
+        q1 = float(s.min())
+        q2 = float(s.max())
+
+    y0 = max(lo, q1 - pad)
+    y1 = min(hi, q2 + pad)
+
+    if y1 - y0 < 1e-6:
+        y0 = max(lo, y0 - 0.01)
+        y1 = min(hi, y1 + 0.01)
+
+    return (y0, y1)
+
+
+# -------------------------
+# Overlap handling (curves superposed)
+# -------------------------
+def _method_label(method: str) -> str:
+    st = METHOD_STYLES.get(method, {})
+    return st.get("label", method)
+
+
+def _short_label(label: str) -> str:
+    # Keep legend/min-panel concise
+    out = label
+    out = out.replace("Jeffreys equal-tailed", "Jeffreys")
+    out = out.replace("Exact Clopper–Pearson", "CP").replace("Exact Clopper-Pearson", "CP")
+    out = out.replace("Normal approximation", "Normal")
+    return out
+
+
+def _group_overlapping_methods(
+    sub_df: pd.DataFrame,
+    ycol: str,
+    xcol: str = "t",
+    atol: float = 1e-12,
+) -> tuple[list[list[str]], dict[str, tuple[np.ndarray, np.ndarray]]]:
+    """
+    Group methods whose (x,y) series are identical up to atol.
+    Returns:
+      - groups: list of lists of method names
+      - series_by_method: dict method -> (x,y) arrays
+    """
+    methods = sorted(sub_df["method"].unique())
+    series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    for m in methods:
+        s = sub_df[sub_df["method"] == m].sort_values(xcol)
+        x = s[xcol].to_numpy(dtype=float)
+        y = s[ycol].to_numpy(dtype=float)
+        series[m] = (x, y)
+
+    groups: list[list[str]] = []
+    used: set[str] = set()
+
+    for m in methods:
+        if m in used:
+            continue
+        x0, y0 = series[m]
+        grp = [m]
+        used.add(m)
+
+        for m2 in methods:
+            if m2 in used:
+                continue
+            x2, y2 = series[m2]
+            # x should be identical (same t-grid). y is compared up to atol.
+            if (
+                len(x2) == len(x0)
+                and np.allclose(x2, x0, rtol=0.0, atol=0.0)
+                and np.allclose(y2, y0, rtol=0.0, atol=atol)
+            ):
+                grp.append(m2)
+                used.add(m2)
+
+        groups.append(grp)
+
+    return groups, series
+
+
+def _format_label_with_overlaps(rep_method: str, group: list[str]) -> str:
+    """
+    Legend label for the representative curve.
+    If multiple methods overlap, we display:
+      "REP (≡ OTHER1, OTHER2)"
+    """
+    rep_label = _method_label(rep_method)
+    others = [m for m in group if m != rep_method]
+    if not others:
+        return rep_label
+
+    other_labels = [_short_label(_method_label(m)) for m in others]
+    return f"{rep_label} (≡ {', '.join(other_labels)})"
+
+
+def _rep_for_group(group: list[str]) -> str:
+    """
+    Choose a representative method for a group.
+    Preference: the first one (sorted already by construction).
+    """
+    return group[0]
+
+
+# -------------------------
+# Plots
+# -------------------------
+def plot_reject_rate_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: str = "temporal_drift"):
+    for scenario in sorted(df["scenario"].unique()):
+        sub_df = df[df["scenario"] == scenario].copy()
+
+        n_vals = sorted(sub_df["n"].unique())
+        if len(n_vals) != 1:
+            raise ValueError(f"Scenario '{scenario}' has multiple n values in data: {n_vals}")
 
         T0 = int(sub_df["T0"].iloc[0])
         T = int(sub_df["T"].iloc[0])
         alpha_nominal = float(sub_df["alpha_nominal"].iloc[0])
+        p_hat = float(sub_df["p_hat"].iloc[0])
+        n = int(sub_df["n"].iloc[0])
 
-        fig, ax = new_figure()
+        fig, ax = plt.subplots(figsize=(10, 6))
+        _apply_axes_style(ax)
 
-        for method in sorted(sub_df["method"].unique()):
-            sub = sub_df[sub_df["method"] == method].sort_values("t")
-            style = METHOD_STYLES.get(method, {})
-            label = style.get("label", method)
-            color = style.get("color", None)
+        # --- group overlaps and plot only one curve per group ---
+        groups, series = _group_overlapping_methods(sub_df, ycol="reject_rate", xcol="t", atol=1e-12)
+        for grp in groups:
+            rep = _rep_for_group(grp)
+            x, y = series[rep]
+
+            st = METHOD_STYLES.get(rep, {})
+            color = st.get("color", None)
+            label = _format_label_with_overlaps(rep, grp)
 
             ax.plot(
-                sub["t"],
-                sub["reject_rate"],
+                x,
+                y,
                 label=label,
                 color=color,
-                linewidth=2.0,
+                linewidth=1.8,
                 solid_capstyle="round",
                 zorder=3,
             )
 
         add_drift_marker(ax, T0=T0, T=T)
 
-        title = "Temporal evolution of rejection rates under drift"
-        if p_hat is not None:
-            title += f" (p̂={p_hat:g})"
+        title = f"Rejection rates under drift — {scenario} (n={n}, p̂={p_hat:g})"
+        ylim_rej = _centered_ylim_around(alpha_nominal, sub_df["reject_rate"], min_halfspan=0.05, max_halfspan=0.25)
 
         finalize_ax(
             ax,
@@ -71,118 +230,68 @@ def plot_reject_rate_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
             nominal_label=f"Nominal level (α = {alpha_nominal:.2f})",
             add_legend=True,
             legend_loc="upper left",
+            xlim=(1, T),
+            ylim=ylim_rej,
         )
 
         _maybe_set_integer_xticks(ax, sub_df)
 
-        if save_dir is not None:
-            suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
-            out_path = save_dir / f"{prefix}_reject_rate_vs_time{suffix}.png"
-            save_figure(fig, out_path, also_pdf=True)
-        else:
-            import matplotlib.pyplot as plt
-            plt.show()
-            plt.close(fig)
-
-
-def plot_coverage_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
-    if "p_hat" in df.columns:
-        p_hats = sorted(df["p_hat"].unique())
-    else:
-        p_hats = [None]
-
-    for p_hat in p_hats:
-        sub_df = df if p_hat is None else df[df["p_hat"] == p_hat]
-
-        T0 = int(sub_df["T0"].iloc[0])
-        T = int(sub_df["T"].iloc[0])
-        conf = float(sub_df["conf_level"].iloc[0])
-
-        fig, ax = new_figure()
-
-        for method in sorted(sub_df["method"].unique()):
-            sub = sub_df[sub_df["method"] == method].sort_values("t")
-            style = METHOD_STYLES.get(method, {})
-            label = style.get("label", method)
-            color = style.get("color", None)
-
-            ax.plot(
-                sub["t"],
-                sub["coverage"],
-                label=label,
-                color=color,
-                linewidth=2.0,
-                solid_capstyle="round",
-                zorder=3,
-            )
-
-        add_drift_marker(ax, T0=T0, T=T)
-
-        title = "Temporal evolution of coverage under drift"
-        if p_hat is not None:
-            title += f" (p̂={p_hat:g})"
-
-        finalize_ax(
-            ax,
-            xlabel="Time period t",
-            ylabel=r"Coverage of $p(t)$",
-            title=title,
-            nominal_level=conf,
-            nominal_label=f"Nominal coverage ({conf:.0%})",
-            add_legend=True,
-            legend_loc="lower left",
+        slug = (
+            str(sub_df["scenario_slug"].iloc[0])
+            if "scenario_slug" in sub_df.columns
+            else scenario.lower().replace(" ", "_")
         )
-
-        _maybe_set_integer_xticks(ax, sub_df)
-
-        if save_dir is not None:
-            suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
-            out_path = save_dir / f"{prefix}_coverage_vs_time{suffix}.png"
-            save_figure(fig, out_path, also_pdf=True)
-        else:
-            import matplotlib.pyplot as plt
-            plt.show()
-            plt.close(fig)
+        save_figure(fig, save_dir / f"{prefix}_{slug}_reject_rate_vs_time.png", also_pdf=False)
 
 
-def plot_length_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
-    if "p_hat" in df.columns:
-        p_hats = sorted(df["p_hat"].unique())
-    else:
-        p_hats = [None]
-
+def plot_length_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: str = "temporal_drift"):
     length_col = "avg_length" if "avg_length" in df.columns else "len_mean"
 
-    for p_hat in p_hats:
-        sub_df = df if p_hat is None else df[df["p_hat"] == p_hat]
+    for scenario in sorted(df["scenario"].unique()):
+        sub_df = df[df["scenario"] == scenario].copy()
+
+        n_vals = sorted(sub_df["n"].unique())
+        if len(n_vals) != 1:
+            raise ValueError(f"Scenario '{scenario}' has multiple n values in data: {n_vals}")
 
         T0 = int(sub_df["T0"].iloc[0])
         T = int(sub_df["T"].iloc[0])
+        p_hat = float(sub_df["p_hat"].iloc[0])
+        n = int(sub_df["n"].iloc[0])
 
-        fig, ax = new_figure()
+        fig, ax = plt.subplots(figsize=(10, 6))
+        _apply_axes_style(ax)
 
-        for method in sorted(sub_df["method"].unique()):
-            sub = sub_df[sub_df["method"] == method].sort_values("t")
-            style = METHOD_STYLES.get(method, {})
-            label = style.get("label", method)
-            color = style.get("color", None)
+        # --- group overlaps ---
+        groups, series = _group_overlapping_methods(sub_df, ycol=length_col, xcol="t", atol=1e-12)
+        for grp in groups:
+            rep = _rep_for_group(grp)
+            x, y = series[rep]
+
+            st = METHOD_STYLES.get(rep, {})
+            color = st.get("color", None)
+            label = _format_label_with_overlaps(rep, grp)
 
             ax.plot(
-                sub["t"],
-                sub[length_col],
+                x,
+                y,
                 label=label,
                 color=color,
-                linewidth=2.0,
+                linewidth=1.8,
                 solid_capstyle="round",
                 zorder=3,
             )
 
         add_drift_marker(ax, T0=T0, T=T)
 
-        title = "Temporal evolution of interval lengths under drift"
-        if p_hat is not None:
-            title += f" (p̂={p_hat:g})"
+        s_len = sub_df[length_col].dropna().astype(float)
+        ylim_len = None
+        if not s_len.empty:
+            pad = 0.02 * float(s_len.quantile(0.98))
+            hi = float(s_len.quantile(0.995)) * 1.10 if float(s_len.quantile(0.995)) > 0 else 1.0
+            ylim_len = _robust_ylim(s_len, pad=pad, lo=0.0, hi=hi)
 
+        title = f"Interval length under drift — {scenario} (n={n}, p̂={p_hat:g})"
         finalize_ax(
             ax,
             xlabel="Time period t",
@@ -191,30 +300,164 @@ def plot_length_vs_time(df, save_dir=None, prefix: str = "temporal_drift"):
             nominal_level=None,
             add_legend=True,
             legend_loc="upper left",
+            xlim=(1, T),
+            ylim=ylim_len,
         )
 
         _maybe_set_integer_xticks(ax, sub_df)
 
-        if save_dir is not None:
-            suffix = "" if p_hat is None else f"_phat{_fmt_p_hat(float(p_hat))}"
-            out_path = save_dir / f"{prefix}_length_vs_time{suffix}.png"
-            save_figure(fig, out_path, also_pdf=True)
-        else:
-            import matplotlib.pyplot as plt
-            plt.show()
-            plt.close(fig)
+        slug = (
+            str(sub_df["scenario_slug"].iloc[0])
+            if "scenario_slug" in sub_df.columns
+            else scenario.lower().replace(" ", "_")
+        )
+        save_figure(fig, save_dir / f"{prefix}_{slug}_length_vs_time.png", also_pdf=False)
 
 
+def plot_coverage_vs_time_by_scenario_with_min_scatter(
+    df: pd.DataFrame,
+    save_dir: Path,
+    prefix: str = "temporal_drift",
+):
+    """
+    Main panel: zoomed coverage vs time + drift marker (NO arrow annotations).
+    Bottom panel: scatter of (t*, min coverage), colored by method.
+    Overlap-aware: if two methods produce identical curves, we plot one and label equivalence.
+    """
+    for scenario in sorted(df["scenario"].unique()):
+        sub_df = df[df["scenario"] == scenario].copy()
+
+        n_vals = sorted(sub_df["n"].unique())
+        if len(n_vals) != 1:
+            raise ValueError(f"Scenario '{scenario}' has multiple n values in data: {n_vals}")
+
+        T0 = int(sub_df["T0"].iloc[0])
+        T = int(sub_df["T"].iloc[0])
+        conf = float(sub_df["conf_level"].iloc[0])
+        p_hat = float(sub_df["p_hat"].iloc[0])
+        n = int(sub_df["n"].iloc[0])
+
+        fig, (ax, ax_min) = plt.subplots(
+            nrows=2,
+            figsize=(10, 7.2),
+            gridspec_kw={"height_ratios": [4.0, 1.4], "hspace": 0.06},
+        )
+        _apply_axes_style(ax)
+        _apply_axes_style(ax_min)
+
+        # Main axis zoom
+        ylim_cov = _centered_ylim_around(
+            target=conf,
+            series=sub_df["coverage"],
+            min_halfspan=0.06,
+            max_halfspan=0.20,
+        )
+
+        # --- group overlaps and plot only one curve per group ---
+        groups, series = _group_overlapping_methods(sub_df, ycol="coverage", xcol="t", atol=1e-12)
+
+        pts = []  # (min_t, min_y, color, short_label)
+        for grp in groups:
+            rep = _rep_for_group(grp)
+            t, y = series[rep]
+
+            st = METHOD_STYLES.get(rep, {})
+            color = st.get("color", None)
+            label = _format_label_with_overlaps(rep, grp)
+
+            ax.plot(
+                t,
+                y,
+                label=label,
+                color=color,
+                linewidth=1.8,
+                solid_capstyle="round",
+                zorder=3,
+            )
+
+            idx_min = int(np.argmin(y))
+            min_t = float(t[idx_min])
+            min_y = float(y[idx_min])
+
+            # Bottom annotation: keep short, but still signal overlaps
+            rep_short = _short_label(_method_label(rep))
+            if len(grp) > 1:
+                other_short = [_short_label(_method_label(m)) for m in grp[1:]]
+                rep_short = f"{rep_short}≡{'+'.join(other_short)}"
+
+            pts.append((min_t, min_y, color, rep_short))
+
+        add_drift_marker(ax, T0=T0, T=T)
+
+        title = f"Coverage under drift — {scenario} (n={n}, p̂={p_hat:g})"
+        finalize_ax(
+            ax,
+            xlabel="",  # x-label on bottom panel
+            ylabel=r"Coverage of $p(t)$",
+            title=title,
+            nominal_level=conf,
+            nominal_label=f"Nominal coverage ({conf:.0%})",
+            add_legend=True,
+            legend_loc="lower left",
+            xlim=(1, T),
+            ylim=ylim_cov,
+        )
+        _maybe_set_integer_xticks(ax, sub_df)
+        ax.tick_params(labelbottom=False)
+
+        # ---- Bottom panel: (t*, min) colored by method ----
+        for (tt, yy, cc, short) in pts:
+            ax_min.scatter([tt], [yy], s=75, zorder=3, color=cc)
+            ax_min.annotate(
+                short,
+                (tt, yy),
+                textcoords="offset points",
+                xytext=(0, 8),
+                ha="center",
+                fontsize=9,
+            )
+
+        # Nominal line + drift onset marker
+        ax_min.axhline(conf, color="black", linestyle="--", linewidth=1.2, alpha=0.8)
+        onset = T0 + 0.5
+        ax_min.axvline(x=onset, color="black", alpha=0.6, linestyle=(0, (3, 3)), linewidth=1.0)
+
+        mins = np.array([p[1] for p in pts], dtype=float)
+        y0 = max(0.0, float(mins.min()) - 0.04)
+        y1 = min(1.0, float(max(conf, mins.max())) + 0.04)
+        if y1 - y0 < 0.14:
+            y0 = max(0.0, y0 - 0.06)
+            y1 = min(1.0, y1 + 0.06)
+
+        ax_min.set_xlim(1, T)
+        ax_min.set_ylim(y0, y1)
+
+        ax_min.set_xlabel("Time period t", fontsize=14)
+        ax_min.set_ylabel("Min coverage", fontsize=12)
+        ax_min.grid(alpha=0.18)
+
+        _maybe_set_integer_xticks(ax_min, sub_df)
+
+        slug = (
+            str(sub_df["scenario_slug"].iloc[0])
+            if "scenario_slug" in sub_df.columns
+            else scenario.lower().replace(" ", "_")
+        )
+        save_figure(fig, save_dir / f"{prefix}_{slug}_coverage_vs_time.png", also_pdf=False)
+
+
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir / "data"
     figs_dir = base_dir / "figs"
     figs_dir.mkdir(parents=True, exist_ok=True)
 
-    df_path = data_dir / "temporal_drift_results.csv"
-    df = pd.read_csv(df_path)
+    df = _load_temporal_drift_df(data_dir)
 
     prefix = "temporal_drift"
-    plot_reject_rate_vs_time(df, save_dir=figs_dir, prefix=prefix)
-    plot_coverage_vs_time(df, save_dir=figs_dir, prefix=prefix)
-    plot_length_vs_time(df, save_dir=figs_dir, prefix=prefix)
+    plot_reject_rate_vs_time_by_scenario(df, save_dir=figs_dir, prefix=prefix)
+    plot_coverage_vs_time_by_scenario_with_min_scatter(df, save_dir=figs_dir, prefix=prefix)
+    plot_length_vs_time_by_scenario(df, save_dir=figs_dir, prefix=prefix)
