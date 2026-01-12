@@ -1,0 +1,32 @@
+📂 projet_data/
+│-- 📂 data/                  # Contient les jeux de données bruts et transformés
+│   │-- raw/                  # Données brutes (originales, non modifiées)
+│   │-- processed/             # Données nettoyées et transformées
+│
+│-- 📂 notebooks/              # Contient les notebooks exploratoires
+│   │-- 01_exploration.ipynb   # Analyse descriptive des données
+│   │-- 02_preprocessing.ipynb # Nettoyage et transformation
+│   │-- 03_modélisation.ipynb  # Développement des modèles
+│   │-- 04_évaluation.ipynb    # Évaluation des modèles
+│
+│-- 📂 src/                    # Scripts de traitement et de modélisation
+│   │-- data_processing.py     # Code de nettoyage et transformation des données
+│   │-- model_training.py      # Code d'entraînement des modèles
+│   │-- model_evaluation.py    # Code d’évaluation des performances
+│   │-- inference.py           # Code pour appliquer les modèles sur de nouvelles données
+│
+│-- 📂 models/                 # Contient les modèles sauvegardés
+│   │-- model_v1.pkl          # Modèle entraîné version 1
+│   │-- model_v2.pkl          # Modèle entraîné version 2
+│
+│-- 📂 reports/                # Contient les rapports et visualisations
+│   │-- figures/               # Graphiques et visualisations
+│   │-- summary_report.pdf     # Rapport récapitulatif du projet
+│
+│-- 📂 logs/                   # Fichiers de logs des expérimentations
+│   │-- training_logs.txt      # Logs des entraînements de modèles
+│   │-- preprocessing_logs.txt # Logs du nettoyage des données
+│
+│-- README.md                  # Présentation du projet et des fichiers
+│-- requirements.txt           # Liste des dépendances Python
+│-- config.yaml                # Fichier de configuration des paramètres du projet
