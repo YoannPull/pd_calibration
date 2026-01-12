@@ -1,16 +1,16 @@
+# experiments/beta_binom_jeffreys/make_table_beta_binom.py
 # -*- coding: utf-8 -*-
 """
-Build compact scenario tables for the Beta–Binomial robustness experiment.
+Build a paper-ready LaTeX table for the Beta–Binomial robustness experiment
+(fixed (n, p_true) scenarios, varying clustering levels).
 
-- Reads:   data/beta_binom_results.csv
-- Writes: tables/beta_binom_scenarios_long.csv
-          tables/beta_binom_scenarios_table.csv
+Reads:
+  - data/beta_binom_results_scenarios.csv if present
+  - else data/beta_binom_results.csv filtered to design=="scenarios" (if column exists)
 
-Enhancements vs the draft:
-- Adds Monte Carlo standard error for coverage: coverage_se
-- Adds +/- 1.96*SE bands: coverage_ci_lo/coverage_ci_hi
-- Also exports SD (sqrt(var)) for bounds/length: lb_sd, ub_sd, len_sd
-- Robust column fallbacks (reject rate, length column names)
+Writes:
+  - tables/beta_binom_rho_table.tex
+  - tables/beta_binom_rho_table_tidy.csv
 """
 
 from __future__ import annotations
@@ -21,46 +21,26 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------
-# Labels (as they appear in beta_binom_results.csv)
-# ---------------------------------------------------------------------
+METHOD_ORDER: List[str] = ["jeffreys", "cp", "normal"]
 METHOD_LABELS: Dict[str, str] = {
     "jeffreys": "Jeffreys",
-    "cp": "Clopper–Pearson",
-    "normal": "Normal Approximation",
+    "cp": "Clopper--Pearson",
+    "normal": "Normal approximation",
 }
 
-# ---------------------------------------------------------------------
-# Scenarios (n, np_target, rho)
-# Here we keep a minimal robustness design: i.i.d. vs clustered, baseline vs low-default.
-# ---------------------------------------------------------------------
-SCENARIOS: List[dict] = [
-    {"scenario": "Baseline",                "n": 1000, "np_target": 10.0, "rho": 0.00},  # p=0.01
-    {"scenario": "Baseline (clustered)",    "n": 1000, "np_target": 10.0, "rho": 0.05},  # p=0.01
-    {"scenario": "Low Default",             "n": 1000, "np_target": 1.0,  "rho": 0.00},  # p=0.001
-    {"scenario": "Low Default (clustered)", "n": 1000, "np_target": 1.0,  "rho": 0.05},  # p=0.001
+CLUSTER_LEVELS: List[Tuple[str, float]] = [
+    ("i.i.d.", 0.00),
+    ("Mild", 0.01),
+    ("Moderate", 0.05),
+    ("Severe", 0.10),
+]
+
+SCENARIOS: List[Dict[str, float | str]] = [
+    {"scenario": "Baseline", "n": 1000, "p_true": 0.01},
+    {"scenario": "Low default", "n": 1000, "p_true": 0.001},
 ]
 
 DECIMALS = 3
-Z_95 = 1.96
-
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def _fmt_interval(len_mean: float, lb_mean: float, ub_mean: float) -> str:
-    return (
-        f"({len_mean:.{DECIMALS}f}) "
-        f"[{lb_mean:.{DECIMALS}f}, {ub_mean:.{DECIMALS}f}]"
-    )
-
-
-def _get_col(df: pd.DataFrame, primary: str, fallback: str) -> str:
-    if primary in df.columns:
-        return primary
-    if fallback in df.columns:
-        return fallback
-    raise KeyError(f"Missing both '{primary}' and '{fallback}' in results CSV.")
 
 
 def _get_first_existing(df: pd.DataFrame, candidates: List[str]) -> str:
@@ -79,177 +59,180 @@ def _require_cols(df: pd.DataFrame, cols: List[str], context: str = "") -> None:
         raise KeyError(msg)
 
 
-def _mc_se_coverage(cov: float, n_sim: int) -> float:
-    # Binomial Monte Carlo SE for a proportion estimate
-    if n_sim <= 0:
-        return float("nan")
-    cov = float(np.clip(cov, 0.0, 1.0))
-    return float(np.sqrt(cov * (1.0 - cov) / n_sim))
+def _closest_value(target: float, values: np.ndarray) -> float:
+    return float(values[np.argmin(np.abs(values - target))])
 
 
-# ---------------------------------------------------------------------
-# Core: build long + wide tables
-# ---------------------------------------------------------------------
-def build_tables(df: pd.DataFrame, scenarios: List[dict]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # Allow backward compatibility
+def _fmt(x: float, d: int = DECIMALS) -> str:
+    return f"{x:.{d}f}"
+
+
+def _cell(lb: float, ub: float, L: float, sd_lb: float, sd_ub: float) -> str:
+    return (
+        r"\makecell{"
+        + rf"$[{_fmt(lb)},\,{_fmt(ub)}]$\\"
+        + rf"\footnotesize $L={_fmt(L)}$\\"
+        + rf"\footnotesize $\sigma_{{LB}}={_fmt(sd_lb)}$, $\sigma_{{UB}}={_fmt(sd_ub)}$"
+        + "}"
+    )
+
+
+def _latex_escape(s: str) -> str:
+    return s.replace("&", r"\&")
+
+
+def build_tidy(df: pd.DataFrame) -> pd.DataFrame:
+    _require_cols(df, ["n", "p_true", "rho", "method", "lb_mean", "ub_mean"])
+
     len_col = _get_first_existing(df, ["len_mean", "avg_length", "length_mean", "interval_len_mean"])
-    reject_col = _get_first_existing(df, ["reject_star_rate", "reject_rate", "rejection_rate"])
 
-    # Required base columns
-    _require_cols(
-        df,
-        ["n", "np_target", "rho", "p_true", "conf_level", "n_sim", "method", "coverage"],
-        context="Check sim_beta_binom.py output schema.",
+    has_sd = ("lb_sd" in df.columns) and ("ub_sd" in df.columns)
+    if not has_sd:
+        _require_cols(df, ["lb_var", "ub_var"], context="Need lb_sd/ub_sd or lb_var/ub_var.")
+        df = df.copy()
+        df["lb_sd"] = np.sqrt(np.maximum(df["lb_var"].astype(float), 0.0))
+        df["ub_sd"] = np.sqrt(np.maximum(df["ub_var"].astype(float), 0.0))
+
+    out = df.copy()
+    out["n"] = out["n"].astype(int)
+    out["p_true"] = out["p_true"].astype(float)
+    out["rho"] = out["rho"].astype(float)
+    out["method"] = out["method"].astype(str)
+    out["lb_mean"] = out["lb_mean"].astype(float)
+    out["ub_mean"] = out["ub_mean"].astype(float)
+    out["len_mean"] = out[len_col].astype(float)
+    out["lb_sd"] = out["lb_sd"].astype(float)
+    out["ub_sd"] = out["ub_sd"].astype(float)
+
+    keep = ["n", "p_true", "rho", "method", "lb_mean", "ub_mean", "len_mean", "lb_sd", "ub_sd"]
+    for extra in ["conf_level", "n_sim", "scenario", "design"]:
+        if extra in out.columns:
+            keep.append(extra)
+    return out[keep]
+
+
+def emit_latex_table(tidy: pd.DataFrame, out_path: Path) -> None:
+    conf = None
+    if "conf_level" in tidy.columns:
+        confs = tidy["conf_level"].dropna().unique()
+        if len(confs) == 1:
+            conf = float(confs[0])
+    cap_level = f"{int(round(conf*100))}\\%" if conf is not None else "95\\%"
+
+    avail_rhos = np.sort(tidy["rho"].unique())
+
+    lines: List[str] = []
+    lines.append(r"% Requires: \usepackage{booktabs}, \usepackage{threeparttable}, \usepackage{makecell}")
+    lines.append(r"\begin{table}[!htbp]")
+    lines.append(r"  \centering")
+    lines.append(r"  \begin{threeparttable}")
+    lines.append(
+        r"  \caption{Beta--Binomial robustness: average interval bounds, lengths, and bound variability ("
+        + cap_level
+        + r" level)}"
     )
+    lines.append(r"  \label{tab:beta_binom_rho}")
+    lines.append(r"  \setlength{\tabcolsep}{5pt}")
+    lines.append(r"  \renewcommand{\arraystretch}{1.15}")
+    lines.append(r"  \small")
 
-    # Required bound/length dispersion columns for SD/Var reporting
-    _require_cols(
-        df,
-        ["lb_mean", "ub_mean", "lb_var", "ub_var", "len_var"],
-        context="Did you update sim_beta_binom.py to store bound means/vars?",
+    col_spec = "l" + "c" * len(CLUSTER_LEVELS)
+    lines.append(rf"  \begin{{tabular}}{{{col_spec}}}")
+    lines.append(r"    \toprule")
+
+    hdr = "    \\textbf{Method}"
+    for lab, _ in CLUSTER_LEVELS:
+        hdr += rf" & \\textbf{{{_latex_escape(lab)}}}"
+    hdr += r" \\"
+    lines.append(hdr)
+    lines.append(r"    \midrule")
+
+    for s_idx, sc in enumerate(SCENARIOS):
+        sc_name = str(sc["scenario"])
+        n0 = int(sc["n"])
+        p0 = float(sc["p_true"])
+
+        lines.append(rf"    \multicolumn{{{1+len(CLUSTER_LEVELS)}}}{{l}}{{\textit{{{_latex_escape(sc_name)}}}}} \\")
+        lines.append(r"    \addlinespace[2pt]")
+
+        sub_sc = tidy[(tidy["n"] == n0) & (np.isclose(tidy["p_true"], p0))].copy()
+        if sub_sc.empty:
+            raise ValueError(f"No data for scenario {sc_name} (n={n0}, p_true={p0})")
+
+        for m in METHOD_ORDER:
+            tmp_m = sub_sc[sub_sc["method"] == m].copy()
+            if tmp_m.empty:
+                raise ValueError(f"Missing method='{m}' for scenario {sc_name}")
+
+            row = rf"    {METHOD_LABELS.get(m, m)}"
+            for _, rho_t in CLUSTER_LEVELS:
+                rho_use = _closest_value(rho_t, avail_rhos)
+                tmp = tmp_m[np.isclose(tmp_m["rho"], rho_use)].copy()
+                if tmp.empty:
+                    raise ValueError(f"Missing rho={rho_t} for scenario={sc_name}, method={m}")
+                r0 = tmp.iloc[0]
+                row += " & " + _cell(
+                    lb=float(r0["lb_mean"]),
+                    ub=float(r0["ub_mean"]),
+                    L=float(r0["len_mean"]),
+                    sd_lb=float(r0["lb_sd"]),
+                    sd_ub=float(r0["ub_sd"]),
+                )
+            row += r" \\"
+            lines.append(row)
+
+        if s_idx < len(SCENARIOS) - 1:
+            lines.append(r"    \addlinespace[6pt]")
+
+    lines.append(r"    \bottomrule")
+    lines.append(r"  \end{tabular}")
+
+    lines.append(r"  \begin{tablenotes}[flushleft]")
+    lines.append(r"    \footnotesize")
+    lines.append(
+        r"    \item \textbf{Notes:} Each cell reports Monte Carlo averages of interval bounds "
+        r"$[\overline{\mathrm{LB}},\overline{\mathrm{UB}}]$, the mean length "
+        r"$L=\overline{(\mathrm{UB}-\mathrm{LB})}$, and Monte Carlo standard deviations "
+        r"$(\sigma_{LB},\sigma_{UB})$ of the bounds across replications. "
+        r"Clustering levels correspond to increasing over-dispersion (parameter values are stated in the main text)."
     )
+    lines.append(r"  \end{tablenotes}")
+    lines.append(r"  \end{threeparttable}")
+    lines.append(r"\end{table}")
+    lines.append("")
 
-    long_rows: List[dict] = []
-
-    for sc in scenarios:
-        sub = df[
-            (df["n"] == sc["n"])
-            & (np.isclose(df["np_target"], sc["np_target"]))
-            & (np.isclose(df["rho"], sc["rho"]))
-        ].copy()
-
-        if sub.empty:
-            raise ValueError(
-                f"No rows found for scenario={sc}. "
-                f"Available n: {sorted(df['n'].unique())}, "
-                f"np_target: {sorted(df['np_target'].unique())[:10]}..., "
-                f"rho: {sorted(df['rho'].unique())}"
-            )
-
-        for method in sorted(sub["method"].unique()):
-            if method not in METHOD_LABELS:
-                continue
-
-            row = sub[sub["method"] == method].iloc[0]
-
-            coverage = float(row["coverage"])
-            n_sim = int(row["n_sim"])
-            coverage_se = _mc_se_coverage(coverage, n_sim)
-
-            lb_var = float(row["lb_var"])
-            ub_var = float(row["ub_var"])
-            len_var = float(row["len_var"])
-
-            # guard tiny negative variances from numerical rounding
-            lb_sd = float(np.sqrt(max(lb_var, 0.0)))
-            ub_sd = float(np.sqrt(max(ub_var, 0.0)))
-            len_sd = float(np.sqrt(max(len_var, 0.0)))
-
-            ci_lo = float(np.clip(coverage - Z_95 * coverage_se, 0.0, 1.0))
-            ci_hi = float(np.clip(coverage + Z_95 * coverage_se, 0.0, 1.0))
-
-            long_rows.append(
-                {
-                    "scenario": sc["scenario"],
-                    "n": int(row["n"]),
-                    "np_target": float(row["np_target"]),
-                    "p_true": float(row["p_true"]),
-                    "rho": float(row["rho"]),
-                    "conf_level": float(row["conf_level"]),
-                    "n_sim": n_sim,
-                    "method": METHOD_LABELS[method],
-                    "coverage": coverage,
-                    "coverage_se": coverage_se,
-                    "coverage_ci_lo": ci_lo,
-                    "coverage_ci_hi": ci_hi,
-                    "reject_rate": float(row[reject_col]),
-                    "lb_mean": float(row["lb_mean"]),
-                    "ub_mean": float(row["ub_mean"]),
-                    "lb_var": lb_var,
-                    "ub_var": ub_var,
-                    "len_mean": float(row[len_col]),
-                    "len_var": len_var,
-                    "lb_sd": lb_sd,
-                    "ub_sd": ub_sd,
-                    "len_sd": len_sd,
-                }
-            )
-
-    df_long = pd.DataFrame(long_rows)
-
-    # Wide table for paper / export
-    base_cols = ["scenario", "n", "np_target", "p_true", "rho", "conf_level", "n_sim"]
-    wide = (
-        df_long[base_cols]
-        .drop_duplicates()
-        .sort_values(["scenario", "n", "rho"])
-        .copy()
-    )
-
-    # Merge method-specific blocks
-    for method_label in sorted(df_long["method"].unique()):
-        subm = df_long[df_long["method"] == method_label].copy()
-        subm["interval"] = subm.apply(
-            lambda r: _fmt_interval(r["len_mean"], r["lb_mean"], r["ub_mean"]), axis=1
-        )
-
-        # Keep compact but informative: interval, coverage, MC SE, reject_rate, and SD of length (optional)
-        keep = base_cols + [
-            "interval",
-            "coverage",
-            "coverage_se",
-            "coverage_ci_lo",
-            "coverage_ci_hi",
-            "reject_rate",
-            "lb_sd",
-            "ub_sd",
-            "len_sd",
-        ]
-
-        subm = subm[keep].rename(
-            columns={
-                "interval": f"{method_label}",
-                "coverage": f"{method_label}__coverage",
-                "coverage_se": f"{method_label}__coverage_se",
-                "coverage_ci_lo": f"{method_label}__coverage_ci_lo",
-                "coverage_ci_hi": f"{method_label}__coverage_ci_hi",
-                "reject_rate": f"{method_label}__reject_rate",
-                "lb_sd": f"{method_label}__lb_sd",
-                "ub_sd": f"{method_label}__ub_sd",
-                "len_sd": f"{method_label}__len_sd",
-            }
-        )
-
-        wide = wide.merge(subm, on=base_cols, how="left")
-
-    return df_long, wide
+    out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-# ---------------------------------------------------------------------
-# CLI entrypoint
-# ---------------------------------------------------------------------
 def main() -> None:
     base_dir = Path(__file__).resolve().parent
     data_dir = base_dir / "data"
     out_dir = base_dir / "tables"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df_path = data_dir / "beta_binom_results.csv"
-    if not df_path.exists():
-        raise FileNotFoundError(f"Missing input CSV: {df_path}")
+    # Prefer scenarios-only file to avoid any ambiguity
+    scen_path = data_dir / "beta_binom_results_scenarios.csv"
+    combined_path = data_dir / "beta_binom_results.csv"
 
-    df = pd.read_csv(df_path)
+    if scen_path.exists():
+        df = pd.read_csv(scen_path)
+    elif combined_path.exists():
+        df = pd.read_csv(combined_path)
+        if "design" in df.columns:
+            df = df[df["design"] == "scenarios"].copy()
+    else:
+        raise FileNotFoundError(f"Missing input CSV in {data_dir}")
 
-    df_long, df_wide = build_tables(df, SCENARIOS)
+    tidy = build_tidy(df)
 
-    out_long = out_dir / "beta_binom_scenarios_long.csv"
-    out_wide = out_dir / "beta_binom_scenarios_table.csv"
+    tidy_out = out_dir / "beta_binom_rho_table_tidy.csv"
+    tidy.to_csv(tidy_out, index=False)
 
-    df_long.to_csv(out_long, index=False)
-    df_wide.to_csv(out_wide, index=False)
+    tex_out = out_dir / "beta_binom_rho_table.tex"
+    emit_latex_table(tidy, tex_out)
 
-    print(f"Saved: {out_long}")
-    print(f"Saved: {out_wide}")
+    print(f"[OK] Saved tidy CSV: {tidy_out}")
+    print(f"[OK] Saved LaTeX table: {tex_out}")
 
 
 if __name__ == "__main__":
