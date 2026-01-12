@@ -56,16 +56,6 @@ def simulate_binomial_coverage_for_n(
       len_mean_*, len_var_*.
     """
 
-    # Méthodes et colonnes de sortie (noms courts et stables)
-    methods_cols = {
-        "jeff": "jeffreys_equal_tailed",
-        "exact": "clopper_pearson_equal_tailed",
-        "approx": "normal_equal_tailed",
-        "ecb": "jeffreys_ecb_upper",
-        "exact_unil": "clopper_pearson_upper",
-        "approx_unil": "normal_upper",
-    }
-
     # Stockage par colonne
     out = {
         "n": [],
@@ -81,7 +71,7 @@ def simulate_binomial_coverage_for_n(
     }
 
     # Ajout des colonnes de stats pour chaque méthode
-    for key in methods_cols.keys():
+    for key in ["jeff", "exact", "approx", "ecb", "exact_unil", "approx_unil"]:
         out[f"lb_mean_{key}"] = []
         out[f"ub_mean_{key}"] = []
         out[f"lb_var_{key}"] = []
@@ -92,24 +82,40 @@ def simulate_binomial_coverage_for_n(
     for p in tqdm(p_values, desc=f"Binomial coverage (n={n})"):
         binomial_samples = rng.binomial(n, p, size=n_simulation)
 
-        # --- Intervalles (vectorisés via compréhension -> arrays) ---
-        # Bilatéraux
-        lb_exact_cp, ub_exact_cp = zip(*[exact_cp(n, d_k, confidence_level) for d_k in binomial_samples])
-        lb_approx, ub_approx = zip(*[approx_normal(n, d_k, confidence_level) for d_k in binomial_samples])
-        lb_jeff, ub_jeff = zip(*[jeffreys_alpha2(n, d_k, confidence_level) for d_k in binomial_samples])
+        # --- Intervalles (bilatéraux) ---
+        lb_exact_cp, ub_exact_cp = zip(
+            *[exact_cp(n, d_k, confidence_level) for d_k in binomial_samples]
+        )
+        lb_approx, ub_approx = zip(
+            *[approx_normal(n, d_k, confidence_level) for d_k in binomial_samples]
+        )
+        lb_jeff, ub_jeff = zip(
+            *[jeffreys_alpha2(n, d_k, confidence_level) for d_k in binomial_samples]
+        )
 
-        # Unilatéraux (upper)
-        lb_exact_u, ub_exact_u = zip(*[
-            exact_cp_unilateral(n_k=n, d_k=d_k, confidence_level=confidence_level, tail="upper")
-            for d_k in binomial_samples
-        ])
-        lb_approx_u, ub_approx_u = zip(*[
-            approx_normal_unilateral(n_k=n, d_k=d_k, confidence_level=confidence_level, tail="upper")
-            for d_k in binomial_samples
-        ])
+        # --- Unilatéraux (upper) ---
+        lb_exact_u, ub_exact_u = zip(
+            *[
+                exact_cp_unilateral(
+                    n_k=n, d_k=d_k, confidence_level=confidence_level, tail="upper"
+                )
+                for d_k in binomial_samples
+            ]
+        )
+        lb_approx_u, ub_approx_u = zip(
+            *[
+                approx_normal_unilateral(
+                    n_k=n, d_k=d_k, confidence_level=confidence_level, tail="upper"
+                )
+                for d_k in binomial_samples
+            ]
+        )
 
-        # ECB: upper uniquement -> on prend LB=0
-        ub_ecb = np.array([jeffreys_ecb(n, d_k, confidence_level) for d_k in binomial_samples], dtype=float)
+        # --- ECB: upper uniquement -> on prend LB=0 ---
+        ub_ecb = np.array(
+            [jeffreys_ecb(n, d_k, confidence_level) for d_k in binomial_samples],
+            dtype=float,
+        )
         lb_ecb = np.zeros_like(ub_ecb)
 
         # Cast en np.array une fois
@@ -162,7 +168,9 @@ if __name__ == "__main__":
     data_dir = base_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Grille commune à tous les n
+    # -----------------------
+    # Main grid (as before)
+    # -----------------------
     n_simulation = 10_000
     ns = [50, 100, 1000, 10_000]
     p_values = np.linspace(0.001, 0.1, 300)
@@ -182,7 +190,28 @@ if __name__ == "__main__":
         dfs.append(df_n)
 
     df_all = pd.concat(dfs, ignore_index=True)
-
     out_path = data_dir / "binom_coverage_all_n.csv"
     df_all.to_csv(out_path, index=False)
     print(f"Résultats sauvegardés dans {out_path}")
+
+    # -----------------------
+    # LDP grid (NEW)
+    # -----------------------
+    # Focus on rare-event region: p in [1e-4, 5e-3]
+    n_ldp = 1000
+    p_values_ldp = np.linspace(0.0001, 0.005, 300)
+
+    # Separate RNG seed to keep the LDP run reproducible independently
+    rng_ldp = np.random.default_rng(456)
+
+    df_ldp = simulate_binomial_coverage_for_n(
+        n=n_ldp,
+        n_simulation=n_simulation,
+        p_values=p_values_ldp,
+        confidence_level=confidence_level,
+        rng=rng_ldp,
+    )
+
+    out_path_ldp = data_dir / f"binom_coverage_ldp_n{n_ldp}.csv"
+    df_ldp.to_csv(out_path_ldp, index=False)
+    print(f"Résultats LDP sauvegardés dans {out_path_ldp}")
