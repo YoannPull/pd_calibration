@@ -540,6 +540,62 @@ temporal_drift_tables:
 	poetry run python -m experiments.temporal_drift.make_table_temporal_drift
 temporal_drift_all: temporal_drift_sim temporal_drift_plots temporal_drift_tables
 
+
+# --- Prior sensibility (Bayesian priors: Jeffreys, Laplace, Haldane, etc.) ---
+.PHONY: prior_sens_sim prior_sens_plots prior_sens_tables prior_sens_all
+
+prior_sens_sim:
+	poetry run python -m experiments.prior_sensibility.sim_prior_sensibility
+
+prior_sens_plots:
+	poetry run python -m experiments.prior_sensibility.plot_prior_sensibility
+
+prior_sens_tables:
+	poetry run python -m experiments.prior_sensibility.make_table_prior_sensibility
+
+prior_sens_all: prior_sens_sim prior_sens_plots prior_sens_tables
+
+
 # --- Tout lancer ---
 .PHONY: sims_all
-sims_all: beta_binom_all temporal_drift_all binom_all
+sims_all: beta_binom_all temporal_drift_all binom_all prior_sens_all
+
+
+# ============================================================================
+# 9) LDP APPLICATION (Intervals comparison: Normal vs Jeffreys vs CP)
+#   Repo layout (from project root):
+#     ldp_application/
+#       run_ldp.py
+#       scripts/ldp_application.py
+#       data/raw/data_rating_corporate.xlsx
+# ============================================================================
+
+LDP_ROOT   ?= ldp_application
+LDP_FILE   ?= $(LDP_ROOT)/data/raw/data_rating_corporate.xlsx
+LDP_OUTDIR ?= $(LDP_ROOT)/outputs/ldp
+LDP_AGENCY ?= Standard & Poor's Ratings Services
+LDP_HORIZON_MONTHS ?= 12
+LDP_ALPHA  ?= 0.05
+
+.PHONY: ldp_list_agencies ldp_run ldp_all
+
+ldp_list_agencies:
+	@echo "\n[LDP] Listing agencies in $(LDP_FILE)..."
+	@test -f "$(LDP_FILE)" || (echo "[ERR] Missing LDP_FILE: $(LDP_FILE)"; exit 1)
+	poetry run python $(LDP_ROOT)/run_ldp.py --list-agencies --file "$(LDP_FILE)"
+
+ldp_run:
+	@echo "\n[LDP] Running LDP interval comparison (Normal / Jeffreys / CP)..."
+	@test -f "$(LDP_FILE)" || (echo "[ERR] Missing LDP_FILE: $(LDP_FILE)"; exit 1)
+	poetry run python $(LDP_ROOT)/run_ldp.py --prefer-poetry \
+		--file "$(LDP_FILE)" \
+		--outdir "$(LDP_OUTDIR)" \
+		--agency "$(LDP_AGENCY)" \
+		--horizon-months $(LDP_HORIZON_MONTHS) \
+		--alpha $(LDP_ALPHA)
+	@echo "✔ LDP outputs: $(LDP_OUTDIR)"
+	@echo "  - interval_comparison_by_rating_all.csv"
+	@echo "  - interval_comparison_by_rating_observable.csv"
+	@echo "  - intervals_by_rating_observable.png"
+
+ldp_all: ldp_run
