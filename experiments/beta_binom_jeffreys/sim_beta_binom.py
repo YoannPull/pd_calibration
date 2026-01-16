@@ -38,7 +38,23 @@ SEED: int = 123
 N_SIM: int = 10_000
 CONF_LEVEL: float = 0.95
 
-RHO_GRID: list[float] = [0.00, 0.01, 0.05, 0.10]
+# Keep CURVES grid relatively light (runtime can explode otherwise)
+RHO_GRID_CURVES: list[float] = [0.00, 0.01, 0.05, 0.10]
+
+# More granular grid for SCENARIOS (coverage vs rho figures)
+# Tune as you like: denser grid => smoother plots, but more compute
+RHO_GRID_SCENARIOS: list[float] = [
+    0.00,
+    0.005,
+    0.01,
+    0.015,
+    0.02,
+    0.03,
+    0.04,
+    0.05,
+    0.07,
+    0.10,
+]
 
 # (A) CURVES design: for coverage-vs-p plots
 NS_CURVES: list[int] = [100, 1000, 10_000]
@@ -46,8 +62,8 @@ P_TRUES_CURVES: np.ndarray = np.linspace(0.001, 0.1, 30)
 
 # (B) SCENARIOS design: for compact tables/robustness-vs-rho plots
 SCENARIOS: list[dict] = [
-    {"scenario": "Baseline",    "n": 1000, "p_true": 0.01,  "rhos": RHO_GRID},
-    {"scenario": "Low Default", "n": 1000, "p_true": 0.001, "rhos": RHO_GRID},
+    {"scenario": "Baseline",    "n": 1000, "p_true": 0.01,  "rhos": RHO_GRID_SCENARIOS},
+    {"scenario": "Low Default", "n": 1000, "p_true": 0.001, "rhos": RHO_GRID_SCENARIOS},
 ]
 
 WRITE_COMBINED: bool = True
@@ -165,7 +181,7 @@ def run_curves(rng: np.random.Generator) -> pd.DataFrame:
     rows: list[dict] = []
     for n in NS_CURVES:
         for p_true in P_TRUES_CURVES:
-            for rho in RHO_GRID:
+            for rho in RHO_GRID_CURVES:
                 print(f"[CURVES] n={n} p_true={p_true:.6f} rho={rho:.3f}")
                 res = simulate_comparison_beta_binom(
                     n=n,

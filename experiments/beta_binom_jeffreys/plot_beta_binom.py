@@ -16,6 +16,7 @@ from experiments.plots.style import (
     METHOD_STYLES,
 )
 
+# Default (legacy) rho targets for "curves" design selection
 RHO_TARGETS: list[float] = [0.00, 0.01, 0.05, 0.10]
 
 
@@ -44,7 +45,6 @@ def _load_df(data_dir: Path) -> pd.DataFrame:
     if combined.exists():
         return pd.read_csv(combined)
 
-    # fallback (if you decided not to write combined)
     curves = data_dir / "beta_binom_results_curves.csv"
     scen = data_dir / "beta_binom_results_scenarios.csv"
     dfs = []
@@ -82,7 +82,6 @@ def _sanity_report(df: pd.DataFrame) -> None:
         print(f"[WARN] Missing columns for sanity checks: {missing}")
         return
 
-    # In the current experiment outputs: reject_star_rate should match 1 - coverage
     err = (1.0 - df["coverage"].astype(float) - df["reject_star_rate"].astype(float)).abs()
     print(f"[CHECK] max |(1-coverage) - reject_star_rate| = {float(err.max()):.4e}")
     print(f"[CHECK] mean |(1-coverage) - reject_star_rate| = {float(err.mean()):.4e}")
@@ -97,6 +96,57 @@ def _sanity_report(df: pd.DataFrame) -> None:
         print(by_method)
 
 
+# -----------------------------
+# Identical-curve collapsing
+# -----------------------------
+def _style_label(method: str) -> str:
+    style = METHOD_STYLES.get(method, {})
+    return str(style.get("label", method))
+
+
+def _group_identical_curves(
+    curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    *,
+    atol: float = 1e-12,
+) -> list[list[str]]:
+    """
+    Group methods whose curves are identical (same x and y allclose).
+    curves: method -> (x, y)
+    returns: list of groups, each group is a list of methods (first is representative).
+    """
+    methods = list(curves.keys())
+    groups: list[list[str]] = []
+
+    for m in methods:
+        x, y = curves[m]
+        placed = False
+        for g in groups:
+            m0 = g[0]
+            x0, y0 = curves[m0]
+            if x.shape == x0.shape and y.shape == y0.shape:
+                if np.allclose(x, x0, atol=0.0, rtol=0.0) and np.allclose(y, y0, atol=atol, rtol=0.0):
+                    g.append(m)
+                    placed = True
+                    break
+        if not placed:
+            groups.append([m])
+
+    # stable ordering
+    groups = [sorted(g) for g in groups]
+    groups.sort(key=lambda g: g[0])
+    return groups
+
+
+def _collapsed_label(group: list[str]) -> str:
+    rep = group[0]
+    base = _style_label(rep)
+    if len(group) == 1:
+        return base
+    others = [m for m in group[1:]]
+    others_lbl = ", ".join(_style_label(m) for m in others)
+    return f"{base} (≡ {others_lbl})"
+
+
 def plot_curves_all_methods_by_n_and_rho(
     df: pd.DataFrame,
     save_dir: Path,
@@ -106,12 +156,16 @@ def plot_curves_all_methods_by_n_and_rho(
     ylim_rej: tuple[float, float] = (0.0, 1.0),
     rho_targets: list[float] | None = None,
     annotate_global_min: bool = True,
+    collapse_identical: bool = True,
+    collapse_atol: float = 1e-12,
 ):
     """
     CURVES design:
     For each (n, rho), plot vs p_true:
       - coverage (all methods)
       - reject_star_rate (all methods)
+
+    If collapse_identical=True, identical curves are plotted once and the legend indicates equivalence.
     """
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -127,7 +181,6 @@ def plot_curves_all_methods_by_n_and_rho(
             sub = df[(df["n"] == n) & (np.isclose(df["rho"], rho))].copy()
             if sub.empty:
                 continue
-
             sub = sub.sort_values("p_true")
 
             # -------------------
@@ -135,22 +188,34 @@ def plot_curves_all_methods_by_n_and_rho(
             # -------------------
             fig, ax = new_figure()
 
+            # collect curves
+            cov_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+            for method in sorted(sub["method"].unique()):
+                tmp = sub[sub["method"] == method].copy()
+                if tmp.empty:
+                    continue
+                x = tmp["p_true"].to_numpy(dtype=float)
+                y = tmp["coverage"].to_numpy(dtype=float)
+                cov_curves[method] = (x, y)
+
+            groups = (
+                _group_identical_curves(cov_curves, atol=collapse_atol)
+                if (collapse_identical and cov_curves)
+                else [[m] for m in sorted(cov_curves.keys())]
+            )
+
             global_min_y = np.inf
             global_min_p = np.nan
             global_min_series_x = None
             global_min_series_y = None
             global_min_idx = None
 
-            for method in sorted(sub["method"].unique()):
-                tmp = sub[sub["method"] == method].copy()
-                if tmp.empty:
-                    continue
+            for g in groups:
+                rep = g[0]
+                x, y = cov_curves[rep]
 
-                x = tmp["p_true"].to_numpy(dtype=float)
-                y = tmp["coverage"].to_numpy(dtype=float)
-
-                style = METHOD_STYLES.get(method, {})
-                label = style.get("label", method)
+                style = METHOD_STYLES.get(rep, {})
+                label = _collapsed_label(g)
                 color = style.get("color", None)
 
                 ax.plot(
@@ -185,7 +250,6 @@ def plot_curves_all_methods_by_n_and_rho(
                 legend_loc="lower right",
             )
 
-            # annotate minimum coverage (robust when clipped)
             if annotate_global_min and global_min_series_x is not None:
                 ylim_low_cov = float(ylim_cov[0])
                 if global_min_y < ylim_low_cov:
@@ -214,20 +278,31 @@ def plot_curves_all_methods_by_n_and_rho(
             # -----------------------
             fig2, ax2 = new_figure()
 
+            rej_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
             for method in sorted(sub["method"].unique()):
                 tmp = sub[sub["method"] == method].copy()
                 if tmp.empty:
                     continue
-
-                x_p = tmp["p_true"].to_numpy(dtype=float)
+                x = tmp["p_true"].to_numpy(dtype=float)
                 y = tmp["reject_star_rate"].to_numpy(dtype=float)
+                rej_curves[method] = (x, y)
 
-                style = METHOD_STYLES.get(method, {})
-                label = style.get("label", method)
+            groups_rej = (
+                _group_identical_curves(rej_curves, atol=collapse_atol)
+                if (collapse_identical and rej_curves)
+                else [[m] for m in sorted(rej_curves.keys())]
+            )
+
+            for g in groups_rej:
+                rep = g[0]
+                x, y = rej_curves[rep]
+
+                style = METHOD_STYLES.get(rep, {})
+                label = _collapsed_label(g)
                 color = style.get("color", None)
 
                 ax2.plot(
-                    x_p,
+                    x,
                     y,
                     label=label,
                     color=color,
@@ -260,6 +335,9 @@ def plot_scenarios_vs_rho(
     ylim_cov: tuple[float, float] = (0.0, 1.02),
     ylim_rej: tuple[float, float] = (0.0, 1.0),
     rho_targets: list[float] | None = None,
+    use_all_rhos_if_none: bool = True,
+    collapse_identical: bool = True,
+    collapse_atol: float = 1e-12,
 ):
     """
     SCENARIOS design:
@@ -267,7 +345,9 @@ def plot_scenarios_vs_rho(
       - coverage (all methods)
       - reject_star_rate (all methods)
 
-    Uses 'scenario' column if present, else groups by (n,p_true).
+    If rho_targets is None and use_all_rhos_if_none=True, we use ALL available rhos (recommended for granular grids).
+
+    If collapse_identical=True, identical curves are plotted once and the legend indicates equivalence.
     """
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -275,7 +355,11 @@ def plot_scenarios_vs_rho(
     conf = float(conf_levels[0]) if len(conf_levels) else 0.95
     alpha = 1.0 - conf
 
-    rhos = _select_rhos(sorted(df["rho"].unique()), rho_targets or RHO_TARGETS)
+    avail_rhos = sorted(df["rho"].unique())
+    if rho_targets is None and use_all_rhos_if_none:
+        rhos = [float(x) for x in avail_rhos]
+    else:
+        rhos = _select_rhos(avail_rhos, rho_targets or RHO_TARGETS)
 
     if "scenario" in df.columns:
         scen_keys = sorted(df["scenario"].unique())
@@ -290,21 +374,36 @@ def plot_scenarios_vs_rho(
         if sub.empty:
             continue
 
+        # filter to selected rhos (avoid plotting “gaps” if df has more)
+        sub = sub[sub["rho"].isin(rhos)].copy()
+        if sub.empty:
+            continue
+
         # Coverage vs rho
         fig, ax = new_figure()
+
+        cov_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for method in sorted(sub["method"].unique()):
             tmp = sub[sub["method"] == method].copy()
             if tmp.empty:
                 continue
-
             tmp = tmp.sort_values("rho")
             x = tmp["rho"].to_numpy(dtype=float)
             y = tmp["coverage"].to_numpy(dtype=float)
+            cov_curves[method] = (x, y)
 
-            style = METHOD_STYLES.get(method, {})
-            label = style.get("label", method)
+        groups = (
+            _group_identical_curves(cov_curves, atol=collapse_atol)
+            if (collapse_identical and cov_curves)
+            else [[m] for m in sorted(cov_curves.keys())]
+        )
+
+        for g in groups:
+            rep = g[0]
+            x, y = cov_curves[rep]
+            style = METHOD_STYLES.get(rep, {})
+            label = _collapsed_label(g)
             color = style.get("color", None)
-
             ax.plot(x, y, label=label, color=color, linewidth=2.0, solid_capstyle="round", zorder=3)
 
         finalize_ax(
@@ -325,19 +424,29 @@ def plot_scenarios_vs_rho(
 
         # Reject vs rho
         fig2, ax2 = new_figure()
+
+        rej_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for method in sorted(sub["method"].unique()):
             tmp = sub[sub["method"] == method].copy()
             if tmp.empty:
                 continue
-
             tmp = tmp.sort_values("rho")
             x = tmp["rho"].to_numpy(dtype=float)
             y = tmp["reject_star_rate"].to_numpy(dtype=float)
+            rej_curves[method] = (x, y)
 
-            style = METHOD_STYLES.get(method, {})
-            label = style.get("label", method)
+        groups_rej = (
+            _group_identical_curves(rej_curves, atol=collapse_atol)
+            if (collapse_identical and rej_curves)
+            else [[m] for m in sorted(rej_curves.keys())]
+        )
+
+        for g in groups_rej:
+            rep = g[0]
+            x, y = rej_curves[rep]
+            style = METHOD_STYLES.get(rep, {})
+            label = _collapsed_label(g)
             color = style.get("color", None)
-
             ax2.plot(x, y, label=label, color=color, linewidth=2.0, solid_capstyle="round", zorder=3)
 
         finalize_ax(
@@ -369,7 +478,6 @@ if __name__ == "__main__":
 
     # 1) Curves (coverage/reject vs p_true)
     if not df_curves.empty:
-        # Full scale (recommended): avoids “fake” looking curves due to y-limits clipping.
         plot_curves_all_methods_by_n_and_rho(
             df_curves,
             save_dir=figs_dir,
@@ -379,9 +487,10 @@ if __name__ == "__main__":
             ylim_rej=(0.0, 1.0),
             rho_targets=RHO_TARGETS,
             annotate_global_min=True,
+            collapse_identical=True,
+            collapse_atol=1e-12,
         )
 
-        # Zoomed scale (paper-friendly): can hide severe under-coverage visually.
         plot_curves_all_methods_by_n_and_rho(
             df_curves,
             save_dir=figs_dir,
@@ -391,26 +500,33 @@ if __name__ == "__main__":
             ylim_rej=(0.00, 0.30),
             rho_targets=RHO_TARGETS,
             annotate_global_min=True,
+            collapse_identical=True,
+            collapse_atol=1e-12,
         )
 
     # 2) Scenarios (coverage/reject vs rho)
     if not df_scen.empty:
-        # Full scale
+        # Here: rho_targets=None + use_all_rhos_if_none=True => use full granular rho grid
         plot_scenarios_vs_rho(
             df_scen,
             save_dir=figs_dir,
             prefix="beta_binom",
             ylim_cov=(0.0, 1.02),
             ylim_rej=(0.0, 1.0),
-            rho_targets=RHO_TARGETS,
+            rho_targets=None,
+            use_all_rhos_if_none=True,
+            collapse_identical=True,
+            collapse_atol=1e-12,
         )
 
-        # Zoomed scale (paper-friendly)
         plot_scenarios_vs_rho(
             df_scen,
             save_dir=figs_dir,
             prefix="beta_binom_zoom",
             ylim_cov=(0.80, 1.02),
             ylim_rej=(0.00, 0.30),
-            rho_targets=RHO_TARGETS,
+            rho_targets=None,
+            use_all_rhos_if_none=True,
+            collapse_identical=True,
+            collapse_atol=1e-12,
         )
