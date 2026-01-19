@@ -1,15 +1,16 @@
+
 #!/usr/bin/env python3
+from __future__ import annotations
 # -*- coding: utf-8 -*-
 """
-One-click launcher for S&P grade tables.
+One-click launcher for S&P grade tables (snapshot input).
 
 Expected layout:
   ldp_application/
     run_sp_grade_tables.py
     scripts/sp_grade_tables.py
+    data/processed/sp_corporate_monthly.csv  (or .xlsx)
 """
-
-from __future__ import annotations
 
 import argparse
 import shutil
@@ -35,12 +36,17 @@ def main() -> int:
     root = _project_root()
     script_path = (root / "scripts" / "sp_grade_tables.py").resolve()
 
-    parser = argparse.ArgumentParser(description="Run S&P grade tables in one command.")
+    parser = argparse.ArgumentParser(description="Run S&P grade tables in one command (snapshot input).")
     parser.add_argument("--prefer-poetry", action="store_true")
     parser.add_argument("--no-poetry", action="store_true")
 
     # pass-through args
-    parser.add_argument("--file", type=str, default=str(root / "data" / "raw" / "data_rating_corporate.xlsx"))
+    parser.add_argument(
+        "--file",
+        type=str,
+        default=str(root / "data" / "processed" / "sp_corporate_monthly.csv"),
+        help="Snapshot file (.csv or .xlsx) in corporate.xlsx-like schema",
+    )
     parser.add_argument("--outdir", type=str, default=str(root / "outputs" / "sp_grade_is_oos"))
     parser.add_argument("--agency", type=str, default="Standard & Poor's Ratings Services")
     parser.add_argument("--horizon-months", type=int, default=12)
@@ -63,6 +69,10 @@ def main() -> int:
     )
     parser.add_argument("--drop-grades-without-ttc", action="store_true")
     parser.add_argument("--keep-grades-without-ttc", action="store_true")
+
+    # year handling in snapshot
+    parser.add_argument("--prefer-year-column", action="store_true")
+    parser.add_argument("--no-prefer-year-column", action="store_true")
 
     args = parser.parse_args()
 
@@ -93,6 +103,11 @@ def main() -> int:
         cmd += ["--drop-grades-without-ttc"]
     if args.keep_grades_without_ttc:
         cmd += ["--keep-grades-without-ttc"]
+
+    if args.prefer_year_column and (not args.no_prefer_year_column):
+        cmd += ["--prefer-year-column"]
+    if args.no_prefer_year_column:
+        cmd += ["--no-prefer-year-column"]
 
     print("Running command:\n  " + " ".join(cmd))
     try:

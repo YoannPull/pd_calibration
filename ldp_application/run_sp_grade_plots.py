@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 # -*- coding: utf-8 -*-
 """
 One-click launcher for S&P grade plots.
@@ -9,8 +10,6 @@ Expected layout:
     scripts/sp_grade_plots.py
     outputs/sp_grade_is_oos/sp_grade_tables_YYYY_YYYY.csv
 """
-
-from __future__ import annotations
 
 import argparse
 import shutil
@@ -25,9 +24,9 @@ def _project_root() -> Path:
 
 def _detect_runner(prefer_poetry: bool) -> list[str]:
     root = _project_root()
-    has_pyproject = (root / "pyproject.toml").exists()
     has_poetry = shutil.which("poetry") is not None
-    if prefer_poetry and has_pyproject and has_poetry:
+    has_pyproject = (root / "pyproject.toml").exists()
+    if prefer_poetry and has_poetry and has_pyproject:
         return ["poetry", "run", "python"]
     return [sys.executable]
 

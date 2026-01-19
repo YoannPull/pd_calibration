@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-S&P (corporate ratings Excel) — PER GRADE benchmark tables
+S&P (monthly snapshot / corporate.xlsx-like) — PER GRADE benchmark tables
+
+Input (new format):
+  rating_agency_name | rating | rating_action_date | legal_entity_identifier | obligor_name
+  year_month | year | pays | nace
 
 Outputs (outdir):
   - sp_grade_table_YYYY.csv (one per OOS year)
@@ -9,7 +13,8 @@ Outputs (outdir):
   - sp_grade_overview.json (meta/config)
 
 Key features:
-  - Builds issuer-year cohorts (first rating action in each year), labels default within 12 months
+  - Builds issuer-year cohorts (first rating observation in each "year"),
+    labels default within HORIZON_MONTHS (default 12).
   - Drops starting-in-default, keeps only observable horizons
   - TTC sources:
       * is     : TTC estimated on IS window (pooled / jeffreys_mean / hybrid)
@@ -17,10 +22,10 @@ Key features:
   - Adds TTC_KEY column (so you can append newer TTC tables later)
   - If TTC_SOURCE=sp2012: clips OOS_START >= 2012 (warns)
 
-IMPORTANT FIX (pandas >= 2.2 / future behavior):
-  - When using groupby.apply(..., include_groups=False), the grouping column ("obligor_id")
-    is NOT present in the group dataframe. So inside per_obligor() we must read the key
-    via grp.name (robust), not grp["obligor_id"].
+Important adaptation to new data:
+  - The input may be .xlsx OR .csv.
+  - If a 'year' column exists, we use it (this matches the "corporate.xlsx" schema).
+    Otherwise we fall back to rating_action_date.dt.year (calendar year).
 """
 
 from __future__ import annotations
@@ -169,8 +174,7 @@ def ttc_estimate(sum_d: int, sum_n: int, estimator: str) -> float:
 
 
 # ============================================================
-# YOUR mapping hook (notched grade -> major grade used in external TTC tables)
-# Replace this function body with your mapping.
+# Mapping hook (notched grade -> major grade used in external TTC tables)
 # Must return one of: {"AAA","AA","A","BBB","BB","B","CCC/C"} or None
 # ============================================================
 def map_notch_to_sp_major(grade: str) -> str | None:
@@ -201,21 +205,52 @@ def build_external_ttc_map_sp2012(grades: list[str]) -> dict[str, float]:
 
 
 # ============================================================
+# Input loader (xlsx or csv)
+# ============================================================
+def load_snapshot(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing input file: {path}")
+
+    suf = path.suffix.lower()
+    if suf in {".xlsx", ".xls"}:
+        df = pd.read_excel(path)
+    elif suf == ".csv":
+        df = pd.read_csv(path)
+    else:
+        raise ValueError(f"Unsupported input extension {path.suffix}. Use .xlsx or .csv")
+
+    return df
+
+
+# ============================================================
 # Cohort builder
 # ============================================================
 def build_sp_cohorts(
-    xlsx_path: Path,
+    input_path: Path,
     *,
     agency: str,
     horizon_months: int,
     default_rating: str,
     grade_whitelist: set[str] | None,
+    prefer_year_column: bool = True,
 ) -> pd.DataFrame:
-    if not xlsx_path.exists():
-        raise FileNotFoundError(f"Missing input Excel: {xlsx_path}")
+    """
+    Build issuer-year cohorts from the monthly snapshot.
 
-    data = pd.read_excel(xlsx_path)
-    df = data[data["rating_agency_name"] == agency].copy()
+    - cohort year is:
+        * df['year'] if present and prefer_year_column=True
+        * else rating_action_date.dt.year
+    - cohort grade is the FIRST observation in that year (per obligor)
+    - default is flagged if a 'D' occurs within (cohort_date, cohort_date + horizon]
+    """
+    df = load_snapshot(input_path)
+
+    needed = {"rating_agency_name", "rating_action_date", "rating", "obligor_name"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in snapshot: {sorted(missing)}")
+
+    df = df[df["rating_agency_name"] == agency].copy()
 
     df["rating_action_date"] = pd.to_datetime(df["rating_action_date"], errors="coerce")
     df = df.dropna(subset=["rating_action_date"]).copy()
@@ -224,27 +259,33 @@ def build_sp_cohorts(
     # obligor_id = LEI if available else obligor_name__country
     lei = df.get("legal_entity_identifier", pd.Series([pd.NA] * len(df))).astype("string")
     lei = lei.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA})
-    fallback = (
-        df.get("obligor_name", pd.Series([pd.NA] * len(df))).astype("string").fillna("UNKNOWN").str.strip()
-        + "__"
-        + df.get("pays", pd.Series([pd.NA] * len(df))).astype("string").fillna("XX").str.strip()
-    )
+
+    pays = df.get("pays", pd.Series([pd.NA] * len(df))).astype("string")
+    pays = pays.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "none": pd.NA}).fillna("XX").str.strip()
+
+    obligor_name = df.get("obligor_name", pd.Series([pd.NA] * len(df))).astype("string")
+    obligor_name = obligor_name.fillna("UNKNOWN").str.strip()
+
+    fallback = obligor_name + "__" + pays
     df["obligor_id"] = np.where(lei.notna(), lei, fallback)
 
-    df["year"] = df["rating_action_date"].dt.year.astype(int)
+    # Year definition: prefer 'year' column if provided by snapshot
+    if prefer_year_column and ("year" in df.columns):
+        y = pd.to_numeric(df["year"], errors="coerce")
+        if y.notna().any():
+            df["year"] = y.astype("Int64").astype(int)  # robust across pandas versions
+        else:
+            df["year"] = df["rating_action_date"].dt.year.astype(int)
+    else:
+        df["year"] = df["rating_action_date"].dt.year.astype(int)
+
     df = df.sort_values(["obligor_id", "rating_action_date"]).copy()
 
     offset = DateOffset(months=int(horizon_months))
     default_rating = str(default_rating).strip().upper()
 
     def per_obligor(grp: pd.DataFrame) -> pd.DataFrame:
-        # IMPORTANT:
-        # - if groupby.apply(..., include_groups=False), "obligor_id" is NOT in grp.columns.
-        # - the group key is available as grp.name.
-        if "obligor_id" in grp.columns:
-            oid = str(grp["obligor_id"].iloc[0])
-        else:
-            oid = str(getattr(grp, "name", "UNKNOWN_OBLIGOR"))
+        oid = str(getattr(grp, "name", "UNKNOWN_OBLIGOR"))
 
         dates = grp["rating_action_date"].to_numpy(dtype="datetime64[ns]")
         ratings = grp["rating"].to_numpy()
@@ -253,7 +294,10 @@ def build_sp_cohorts(
         d_dates = dates[d_pos] if len(d_pos) else np.array([], dtype="datetime64[ns]")
         last_date = dates[-1]
 
-        cohorts = grp.drop_duplicates("year", keep="first")[["year", "rating_action_date", "rating"]]
+        # First observation in each year defines the cohort entry for that year
+        cohorts = grp.sort_values("rating_action_date").drop_duplicates("year", keep="first")[
+            ["year", "rating_action_date", "rating"]
+        ]
 
         rows = []
         for _, r in cohorts.iterrows():
@@ -281,7 +325,7 @@ def build_sp_cohorts(
             )
         return pd.DataFrame(rows)
 
-    # pandas FutureWarning: include_groups
+    # pandas compatibility (include_groups exists only in newer versions)
     try:
         cohorts = (
             df.groupby("obligor_id", group_keys=False)
@@ -289,9 +333,9 @@ def build_sp_cohorts(
             .reset_index(drop=True)
         )
     except TypeError:
-        # older pandas without include_groups
         cohorts = df.groupby("obligor_id", group_keys=False).apply(per_obligor).reset_index(drop=True)
 
+    # Drop starting in default and keep only observable horizons
     cohorts = cohorts[cohorts["grade"] != default_rating].copy()
     cohorts = cohorts[cohorts["observable_12m"] == 1].copy()
 
@@ -383,8 +427,8 @@ def save_tables(tables: dict[int, pd.DataFrame], outdir: Path, *, oos_start: int
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build S&P per-grade OOS tables with TTC benchmarks.")
-    parser.add_argument("--file", type=str, default="ldp_application/data/raw/data_rating_corporate.xlsx")
+    parser = argparse.ArgumentParser(description="Build S&P per-grade OOS tables with TTC benchmarks (snapshot input).")
+    parser.add_argument("--file", type=str, default="ldp_application/data/processed/sp_corporate_monthly.xlsx")
     parser.add_argument("--outdir", type=str, default="ldp_application/outputs/sp_grade_is_oos")
 
     parser.add_argument("--agency", type=str, default="Standard & Poor's Ratings Services")
@@ -410,20 +454,35 @@ def main() -> int:
     parser.add_argument("--drop-grades-without-ttc", action="store_true")
     parser.add_argument("--keep-grades-without-ttc", action="store_true")
 
+    # New: prefer year column from snapshot (recommended)
+    parser.add_argument(
+        "--prefer-year-column",
+        action="store_true",
+        help="If set, use the input 'year' column when available (recommended for corporate.xlsx-like data).",
+    )
+    parser.add_argument(
+        "--no-prefer-year-column",
+        action="store_true",
+        help="If set, ignore input 'year' column and use rating_action_date.year (calendar year).",
+    )
+
     args = parser.parse_args()
 
-    xlsx_path = Path(args.file).expanduser().resolve()
+    input_path = Path(args.file).expanduser().resolve()
     outdir = Path(args.outdir).expanduser().resolve()
     _safe_mkdir(outdir)
 
     wl = _upper_set(args.grade_whitelist) if args.grade_whitelist else None
 
+    prefer_year = bool(args.prefer_year_column) and (not bool(args.no_prefer_year_column))
+
     cohorts = build_sp_cohorts(
-        xlsx_path,
+        input_path,
         agency=str(args.agency),
         horizon_months=int(args.horizon_months),
         default_rating=str(args.default_rating),
         grade_whitelist=wl,
+        prefer_year_column=prefer_year,
     )
     if cohorts.empty:
         print("[ERR] cohorts empty after filtering.", file=sys.stderr)
@@ -472,12 +531,13 @@ def main() -> int:
     combined_path = save_tables(tables, outdir, oos_start=oos_start_eff, oos_end=oos_end_eff)
 
     meta = {
-        "input_file": str(xlsx_path),
+        "input_file": str(input_path),
         "outdir": str(outdir),
         "agency": str(args.agency),
         "horizon_months": int(args.horizon_months),
         "default_rating": str(args.default_rating),
         "confidence_level": float(args.confidence_level),
+        "prefer_year_column": bool(prefer_year),
         "is_window": [int(args.is_start_year), int(args.is_end_year)],
         "oos_window_requested": [int(args.oos_start_year), int(args.oos_end_year)],
         "oos_window_effective": [int(oos_start_eff), int(oos_end_eff)],
@@ -495,7 +555,7 @@ def main() -> int:
         json.dump(meta, f, indent=2)
 
     print("\n=== S&P grade tables ===")
-    print(f"Input:  {xlsx_path}")
+    print(f"Input:  {input_path}")
     print(f"Outdir: {outdir}")
     print(f"TTC:    {ttc_source} | key={ttc_key}")
     if ttc_source == "is":
