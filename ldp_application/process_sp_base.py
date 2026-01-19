@@ -2,7 +2,7 @@
 # ldp_application/process_sp_base.py
 # -*- coding: utf-8 -*-
 """
-Master ESA Project — Clean S&P corporate ratings (Python)
+Code translated from the R code of Charles-Emmanuel Prost (Square Management)
 
 Goal:
 - Process / clean S&P corporate ratings from the raw ratingshistory CSV.
