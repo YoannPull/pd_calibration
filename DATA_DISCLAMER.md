@@ -1,17 +1,3 @@
-Voilà une version plus détaillée (et “propre”) de l’origine des **données de ratings** via **ratingshistory.info**, en s’appuyant sur la base réglementaire **SEC Rule 17g-7** et sur la description officielle du site. ([ratingshistory.info][1])
-
-* **Cadre réglementaire** : la SEC impose aux **NRSROs** de publier leur **rating history** dans un fichier **XBRL** (interactive data) conformément à la **Rule 17g-7(b)**, en utilisant la “Record of Credit Ratings Taxonomy”, avec un guide de publication dédié. ([SEC][2])
-* **Problème pratique** : ces fichiers XBRL sont difficiles à localiser/consommer pour beaucoup de chercheurs. ([ratingshistory.info][1])
-* **Ce que fait ratingshistory.info** : le site (RatingsHistory.info) **agrège** des historiques de plusieurs agences et les **convertit en CSV**, directement exploitables (Excel/Access), avec une convention de nommage (date, agence, classe d’actifs). ([ratingshistory.info][1])
-* **Abbréviations / standard** : le site renvoie au **SEC Rating History Publication Guide** (utile pour interpréter les champs/abréviations). ([SEC][3])
-
-Ci-dessous, je te donne des versions **finales** à copier-coller.
-
----
-
-## 1) `DATA_DISCLAIMER.md` (mis à jour, sans macro)
-
-```md
 # Data Disclaimer (Third-Party / External Data)
 
 This repository contains **code** to process and analyze external datasets.  
