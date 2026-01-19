@@ -523,9 +523,41 @@ oos_backtest_full: oos_score
 
 # ============================================================================
 # (B) EMPIRICAL APPLICATION #2 — LDP / S&P GRADES (tables + plots)
+#   + NEW STEP: build the monthly snapshot dataset (CSV-only)
 # ============================================================================
+
 SPG_ROOT   ?= ldp_application
-SPG_FILE   ?= $(SPG_ROOT)/data/raw/data_rating_corporate.xlsx
+
+# -----------------------------
+# Build monthly snapshot (CSV only)
+# -----------------------------
+SP_RAW_CSV ?= $(SPG_ROOT)/data/raw/20220601_SP_Ratings_Services_Corporate.csv
+SP_SNAP_CSV ?= $(SPG_ROOT)/data/processed/sp_corporate_monthly.csv
+SP_SNAP_SCRIPT ?= $(SPG_ROOT)/process_sp_base.py
+
+SP_SNAP_START ?= 2010-01-01
+SP_SNAP_END   ?= 2021-07-01
+
+.PHONY: sp_snapshot
+
+sp_snapshot:
+	@echo "\n[SP-SNAPSHOT] Build monthly snapshot (CSV-only, corporate.xlsx-like schema)..."
+	@test -f "$(SP_RAW_CSV)" || (echo "[ERR] Missing raw CSV: $(SP_RAW_CSV)"; exit 1)
+	@test -f "$(SP_SNAP_SCRIPT)" || (echo "[ERR] Missing script: $(SP_SNAP_SCRIPT)"; exit 1)
+	$(PYP) "$(SP_SNAP_SCRIPT)" \
+		--raw "$(SP_RAW_CSV)" \
+		--out_csv "$(SP_SNAP_CSV)" \
+		--start "$(SP_SNAP_START)" \
+		--end   "$(SP_SNAP_END)"
+	@echo "✔ Snapshot written:"
+	@echo "  - $(SP_SNAP_CSV)"
+
+
+# -----------------------------
+# S&P grades (tables + plots)
+# -----------------------------
+# Use CSV snapshot as the default input for the grade pipeline
+SPG_FILE   ?= $(SP_SNAP_CSV)
 SPG_OUTDIR ?= $(SPG_ROOT)/outputs/sp_grade_is_oos
 
 SPG_AGENCY ?= Standard & Poor's Ratings Services
@@ -540,7 +572,11 @@ SPG_OOS_END   ?= 2020
 SPG_TTC_SOURCE    ?= sp2012
 SPG_TTC_ESTIMATOR ?= pooled
 SPG_DROP_NO_TTC   ?= 1
-SPG_INCLUDE_UNOBS ?= 0
+
+# New: year handling in snapshot
+#   - If your snapshot contains the custom July–June "year" column (recommended): 1
+#   - If you want calendar year from rating_action_date.year: 0
+SPG_PREFER_YEAR_COLUMN ?= 1
 
 SPG_PMAX        ?=
 SPG_MIN_TOTAL_N ?= 1
@@ -549,24 +585,25 @@ SPG_TABLES_CSV ?= $(SPG_OUTDIR)/sp_grade_tables_$(SPG_OOS_START)_$(SPG_OOS_END).
 
 .PHONY: sp_grade_tables sp_grade_plots sp_grade_all
 
-sp_grade_tables:
+# Ensure tables always run on the freshest snapshot
+sp_grade_tables: sp_snapshot
 	@echo "\n[SP-GRADE] Tables (TTC_SOURCE=$(SPG_TTC_SOURCE))..."
 	@test -f "$(SPG_FILE)" || (echo "[ERR] Missing: $(SPG_FILE)"; exit 1)
-	@if [ "$(SPG_INCLUDE_UNOBS)" = "1" ]; then INC_FLAG="--include-unobserved"; else INC_FLAG=""; fi; \
-	if [ "$(SPG_DROP_NO_TTC)" = "1" ]; then DROP_FLAG="--drop-grades-without-ttc"; else DROP_FLAG=""; fi; \
+	@if [ "$(SPG_DROP_NO_TTC)" = "1" ]; then DROP_FLAG="--drop-grades-without-ttc"; else DROP_FLAG=""; fi; \
+	if [ "$(SPG_PREFER_YEAR_COLUMN)" = "1" ]; then YEAR_FLAG="--prefer-year-column"; else YEAR_FLAG="--no-prefer-year-column"; fi; \
 	$(PYP) $(SPG_ROOT)/run_sp_grade_tables.py --no-poetry \
 		--file "$(SPG_FILE)" \
 		--outdir "$(SPG_OUTDIR)" \
 		--agency "$(SPG_AGENCY)" \
 		--horizon-months $(SPG_HORIZON_MONTHS) \
 		--confidence-level $(SPG_CONF_LEVEL) \
-		--is-start $(SPG_IS_START) \
-		--is-end $(SPG_IS_END) \
-		--oos-start $(SPG_OOS_START) \
-		--oos-end $(SPG_OOS_END) \
+		--is-start-year $(SPG_IS_START) \
+		--is-end-year $(SPG_IS_END) \
+		--oos-start-year $(SPG_OOS_START) \
+		--oos-end-year $(SPG_OOS_END) \
 		--ttc-source $(SPG_TTC_SOURCE) \
 		--ttc-estimator $(SPG_TTC_ESTIMATOR) \
-		$$INC_FLAG $$DROP_FLAG
+		$$YEAR_FLAG $$DROP_FLAG
 	@echo "✔ Tables written to: $(SPG_OUTDIR)"
 	@echo "  - sp_grade_table_YYYY.csv (one per year)"
 	@echo "  - sp_grade_tables_*.csv (combined)"
@@ -590,6 +627,7 @@ sp_grade_plots:
 	@echo "✔ Plots written to: $(SPG_OUTDIR)/plots_timeseries"
 
 sp_grade_all: sp_grade_tables sp_grade_plots
+
 
 
 # ============================================================================
