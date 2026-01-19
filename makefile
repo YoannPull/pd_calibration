@@ -97,7 +97,6 @@ help:
 	@echo "    make binning_fit              : 3) Binning (Max Gini + monotonicity)"
 	@echo "    make model_train_iter         : 4) Train model (ITER: halving, large search)"
 	@echo "    make model_train_final        : 4) Train model (FINAL: grid, reproducible)"
-	@echo "    make ttc_macro                : 5) Estimate TTC macro PD per grade"
 	@echo "    make report                   : 6) Generate HTML report (train+val scored)"
 	@echo ""
 	@echo "    make recalibrate_pd           : Type-1 recalibration (grade->PD) on rolling window"
@@ -108,6 +107,9 @@ help:
 	@echo "    make oos_vintage_report       : Score OOS + vintage/grade report"
 	@echo "    make val_vintage_report       : Vintage/grade report on Validation"
 	@echo "    make score_custom             : Score a custom dataset"
+	@echo ""
+	@echo "    make oos_backtest_full        : Paper-ready OOS backtest (tables+plots+LaTeX snapshot)"
+	@echo "                                 : (use vars: OOSBT_OOS=..., OOSBT_BUCKET_STATS=..., OOSBT_PDK_TARGET=...)"
 	@echo ""
 	@echo "-----------------------------------------------------------------"
 	@echo "  (B) EMPIRICAL APPLICATION #2 — LDP / S&P GRADES (tables + plots)"
@@ -478,14 +480,49 @@ score_custom:
 
 
 # ============================================================================
+# (A quater) OOS BACKTEST — FULL PAPER-READY (tables + plots + LaTeX snapshot)
+# ============================================================================
+OOSBT_OUTDIR        ?= outputs/oos_backtest
+OOSBT_OOS           ?= $(OOS_SCORED)
+OOSBT_BUCKET_STATS  ?= $(MODEL_ARTIFACTS_DIR)/bucket_stats.json
+OOSBT_BUCKET_SECTION ?= train
+
+OOSBT_PDK_TARGET    ?= pd_ttc
+OOSBT_CONF_LEVEL    ?= 0.95
+OOSBT_TL_MAIN_MODE  ?= decision
+OOSBT_SAVE_PDF      ?= 1
+OOSBT_FOCUS_YEAR    ?=
+
+OOSBT_PAPER_SNAPSHOT ?= 2023Q4
+OOSBT_PAPER_UNITS    ?= bps
+OOSBT_PAPER_ALPHA    ?= 0.05
+
+.PHONY: oos_backtest_full
+oos_backtest_full: oos_score
+	@echo "\n[OOS-BACKTEST] FULL PAPER-READY BACKTEST..."
+	@test -f "$(OOSBT_OOS)"          || (echo "[ERR] Missing: $(OOSBT_OOS)"; exit 1)
+	@test -f "$(OOSBT_BUCKET_STATS)" || (echo "[ERR] Missing: $(OOSBT_BUCKET_STATS)"; exit 1)
+	@if [ "$(OOSBT_SAVE_PDF)" = "1" ]; then PDF_FLAG="--save-pdf"; else PDF_FLAG="--no-pdf"; fi; \
+	FOCUS_FLAG=""; \
+	if [ -n "$(strip $(OOSBT_FOCUS_YEAR))" ]; then FOCUS_FLAG="--focus-year $(OOSBT_FOCUS_YEAR)"; fi; \
+	$(PY) src/run_oos_backtest.py \
+		--oos "$(OOSBT_OOS)" \
+		--bucket-stats "$(OOSBT_BUCKET_STATS)" \
+		--bucket-section "$(OOSBT_BUCKET_SECTION)" \
+		--out "$(OOSBT_OUTDIR)" \
+		--pdk-target "$(OOSBT_PDK_TARGET)" \
+		--conf-level $(OOSBT_CONF_LEVEL) \
+		--tl-main-mode "$(OOSBT_TL_MAIN_MODE)" \
+		--paper-snapshot "$(OOSBT_PAPER_SNAPSHOT)" \
+		--paper-units "$(OOSBT_PAPER_UNITS)" \
+		--paper-alpha $(OOSBT_PAPER_ALPHA) \
+		$$PDF_FLAG \
+		$$FOCUS_FLAG
+	@echo "✔ OOS backtest written to: $(OOSBT_OUTDIR)"
+
+
+# ============================================================================
 # (B) EMPIRICAL APPLICATION #2 — LDP / S&P GRADES (tables + plots)
-# Expected repository layout (from repo root):
-#   ldp_application/
-#     run_sp_grade_tables.py
-#     run_sp_grade_plots.py
-#     scripts/sp_grade_tables.py
-#     scripts/sp_grade_plots.py
-#     data/raw/data_rating_corporate.xlsx
 # ============================================================================
 SPG_ROOT   ?= ldp_application
 SPG_FILE   ?= $(SPG_ROOT)/data/raw/data_rating_corporate.xlsx
@@ -495,23 +532,19 @@ SPG_AGENCY ?= Standard & Poor's Ratings Services
 SPG_HORIZON_MONTHS ?= 12
 SPG_CONF_LEVEL ?= 0.95
 
-# Windows (requested; scripts may clip when using external TTC tables)
 SPG_IS_START  ?= 2010
 SPG_IS_END    ?= 2018
 SPG_OOS_START ?= 2010
 SPG_OOS_END   ?= 2020
 
-# TTC settings
 SPG_TTC_SOURCE    ?= sp2012
 SPG_TTC_ESTIMATOR ?= pooled
 SPG_DROP_NO_TTC   ?= 1
 SPG_INCLUDE_UNOBS ?= 0
 
-# Plot options
 SPG_PMAX        ?=
 SPG_MIN_TOTAL_N ?= 1
 
-# Combined CSV name for the *requested* range (fallback to most recent if missing)
 SPG_TABLES_CSV ?= $(SPG_OUTDIR)/sp_grade_tables_$(SPG_OOS_START)_$(SPG_OOS_END).csv
 
 .PHONY: sp_grade_tables sp_grade_plots sp_grade_all
@@ -540,7 +573,6 @@ sp_grade_tables:
 
 sp_grade_plots:
 	@echo "\n[SP-GRADE] Plots..."
-	@# Use the “expected” combined CSV; if missing (year clipping), fall back to the newest produced CSV.
 	@TABLES="$(SPG_TABLES_CSV)"; \
 	if [ ! -f "$$TABLES" ]; then \
 		TABLES=$$(ls -1t "$(SPG_OUTDIR)"/sp_grade_tables_*.csv 2>/dev/null | head -n 1 || true); \
