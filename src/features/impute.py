@@ -1,3 +1,76 @@
+# src/features/impute.py
+# -*- coding: utf-8 -*-
+
+"""
+=========
+
+Train-only imputation and robust schema alignment for the credit-risk pipeline.
+
+This module defines :class:`DataImputer`, a scikit-learn compatible transformer
+(:class:`sklearn.base.BaseEstimator`, :class:`sklearn.base.TransformerMixin`)
+designed to be fitted on the TRAIN sample only and then applied consistently to
+TRAIN/VALIDATION/OOS datasets without leakage.
+
+Core ideas
+----------
+- Fit on TRAIN only: all statistics (medians, modes, cohort maps) are learned
+  on the training set, then reused as fixed artifacts at inference time.
+- Schema stability: at transform-time, missing columns are created and
+  unexpected columns are safely ignored, ensuring robust application across
+  time/quarters.
+- Domain-aware imputation: a small set of features receives specialized
+  business logic (credit score, MI%, DTI, CLTV), then a generic safety net
+  imputes remaining columns using global TRAIN statistics.
+- Optional cohort imputation: if ``use_cohort=True``, the transformer can
+  impute using cohort-specific statistics (e.g., by loan purpose and/or year),
+  with transparent fallbacks to global TRAIN values.
+- Optional missingness indicators: if ``missing_flag=True``, the transformer
+  adds binary flags describing which values were missing before imputation.
+
+What it imputes (special rules)
+-------------------------------
+- ``credit_score``:
+  - coerces to numeric and clips to [300, 850]
+  - imputes by (year, loan_purpose) if available, then by loan_purpose, then
+    global TRAIN median
+  - adds ``cs_missing`` flag
+- ``mi_percent`` (requires ``original_ltv``):
+  - sets MI to 0 when LTV <= 80 and MI is missing (business rule)
+  - imputes by (year, LTV bin) if available, then by LTV bin, then 0
+  - adds ``mi_missing`` and ``has_mi`` flags
+- ``original_dti``:
+  - imputes by (year, loan_purpose) then by loan_purpose then global TRAIN median
+  - adds ``dti_missing`` flag
+- ``original_cltv``:
+  - imputes missing CLTV with LTV when available, and enforces CLTV >= LTV
+  - optionally imputes by year, then global TRAIN median
+  - adds ``cltv_missing`` flag
+- Small ordinal features (e.g., ``original_loan_term``, ``number_of_borrowers``):
+  - imputes with TRAIN mode after numeric coercion
+  - adds ``*_missing`` flags
+
+Generic safety net
+------------------
+After specialized rules, remaining numeric columns are filled with TRAIN medians,
+and non-numeric columns are filled with TRAIN modes. Categorical columns are
+expanded to include the chosen fill value when needed.
+
+Input/Output contract
+---------------------
+Input: pandas DataFrame with raw loan-level features (may include ``vintage``).
+Output: DataFrame with the same (aligned) schema and no missing values for the
+handled features, plus optional missingness indicators.
+
+Notes
+-----
+- The transformer intentionally drops ``pre_relief_refi_loan_seq_number`` (if
+  present) to avoid using it as a feature.
+- Year extraction is robust to Period, datetime, and common string encodings
+  (e.g., '2015Q1', '2015-03-31') via a lightweight regex fallback.
+
+"""
+
+
 import numpy as np
 import pandas as pd
 from pandas.api.types import (
@@ -26,12 +99,14 @@ class DataImputer(BaseEstimator, TransformerMixin):
     @staticmethod
     def _to_year(series):
         """
-        Retourne une Series d'années (Int16) de façon déterministe et rapide.
-        Gère:
-        - Period (M/Q/…)        -> .dt.year
-        - datetime64[ns]        -> .dt.year
-        - Chaînes: 'YYYYQn', 'YYYY-MM', 'YYYYMM', 'YYYY...' -> 4 premiers chiffres
-        Si rien n'est interprétable, retourne None (désactive les stats 'by year').
+        Return a year Series (Int16) in a deterministic and fast way.
+
+        Handles:
+        - Period (M/Q/...)        -> .dt.year
+        - datetime64[ns]          -> .dt.year
+        - strings: 'YYYYQn', 'YYYY-MM', 'YYYYMM', 'YYYY...' -> first 4 digits
+
+        If nothing is interpretable, returns None (disables any 'by year' logic).
         """
         try:
             s = pd.Series(series)
@@ -46,12 +121,12 @@ class DataImputer(BaseEstimator, TransformerMixin):
         if pd.api.types.is_datetime64_any_dtype(s):
             return pd.to_datetime(s, errors="coerce").dt.year.astype("Int16")
 
-        # Catégorique/objet/chaine -> on extrait les 4 premiers chiffres (YYYY)
+        # Categorical/object/string -> extract first 4 digits (YYYY)
         ss = s.astype("string").str.strip()
         year_str = ss.str.extract(r"^\s*(\d{4})")[0]
         year = pd.to_numeric(year_str, errors="coerce").astype("Int16")
 
-        # Si tout est NA, rien d'exploitable -> désactive la logique "by year"
+        # If everything is NA, nothing usable -> disable "by year" logic
         if year.isna().all():
             return None
         return year
@@ -66,7 +141,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         df = X.copy()
 
-        # Colonnes de référence (exclure la colonne drop future)
+        # Reference columns (exclude a future dropped column)
         self.columns_fit_ = [c for c in df.columns if c != 'pre_relief_refi_loan_seq_number']
         self.dtypes_ = df.dtypes.to_dict()
 
@@ -132,12 +207,12 @@ class DataImputer(BaseEstimator, TransformerMixin):
                 med = pd.Series(cltv.values, index=vyear).groupby(level=0).median()
                 self.stats_['cltv_by_year'] = {int(k): float(v) for k, v in med.items() if pd.notna(v)}
 
-        # modes for small ordinal
+        # Modes for small ordinal variables
         for col in ['original_loan_term', 'number_of_borrowers']:
             if col in df.columns:
                 self.stats_[f'{col}_mode'] = self._mode(df[col])
 
-        # Fallbacks génériques appris sur le train
+        # Generic fallbacks learned on train
         num_cols = df.select_dtypes(include='number').columns.tolist()
         self.stats_['global_num_median'] = {
             c: float(pd.to_numeric(df[c], errors='coerce').median()) for c in num_cols
@@ -151,16 +226,16 @@ class DataImputer(BaseEstimator, TransformerMixin):
     def transform(self, X):
         df = X.copy()
 
-        # 0) Drop colonne non utilisée
+        # 0) Drop unused column
         df.drop(columns=['pre_relief_refi_loan_seq_number'], errors='ignore', inplace=True)
 
-        # 0-bis) Alignement de schéma : ajouter les colonnes vues au fit mais absentes ici
+        # 0-bis) Schema alignment: add columns seen at fit-time but missing here
         if hasattr(self, 'columns_fit_'):
             for c in self.columns_fit_:
                 if c not in df.columns:
                     df[c] = pd.NA
 
-        # Flags "était manquant" avant toute imputation
+        # "Was missing" flags BEFORE any imputation
         if self.missing_flag:
             cols_impute = df.columns
             missing0 = df[cols_impute].isna().add_prefix('was_missing_').astype('int8')
@@ -168,15 +243,15 @@ class DataImputer(BaseEstimator, TransformerMixin):
         # Helpers
         vyear = self._to_year(df['vintage']) if 'vintage' in df.columns else None
 
-        # 1) Catégorielles : Unknown / NotApplicable
+        # 1) Categoricals: Unknown / NotApplicable conventions
         if 'channel' in df.columns and isinstance(df['channel'].dtype, CategoricalDtype):
             df['channel'] = df['channel'].cat.add_categories(['Unknown']).fillna('Unknown')
 
         if 'property_valuation_method' in df.columns:
             pvm = pd.to_numeric(df['property_valuation_method'].astype('string'), errors='coerce')
             if vyear is not None:
-                pvm = pvm.where(vyear >= 2017, 99)  # 99 NotApplicable avant 2017
-            pvm = pvm.fillna(9)  # 9 NotAvailable
+                pvm = pvm.where(vyear >= 2017, 99)  # 99 = NotApplicable before 2017
+            pvm = pvm.fillna(9)  # 9 = NotAvailable
             df['property_valuation_method'] = pvm.astype('Int16').astype('category')
 
         if 'special_eligibility_program' in df.columns and isinstance(df['special_eligibility_program'].dtype, CategoricalDtype):
@@ -191,7 +266,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
             df['cs_missing'] = df['credit_score'].isna().astype('int8')
             cs = pd.to_numeric(df['credit_score'], errors='coerce').clip(300, 850)
 
-            # cohort fill
+            # Cohort fill
             if self.use_cohort and 'loan_purpose' in df.columns:
                 if vyear is not None and self.stats_.get('credit_score_by_year_lp'):
                     keys = pd.Series(list(zip(vyear, df['loan_purpose'])), index=df.index)
@@ -201,7 +276,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                     mapped = df['loan_purpose'].map(self.stats_['credit_score_by_lp'])
                     cs = cs.fillna(mapped)
 
-            # global fallback
+            # Global fallback
             cs = cs.fillna(self.stats_.get('credit_score_global', float(np.nan)))
             df['credit_score'] = pd.Series(cs, index=df.index).round().astype('Int16')
 
@@ -210,11 +285,15 @@ class DataImputer(BaseEstimator, TransformerMixin):
             df['mi_missing'] = df['mi_percent'].isna().astype('int8')
             mi = pd.to_numeric(df['mi_percent'], errors='coerce').astype('Float32')
 
-            ltv = pd.to_numeric(df['original_ltv'], errors='coerce').clip(lower=0) if 'original_ltv' in df.columns else pd.Series(np.nan, index=df.index)
-            # règle métier
+            ltv = (
+                pd.to_numeric(df['original_ltv'], errors='coerce').clip(lower=0)
+                if 'original_ltv' in df.columns else pd.Series(np.nan, index=df.index)
+            )
+
+            # Business rule: if LTV <= 80 and MI is missing, set to 0
             mi = mi.mask(ltv.le(80) & mi.isna(), 0.0)
 
-            # cohort median by LTV bins (and year)
+            # Cohort median by LTV bins (and year)
             if 'original_ltv' in df.columns:
                 ltv_bins = pd.cut(ltv, self.ltv_bins, include_lowest=True, right=True)
 
@@ -252,6 +331,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
             df['cltv_missing'] = df['original_cltv'].isna().astype('int8')
             cltv = pd.to_numeric(df['original_cltv'], errors='coerce').astype('Float32')
 
+            # If CLTV missing, fallback to LTV; also ensure CLTV >= LTV when both are present
             if 'original_ltv' in df.columns:
                 ltv = pd.to_numeric(df['original_ltv'], errors='coerce').astype('Float32')
                 cltv = pd.Series(cltv, index=df.index).fillna(ltv)
@@ -264,19 +344,22 @@ class DataImputer(BaseEstimator, TransformerMixin):
             cltv = pd.Series(cltv, index=df.index).fillna(self.stats_.get('cltv_global', float(np.nan)))
             df['original_cltv'] = cltv.astype('Float32')
 
-        # 6) Small ordinal -> mode (cast explicite en numérique)
+        # 6) Small ordinal -> mode (explicit cast to numeric)
         for col in ['original_loan_term', 'number_of_borrowers']:
             if col in df.columns:
                 df[col + '_missing'] = df[col].isna().astype('int8')
                 mode_val = self.stats_.get(f'{col}_mode', np.nan)
+
                 ser_num = pd.to_numeric(df[col], errors='coerce')
                 mode_num = pd.to_numeric(pd.Series([mode_val]), errors='coerce').iloc[0]
+
                 ser_num = ser_num.fillna(mode_num)
                 if ser_num.isna().any():
                     ser_num = ser_num.fillna(method='ffill').fillna(method='bfill')
+
                 df[col] = pd.Series(ser_num.round(), index=df.index).astype('Int16')
 
-        # 7) Filet de sécurité générique
+        # 7) Generic safety net
         num_meds = self.stats_.get('global_num_median', {})
         for c, med in num_meds.items():
             if c in df.columns:
@@ -291,7 +374,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
             if c not in df.columns:
                 continue
 
-            # Datetime
+            # Datetime columns
             if is_datetime64_any_dtype(df[c]):
                 ser_dt = pd.to_datetime(df[c], errors='coerce')
                 if pd.notna(mode_val):
@@ -300,7 +383,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                     df[c] = ser_dt
                 continue
 
-            # Catégories
+            # Categorical columns
             if isinstance(df[c].dtype, CategoricalDtype):
                 cat = df[c]
                 cats = cat.cat.categories
@@ -322,6 +405,7 @@ class DataImputer(BaseEstimator, TransformerMixin):
                                 fill_val = type(cats[0])(try_conv)
                             else:
                                 fill_val = try_conv
+
                     if fill_val is None:
                         continue
                     if fill_val not in cats:
@@ -334,11 +418,11 @@ class DataImputer(BaseEstimator, TransformerMixin):
                     df[c] = cat.fillna(fill_val)
                 continue
 
-            # Autres non-numériques
+            # Other non-numeric columns
             fill_val = mode_val if pd.notna(mode_val) else 'Unknown'
             df[c] = df[c].fillna(fill_val)
 
-        # Added missing flag or drop all missing flags depending on configuration
+        # Add missing-flag features or drop all missing flags depending on configuration
         if self.missing_flag:
             df = pd.concat([df, missing0], axis=1)
         else:

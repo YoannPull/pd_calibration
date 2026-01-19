@@ -1,78 +1,112 @@
 #!/usr/bin/env python3
+# src/recalibrate_master_scale.py
 # -*- coding: utf-8 -*-
 
 """
-Recalibration "type (1)" = update de la table grade -> PD
-- mean     : PD brute par grade
-- isotonic : PD monotone lissée par grade (IsotonicRegression)
+recalibrate_grade_pd.py
+======================
 
-Supporte:
-- agrégation pooled     : sum(bad)/sum(count) par grade
-- agrégation time_mean  : moyenne arithmétique des DR_{grade, vintage} (par grade),
-                          utile si tu veux "moyenner dans le temps"
+Type-(1) recalibration: update the *grade -> PD* lookup table.
 
-Optionnel:
-- filtre fenêtre glissante: --window-years 5 (nécessite time_col)
-- ou bornes: --vintage-start / --vintage-end
+Two estimators are supported per grade:
+- mean     : raw grade PD (with optional pseudo-count smoothing)
+- isotonic : monotone-smoothed grade PD via IsotonicRegression (increasing with grade)
 
-Sortie:
-- un JSON du style bucket_stats "train" (liste de records par grade)
+Two aggregation modes are supported:
+- pooled     : PD_k = sum(bad_k) / sum(count_k) across all observations in the input
+- time_mean  : PD_k = average over time of DR_{k,t} (grade k, period t),
+               useful if you want to "average through time" instead of pooling.
+
+Optional time filtering:
+- rolling window: --window-years 5   (requires --time-col)
+- explicit bounds: --vintage-start / --vintage-end
+
+Output
+------
+A JSON payload aligned with the `bucket_stats.json` style used elsewhere in the
+pipeline, under the "train" key (list of per-grade records).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from datetime import datetime
-import re
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-
 from sklearn.isotonic import IsotonicRegression
 
 
+# =============================================================================
+# I/O
+# =============================================================================
+
 def load_any(path: str) -> pd.DataFrame:
+    """
+    Load a dataset from Parquet or CSV (format inferred from extension).
+    """
     p = Path(path)
-    if p.suffix in (".parquet", ".pq"):
+    if p.suffix.lower() in (".parquet", ".pq"):
         return pd.read_parquet(p)
     return pd.read_csv(p)
 
 
+# =============================================================================
+# Time parsing utilities
+# =============================================================================
+
 def parse_vintage_to_period(s: pd.Series, freq: str = "Q") -> pd.PeriodIndex:
     """
-    Convertit une colonne vintage en PeriodIndex.
-    Supporte:
-      - '2015Q1', '2015-Q1'
-      - dates parseables ('2015-03-31', etc.) -> conversion en trimestre
-      - Period déjà présent
+    Convert a "vintage" column to a pandas PeriodIndex.
+
+    Supported formats:
+    - Quarter strings: '2015Q1', '2015-Q1'
+    - Parseable dates: '2015-03-31', etc. -> converted to quarters/months
+    - Already a Period dtype
+
+    Parameters
+    ----------
+    s : pd.Series
+        Vintage-like column.
+    freq : {"Q","M"}
+        Target period frequency (quarters or months).
+
+    Returns
+    -------
+    pd.PeriodIndex
+        Period representation of the input.
     """
     if isinstance(s.dtype, pd.PeriodDtype):
         return s.astype("period[Q]").array
 
     s_str = s.astype(str)
 
-    # Cas type 'YYYYQn' ou 'YYYY-Qn'
+    # Case 1: strings like "YYYYQn" or "YYYY-Qn"
     m = s_str.str.match(r"^\d{4}[- ]?Q[1-4]$")
     if m.all():
         cleaned = s_str.str.replace(" ", "", regex=False).str.replace("-", "", regex=False)
-        # '2015Q1' ok pour PeriodIndex(freq='Q')
         return pd.PeriodIndex(cleaned, freq="Q")
 
-    # Sinon on tente datetime
+    # Case 2: attempt datetime parsing then convert
     dt = pd.to_datetime(s_str, errors="coerce", utc=False)
     if dt.notna().mean() < 0.95:
         bad = s_str[dt.isna()].head(5).tolist()
         raise ValueError(
-            f"Impossible de parser vintage en dates/quarters. Exemples non parseables: {bad}"
+            f"Could not parse vintage as dates/quarters. Examples of non-parseable values: {bad}"
         )
 
     if freq.upper().startswith("Q"):
         return dt.dt.to_period("Q")
     if freq.upper().startswith("M"):
         return dt.dt.to_period("M")
-    raise ValueError(f"freq non supportée: {freq}")
+    raise ValueError(f"Unsupported freq: {freq}")
 
+
+# =============================================================================
+# Grade reconstruction (optional)
+# =============================================================================
 
 def ensure_grade(
     df: pd.DataFrame,
@@ -81,24 +115,39 @@ def ensure_grade(
     buckets_json: str | None,
     n_buckets: int = 10,
 ) -> pd.DataFrame:
+    """
+    Ensure that `grade_col` exists in the input.
+
+    If grade is missing, reconstruct it from a score column and a bucket definition
+    (risk_buckets.json) so that the convention matches training:
+      - grade 1: least risky (highest scores)
+      - grade N: most risky  (lowest scores)
+    """
     if grade_col in df.columns:
         return df
 
     if score_col is None or buckets_json is None:
         raise ValueError(
-            f"Colonne '{grade_col}' absente. Fournis --score-col et --buckets pour reconstruire les grades."
+            f"Missing '{grade_col}'. Provide --score-col and --buckets to reconstruct grades."
         )
 
     edges = json.loads(Path(buckets_json).read_text(encoding="utf-8"))["edges"]
     scores = df[score_col].to_numpy()
 
+    # Raw bucket: 1 corresponds to lowest score range
     raw_grade = np.digitize(scores, np.array(edges)[1:], right=True) + 1
-    grade = n_buckets + 1 - raw_grade  # même convention que ton train_model.py
+
+    # Final convention: 1 is least risky (invert order)
+    grade = n_buckets + 1 - raw_grade
 
     out = df.copy()
     out[grade_col] = grade.astype(int)
     return out
 
+
+# =============================================================================
+# PD table computation
+# =============================================================================
 
 def compute_pd_table(
     df: pd.DataFrame,
@@ -111,14 +160,45 @@ def compute_pd_table(
     smooth: float,
     score_col: str | None,
 ) -> dict:
-    # Base stats par obs
+    """
+    Compute grade-level PDs and optionally apply isotonic monotone smoothing.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input scored dataset (can be a concatenation of multiple files).
+    target_col : str
+        Binary target name (0/1).
+    grade_col : str
+        Grade column (integer).
+    method : {"mean","isotonic"}
+        PD estimator per grade (raw vs monotone-smoothed).
+    aggregation : {"pooled","time_mean"}
+        How to aggregate information across time.
+    time_col : str or None
+        Vintage/time column used for time_mean aggregation.
+    time_freq : {"Q","M"}
+        Period frequency used when parsing the time column.
+    smooth : float
+        Pseudo-count smoothing: PD = (bad + smooth) / (count + 2*smooth).
+        Example: smooth=0.5 yields Jeffreys-like shrinkage.
+    score_col : str or None
+        If present, attach min/max score observed within each grade.
+
+    Returns
+    -------
+    dict
+        JSON-serializable payload aligned with `bucket_stats.json` structure.
+    """
     d = df.copy()
     d[target_col] = d[target_col].astype(int)
     d[grade_col] = d[grade_col].astype(int)
 
-    # Option score ranges
     has_score = score_col is not None and score_col in d.columns
 
+    # ------------------------------------------------------------------
+    # Aggregation step: produce a grade-level table with count, bad, pd_raw
+    # ------------------------------------------------------------------
     if aggregation == "pooled":
         g = d.groupby(grade_col, as_index=False).agg(
             count=(target_col, "size"),
@@ -138,8 +218,9 @@ def compute_pd_table(
 
     elif aggregation == "time_mean":
         if time_col is None:
-            raise ValueError("aggregation=time_mean nécessite --time-col.")
+            raise ValueError("aggregation=time_mean requires --time-col.")
 
+        # Compute period label (quarter/month) and grade-time default rates
         d["_period"] = parse_vintage_to_period(d[time_col], freq=time_freq)
 
         gt = d.groupby([grade_col, "_period"], as_index=False).agg(
@@ -148,10 +229,10 @@ def compute_pd_table(
         )
         gt["dr"] = (gt["bad"] + smooth) / (gt["count"] + 2 * smooth)
 
-        # moyenne arithmétique des DR dans le temps
+        # Arithmetic mean of grade-time default rates (equal weight per period)
         g = gt.groupby(grade_col, as_index=False).agg(
             n_periods=("_period", "nunique"),
-            count=("count", "sum"),   # volume total (utile pour pondérer isotonic)
+            count=("count", "sum"),  # total volume (useful as isotonic weights)
             bad=("bad", "sum"),
             pd_raw=("dr", "mean"),
         )
@@ -165,27 +246,33 @@ def compute_pd_table(
         else:
             g["min_score"] = np.nan
             g["max_score"] = np.nan
-    else:
-        raise ValueError(f"aggregation non supportée: {aggregation}")
 
+    else:
+        raise ValueError(f"Unsupported aggregation: {aggregation}")
+
+    # Sort grades to enforce the expected direction (1 -> least risky, N -> most risky)
     g = g.sort_values(grade_col).reset_index(drop=True)
 
-    # Isotonic smoothing sur les PD de grade (pondérée par les volumes)
+    # ------------------------------------------------------------------
+    # Optional isotonic smoothing to enforce monotonic PDs across grades
+    # ------------------------------------------------------------------
     if method == "mean":
         g["pd"] = g["pd_raw"]
     elif method == "isotonic":
         iso = IsotonicRegression(increasing=True, out_of_bounds="clip")
         x = g[grade_col].to_numpy(dtype=float)
         y = g["pd_raw"].to_numpy(dtype=float)
-        w = g["count"].to_numpy(dtype=float)  # poids = volumes par grade
+        w = g["count"].to_numpy(dtype=float)  # weights = exposure counts per grade
         g["pd"] = iso.fit_transform(x, y, sample_weight=w)
     else:
-        raise ValueError(f"method non supportée: {method}")
+        raise ValueError(f"Unsupported method: {method}")
 
-    # Monotonicité check (PD doit croître avec grade)
+    # Monotonicity check: PD should increase with grade (grade↑ => PD↑)
     mono = bool(np.all(np.diff(g["pd"].to_numpy()) >= -1e-15))
 
-    # Payload compatible "bucket_stats.json" (style train_model.py)
+    # ------------------------------------------------------------------
+    # Build a `bucket_stats.json`-like payload (records under "train")
+    # ------------------------------------------------------------------
     recs = []
     for _, r in g.iterrows():
         recs.append({
@@ -214,38 +301,52 @@ def compute_pd_table(
     return payload
 
 
+# =============================================================================
+# CLI
+# =============================================================================
+
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--scored", action="append", required=True,
-                   help="Chemin vers un fichier *_scored (parquet/csv). Peut être répété.")
-    p.add_argument("--target", required=True)
-    p.add_argument("--grade-col", default="grade")
-    p.add_argument("--time-col", default=None)
-    p.add_argument("--time-freq", default="Q", choices=["Q", "M"])
-    p.add_argument("--method", default="mean", choices=["mean", "isotonic"])
-    p.add_argument("--aggregation", default="pooled", choices=["pooled", "time_mean"])
-    p.add_argument("--smooth", type=float, default=0.0, help="Pseudo-comptes (0.5 = Jeffreys-like).")
-    p.add_argument("--out-json", required=True)
+    """Parse CLI arguments."""
+    p = argparse.ArgumentParser(description="Type-(1) recalibration: update grade->PD table.")
+    p.add_argument(
+        "--scored",
+        action="append",
+        required=True,
+        help="Path to a *_scored file (parquet/csv). Can be repeated.",
+    )
+    p.add_argument("--target", required=True, help="Binary default label column name")
+    p.add_argument("--grade-col", default="grade", help="Grade column name")
+    p.add_argument("--time-col", default=None, help="Vintage/time column (required for time_mean or time filters)")
+    p.add_argument("--time-freq", default="Q", choices=["Q", "M"], help="Period frequency used for parsing time-col")
+    p.add_argument("--method", default="mean", choices=["mean", "isotonic"], help="Raw vs isotonic-smoothed PDs")
+    p.add_argument("--aggregation", default="pooled", choices=["pooled", "time_mean"], help="Pooling strategy")
+    p.add_argument("--smooth", type=float, default=0.0, help="Pseudo-count smoothing (0.5 ~ Jeffreys-like)")
+    p.add_argument("--out-json", required=True, help="Output JSON path")
 
-    # Fenêtre glissante / filtres temps
-    p.add_argument("--window-years", type=int, default=None,
-                   help="Garde les X dernières années (nécessite --time-col).")
-    p.add_argument("--vintage-start", default=None, help="Ex: 2015Q1 (ou date).")
-    p.add_argument("--vintage-end", default=None, help="Ex: 2024Q4 (ou date).")
+    # Optional time filtering
+    p.add_argument("--window-years", type=int, default=None, help="Keep last X years (requires --time-col)")
+    p.add_argument("--vintage-start", default=None, help="Lower bound (e.g., 2015Q1 or a parseable date)")
+    p.add_argument("--vintage-end", default=None, help="Upper bound (e.g., 2024Q4 or a parseable date)")
 
-    # Si grade pas présent
-    p.add_argument("--score-col", default="score_ttc")
-    p.add_argument("--buckets", default=None, help="risk_buckets.json pour reconstruire les grades si besoin.")
-    p.add_argument("--n-buckets", type=int, default=10)
+    # If grade is missing, reconstruct it
+    p.add_argument("--score-col", default="score_ttc", help="Score column used to rebuild grade if needed")
+    p.add_argument("--buckets", default=None, help="risk_buckets.json used to rebuild grade if needed")
+    p.add_argument("--n-buckets", type=int, default=10, help="Number of grades/buckets used during training")
     return p.parse_args()
 
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
     args = parse_args()
 
+    # Load and concatenate inputs
     dfs = [load_any(p) for p in args.scored]
     df = pd.concat(dfs, axis=0, ignore_index=True)
 
+    # Ensure grade exists (reconstruct if needed)
     df = ensure_grade(
         df,
         grade_col=args.grade_col,
@@ -254,7 +355,9 @@ def main():
         n_buckets=args.n_buckets,
     )
 
-    # Filtrage fenêtre
+    # ------------------------------------------------------------------
+    # Optional time filtering (rolling window or explicit bounds)
+    # ------------------------------------------------------------------
     if args.time_col is not None and (args.window_years or args.vintage_start or args.vintage_end):
         per = parse_vintage_to_period(df[args.time_col], freq=args.time_freq)
         df = df.copy()
@@ -269,17 +372,14 @@ def main():
             df = df[df["_period"] <= p1]
 
         if args.window_years:
-            # on garde les derniers X*freq periods
             maxp = df["_period"].max()
-            if args.time_freq == "Q":
-                keep = args.window_years * 4
-            else:
-                keep = args.window_years * 12
+            keep = args.window_years * (4 if args.time_freq == "Q" else 12)
             minp = (maxp - keep + 1)
             df = df[df["_period"] >= minp]
 
         df = df.drop(columns=["_period"], errors="ignore")
 
+    # Compute recalibrated PD table
     payload = compute_pd_table(
         df=df,
         target_col=args.target,
@@ -292,10 +392,12 @@ def main():
         score_col=args.score_col,
     )
 
+    # Write JSON output
     outp = Path(args.out_json)
     outp.parent.mkdir(parents=True, exist_ok=True)
     outp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"✔ Recalibration écrite dans: {outp}")
+
+    print(f"✔ Recalibration written to: {outp}")
     print(f"  - method={payload['method']} aggregation={payload['aggregation']} monotone={payload['monotone_pd']}")
 
 

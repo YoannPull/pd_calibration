@@ -1,5 +1,3 @@
-
-
 data:
   root: "data/raw/mortgage_data"
   quarters: ["2008Q1","2008Q2","2008Q3","2008Q4",

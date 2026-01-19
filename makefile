@@ -1,40 +1,44 @@
 # ============================================================================
-# Makefile – Pipeline Risque de Crédit (Bank-Grade)
+# Makefile – Credit Risk Pipeline (Bank-Grade) — CLEAN
 # ============================================================================
-# Objectif :
-#   - Pipeline principal : Labels -> Impute -> Binning -> Model -> TTC Macro -> Report
-#   - Modules manuels : scoring OOS, reports vintage/grade, scoring custom
-#   - Recalibration (type 1) : update table grade -> PD (mean ou isotonic)
-#   - Application Master Scale : ajoute une PD "pd_ms" aux jeux scorés
+# 3 BLOCKS:
+#   (A) Empirical application #1 : Main pipeline (labels -> ... -> report)
+#   (B) Empirical application #2 : LDP / S&P grades (tables + plots)
+#   (C) Simulations              : binom / beta-binom / drift / prior sens
 # ============================================================================
 
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
 .DEFAULT_GOAL := help
 
-
 # ============================================================================
-# 0) ENVIRONNEMENT
+# 0) ENVIRONMENT
 # ============================================================================
 export OMP_NUM_THREADS ?= 1
 export MKL_NUM_THREADS ?= 1
 export OPENBLAS_NUM_THREADS ?= 1
+
+# Main pipeline scripts live under src/ (so we set PYTHONPATH=src)
 PY ?= PYTHONPATH=src poetry run python
+
+# LDP runner scripts are self-contained; use plain "poetry run python" here
+# (and avoid nested poetry inside those runner scripts)
+PYP ?= poetry run python
 
 
 # ============================================================================
-# 1) RÉPERTOIRES
+# 1) DIRECTORIES
 # ============================================================================
 DATA_DIR      := data/processed
 ARTIFACTS_DIR := artifacts
 REPORTS_DIR   := reports
 
-# Séries macro brutes (FRED)
+# Raw macro series directory (e.g., FRED downloads)
 MACRO_RAW_DIR := data/raw/macro
 
 
 # ============================================================================
-# 2) CONFIGURATION GLOBALE
+# 2) GLOBAL CONFIG (EMPIRICAL APP #1)
 # ============================================================================
 
 # 2.1 Labels
@@ -59,11 +63,11 @@ SCORED_OUT_DIR      = $(DATA_DIR)/scored
 MODEL_TRAIN_DATA    = $(BINNING_OUT_DIR)/train.parquet
 MODEL_VAL_DATA      = $(BINNING_OUT_DIR)/validation.parquet
 
-# 2.5 Scored (sorties de train_model.py)
+# 2.5 Scored outputs (produced by train_model.py)
 SCORED_TRAIN_DATA   = $(SCORED_OUT_DIR)/train_scored.parquet
 SCORED_VAL_DATA     = $(SCORED_OUT_DIR)/validation_scored.parquet
 
-# 2.6 TTC Macro
+# 2.6 TTC Macro output (JSON)
 PD_TTC_MACRO_JSON   = $(MODEL_ARTIFACTS_DIR)/pd_ttc_macro.json
 
 # 2.7 OOS & Reporting
@@ -76,55 +80,76 @@ VINTAGE_REPORT_VAL  = $(REPORTS_DIR)/vintage_grade_validation.html
 
 
 # ============================================================================
-# 3) AIDE
+# 3) HELP
 # ============================================================================
 .PHONY: help
 help:
 	@echo "================================================================="
-	@echo "   PIPELINE RISQUE DE CRÉDIT -- FOCUS CALIBRATION"
+	@echo "   CREDIT RISK PIPELINE -- CLEAN (3 BLOCKS)"
 	@echo "================================================================="
-	@echo "  make pipeline                 : (1) labels -> (2) impute -> (3) binning -> (4) model -> (5) ttc_macro -> (6) report"
+	@echo ""
 	@echo "-----------------------------------------------------------------"
-	@echo "  [PIPELINE]"
-	@echo "    make labels                 : 1) Génère les labels"
-	@echo "    make impute                 : 2) Impute (Fit Train / Transform All)"
-	@echo "    make binning_fit            : 3) Discrétise (Max Gini + Monotonicité)"
-	@echo "    make model_train            : 4) Entraîne (LR + Calibration + Grille + scored)"
-	@echo "    make ttc_macro              : 5) Estime la PD TTC macro par grade"
-	@echo "    make report                 : 6) Génère le rapport HTML (Train+Val scorés)"
+	@echo "  (A) EMPIRICAL APPLICATION #1 — MAIN PIPELINE"
 	@echo "-----------------------------------------------------------------"
-	@echo "  [RECALIBRATION MASTER SCALE]"
-	@echo "    make recalibrate_pd         : Recalibration type (1) (grade->PD) sur fenêtre glissante"
-	@echo "    make val_apply_ms           : Applique la master scale recalibrée sur Validation (ajoute pd_ms)"
-	@echo "    make oos_apply_ms           : Applique la master scale recalibrée sur OOS (ajoute pd_ms)"
+	@echo "    make pipeline                 : labels -> impute -> binning_fit -> model_train_final -> ttc_macro -> report"
+	@echo "    make labels                   : 1) Generate default labels"
+	@echo "    make impute                   : 2) Impute (fit on Train / transform all)"
+	@echo "    make binning_fit              : 3) Binning (Max Gini + monotonicity)"
+	@echo "    make model_train_iter         : 4) Train model (ITER: halving, large search)"
+	@echo "    make model_train_final        : 4) Train model (FINAL: grid, reproducible)"
+	@echo "    make ttc_macro                : 5) Estimate TTC macro PD per grade"
+	@echo "    make report                   : 6) Generate HTML report (train+val scored)"
+	@echo ""
+	@echo "    make recalibrate_pd           : Type-1 recalibration (grade->PD) on rolling window"
+	@echo "    make val_apply_ms             : Apply recalibrated master scale on Validation (pd_ms)"
+	@echo "    make oos_apply_ms             : Apply recalibrated master scale on OOS (pd_ms)"
+	@echo ""
+	@echo "    make oos_score                : Score OOS sample (oos.parquet)"
+	@echo "    make oos_vintage_report       : Score OOS + vintage/grade report"
+	@echo "    make val_vintage_report       : Vintage/grade report on Validation"
+	@echo "    make score_custom             : Score a custom dataset"
+	@echo ""
 	@echo "-----------------------------------------------------------------"
-	@echo "  [MODULES MANUELS]"
-	@echo "    make oos_score              : Scoring OOS (fichier oos.parquet)"
-	@echo "    make oos_vintage_report     : Scoring OOS + report vintage/grade"
-	@echo "    make val_vintage_report     : Report vintage/grade sur Validation"
-	@echo "    make score_custom           : Scorer un fichier spécifique"
-	@echo "    make clean_all              : Nettoyage complet"
+	@echo "  (B) EMPIRICAL APPLICATION #2 — LDP / S&P GRADES (tables + plots)"
+	@echo "-----------------------------------------------------------------"
+	@echo "    make sp_grade_tables          : Build S&P grade tables (CSV per year + combined CSV)"
+	@echo "    make sp_grade_plots           : Build plots from combined CSV (timeseries)"
+	@echo "    make sp_grade_all             : tables + plots"
+	@echo ""
+	@echo "-----------------------------------------------------------------"
+	@echo "  (C) SIMULATIONS"
+	@echo "-----------------------------------------------------------------"
+	@echo "    make binom_all                : sim+plots+tables (binomial)"
+	@echo "    make beta_binom_all           : sim+plots+tables (beta-binomial)"
+	@echo "    make temporal_drift_all       : sim+plots+tables (temporal drift)"
+	@echo "    make prior_sens_all           : sim+plots+tables (prior sensitivity)"
+	@echo "    make sims_all                 : run everything"
+	@echo ""
+	@echo "-----------------------------------------------------------------"
+	@echo "  CLEAN"
+	@echo "-----------------------------------------------------------------"
+	@echo "    make clean_all                : Remove all processed outputs / artifacts / reports"
 	@echo "================================================================="
 
 
 # ============================================================================
-# 4) PIPELINE PRINCIPAL (1 -> 6)
+# (A) EMPIRICAL APPLICATION #1 — MAIN PIPELINE (1 -> 6)
 # ============================================================================
 
 # ----------------------------------------------------------------------------
-# 4.1) LABELS
+# A.1) LABELS
 # ----------------------------------------------------------------------------
 .PHONY: labels
 labels:
-	@echo "\n[1/6] GÉNÉRATION DES LABELS..."
+	@echo "\n[1/6] GENERATING LABELS..."
 	$(PY) src/make_labels.py --config $(LABELS_CONFIG) --workers 12
 
 # ----------------------------------------------------------------------------
-# 4.2) IMPUTATION (Anti-Leakage)
+# A.2) IMPUTATION (Anti-leakage)
 # ----------------------------------------------------------------------------
 .PHONY: impute
 impute:
-	@echo "\n[2/6] IMPUTATION (Fit on Train / Transform All)..."
+	@echo "\n[2/6] IMPUTATION (fit on Train / transform all)..."
 	$(PY) src/impute_and_save.py \
 		--labels-window-dir $(LABELS_OUTDIR)/window=$(LABELS_WINDOW)m \
 		--target $(IMPUTE_TARGET_COL) \
@@ -134,11 +159,11 @@ impute:
 		--fail-on-nan
 
 # ----------------------------------------------------------------------------
-# 4.3) BINNING (Monotone)
+# A.3) BINNING (Monotone)
 # ----------------------------------------------------------------------------
 .PHONY: binning_fit
 binning_fit:
-	@echo "\n[3/6] BINNING (Max Gini + Monotonicity Check)..."
+	@echo "\n[3/6] BINNING (Max Gini + monotonicity check)..."
 	$(PY) src/fit_binning.py \
 		--train $(BINNING_TRAIN) \
 		--validation $(BINNING_VAL) \
@@ -150,67 +175,48 @@ binning_fit:
 		--n-quantiles-num 50
 
 # ----------------------------------------------------------------------------
-# 4.4) MODEL TRAINING (Master Scale + SCORING TRAIN/VAL) — FINAL RECOMMENDED
+# A.4) MODEL TRAINING (Master Scale + scoring Train/Validation)
 # ----------------------------------------------------------------------------
-# Usage (itération rapide):
-#   make model_train_iter
-#
-# Usage (modèle final reproductible):
-#   make model_train_final
-#
-# Tu peux surcharger à l'appel, ex:
-#   make model_train_iter CALIBRATION=sigmoid CAL_SIZE=0.25 NO_INTERACTIONS=1
-#   make model_train_final N_BUCKETS_CANDIDATES="7,8,9,10" MIN_BUCKET_BAD=10
-#
-
-# ----------------------------
-# Search space (LARGE)
-# ----------------------------
-SEARCH          ?= halving      # halving | grid
+# Hyperparameter search
+SEARCH          ?= halving
 C_MIN_EXP       ?= -12
 C_MAX_EXP       ?= 6
 C_NUM           ?= 120
 HALVING_FACTOR  ?= 3
 SEARCH_VERBOSE  ?= 0
 
-LR_SOLVER       ?= lbfgs        # lbfgs | saga | newton-cg
+# Logistic regression training
+LR_SOLVER       ?= lbfgs
 LR_MAX_ITER     ?= 4000
-COEF_STATS      ?= none         # statsmodels | none
+COEF_STATS      ?= none
 
-# ----------------------------
-# Time-aware CV / calibration
-# ----------------------------
-CV_SCHEME       ?= time         # time | stratified
-CAL_SPLIT       ?= time_last    # time_last | stratified
-CAL_SIZE        ?= 0.40         # recommandé: 0.20–0.30 (éviter 0.50)
+# Time-aware CV / calibration split
+CV_SCHEME       ?= time
+CAL_SPLIT       ?= time_last
+CAL_SIZE        ?= 0.40
 CV_TIME_COL     ?= vintage
-CV_TIME_FREQ    ?= Q            # Q | M
+CV_TIME_FREQ    ?= Q
 
-CALIBRATION     ?= isotonic      # none | sigmoid | isotonic (sigmoid en baseline robuste)
+# Calibration method
+CALIBRATION     ?= isotonic
 
-# ----------------------------
-# Windows for grid/TTC
-# ----------------------------
+# Rolling windows
 GRID_YEARS      ?= 12
 TTC_YEARS       ?= 12
 GRID_TIME_COL   ?= vintage
-GRID_TIME_FREQ  ?= Q            # Q | M
+GRID_TIME_FREQ  ?= Q
 
-# ----------------------------
-# Master scale (buckets)
-# ----------------------------
+# Master scale (risk buckets)
 N_BUCKETS       ?= 10
-# Optionnel: activer la sélection auto sous contraintes (recommandé si tests OOS instables)
 N_BUCKETS_CANDIDATES ?=
 MIN_BUCKET_COUNT ?= 300
 MIN_BUCKET_BAD   ?= 5
 
-# ----------------------------
-# Switches (0/1)
-# ----------------------------
+# Switches
 NO_INTERACTIONS ?= 0
 TIMING          ?= 1
 
+# Flags derived from switches
 ifeq ($(NO_INTERACTIONS),1)
   NO_INTERACTIONS_FLAG := --no-interactions
 else
@@ -223,6 +229,7 @@ else
   TIMING_FLAG :=
 endif
 
+# Optional “auto bucket selection” constraints
 ifneq ($(strip $(N_BUCKETS_CANDIDATES)),)
   N_BUCKETS_CANDIDATES_FLAG := --n-buckets-candidates "$(N_BUCKETS_CANDIDATES)" \
                                --min-bucket-count $(MIN_BUCKET_COUNT) \
@@ -231,14 +238,9 @@ else
   N_BUCKETS_CANDIDATES_FLAG :=
 endif
 
-
-# ----------------------------
-# Targets
-# ----------------------------
-
 .PHONY: model_train_iter
 model_train_iter:
-	@echo "\n[4/6] MODEL TRAIN (ITER) — halving, large search space..."
+	@echo "\n[4/6] MODEL TRAIN (ITER) — halving search, large space..."
 	$(PY) src/train_model.py \
 		--train $(MODEL_TRAIN_DATA) \
 		--validation $(MODEL_VAL_DATA) \
@@ -272,10 +274,9 @@ model_train_iter:
 		$(NO_INTERACTIONS_FLAG) \
 		$(TIMING_FLAG)
 
-
 .PHONY: model_train_final
 model_train_final:
-	@echo "\n[4/6] MODEL TRAIN (FINAL) — grid, reproductible..."
+	@echo "\n[4/6] MODEL TRAIN (FINAL) — grid search, reproducible..."
 	$(PY) src/train_model.py \
 		--train $(MODEL_TRAIN_DATA) \
 		--validation $(MODEL_VAL_DATA) \
@@ -308,13 +309,13 @@ model_train_final:
 		$(TIMING_FLAG)
 
 # ----------------------------------------------------------------------------
-# 4.5) PD TTC MACRO (grade × temps + macro)
+# A.5) TTC MACRO PD ESTIMATION
 # ----------------------------------------------------------------------------
 .PHONY: ttc_macro
 ttc_macro:
-	@echo "\n[5/6] ESTIMATION PD TTC MACRO PAR GRADE (pd_ttc_macro)..."
-	@test -f "$(SCORED_TRAIN_DATA)" || (echo "[ERR] Fichier train_scored manquant : $(SCORED_TRAIN_DATA)"; exit 1)
-	@test -f "$(SCORED_VAL_DATA)"   || (echo "[ERR] Fichier validation_scored manquant : $(SCORED_VAL_DATA)"; exit 1)
+	@echo "\n[5/6] ESTIMATING TTC MACRO PD PER GRADE (pd_ttc_macro)..."
+	@test -f "$(SCORED_TRAIN_DATA)" || (echo "[ERR] Missing: $(SCORED_TRAIN_DATA)"; exit 1)
+	@test -f "$(SCORED_VAL_DATA)"   || (echo "[ERR] Missing: $(SCORED_VAL_DATA)"; exit 1)
 	$(PY) src/estimate_ttc_macro.py \
 		--train-scored $(SCORED_TRAIN_DATA) \
 		--val-scored $(SCORED_VAL_DATA) \
@@ -322,14 +323,14 @@ ttc_macro:
 		--target $(IMPUTE_TARGET_COL) \
 		--time-col vintage \
 		--out-json $(PD_TTC_MACRO_JSON)
-	@echo "✔ PD TTC macro par grade sauvegardée dans : $(PD_TTC_MACRO_JSON)"
+	@echo "✔ TTC macro PD written to: $(PD_TTC_MACRO_JSON)"
 
 # ----------------------------------------------------------------------------
-# 4.6) REPORTING (TRAIN + VALIDATION déjà scorés)
+# A.6) REPORTING
 # ----------------------------------------------------------------------------
 .PHONY: report
 report:
-	@echo "\n[6/6] GENERATION DU RAPPORT GLOBAL (Train + Validation scorés)..."
+	@echo "\n[6/6] GENERATING GLOBAL REPORT (Train + Validation scored)..."
 	$(PY) src/generate_report.py \
 		--train $(SCORED_TRAIN_DATA) \
 		--validation $(SCORED_VAL_DATA) \
@@ -337,33 +338,31 @@ report:
 		--target $(IMPUTE_TARGET_COL) \
 		--score score_ttc --pd pd --grade grade \
 		--model $(MODEL_ARTIFACTS_DIR)/model_best.joblib
-	@echo "✔ Rapport généré : $(REPORT_HTML)"
+	@echo "✔ Report generated: $(REPORT_HTML)"
 	@open $(REPORT_HTML) 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
-# 4.X) PIPELINE GLOBAL
+# A.X) FULL PIPELINE (shortcut)
 # ----------------------------------------------------------------------------
 .PHONY: pipeline
-pipeline: labels impute binning_fit model_train ttc_macro report
+pipeline: labels impute binning_fit model_train_final ttc_macro report
 	@echo "\n-------------------------------------------------------"
-	@echo "✔ PIPELINE DE VALIDATION TERMINÉ."
+	@echo "✔ VALIDATION PIPELINE COMPLETED."
 	@echo "-------------------------------------------------------"
 
 
 # ============================================================================
-# 5) RECALIBRATION MASTER SCALE (Type 1 : update grade -> PD)
+# (A bis) RECALIBRATION / MASTER SCALE (APP #1)
 # ============================================================================
-
-# Paramètres recalibration
-RECAL_METHOD ?= mean        # mean | isotonic
-RECAL_AGG    ?= time_mean   # pooled | time_mean
+RECAL_METHOD ?= mean
+RECAL_AGG    ?= time_mean
 RECAL_YEARS  ?= 5
 
 BUCKET_STATS_RECAL := $(MODEL_ARTIFACTS_DIR)/bucket_stats_recalibrated.json
 
 .PHONY: recalibrate_pd
 recalibrate_pd:
-	@echo "\n[REC] Recalibration PD par grade (method=$(RECAL_METHOD), agg=$(RECAL_AGG), years=$(RECAL_YEARS))..."
+	@echo "\n[REC] Recalibrating grade->PD (method=$(RECAL_METHOD), agg=$(RECAL_AGG), years=$(RECAL_YEARS))..."
 	@test -f "$(SCORED_TRAIN_DATA)" || (echo "[ERR] Missing: $(SCORED_TRAIN_DATA)"; exit 1)
 	@test -f "$(SCORED_VAL_DATA)"   || (echo "[ERR] Missing: $(SCORED_VAL_DATA)"; exit 1)
 	$(PY) src/recalibrate_master_scale.py \
@@ -377,19 +376,14 @@ recalibrate_pd:
 		--aggregation $(RECAL_AGG) \
 		--window-years $(RECAL_YEARS) \
 		--out-json $(BUCKET_STATS_RECAL)
-	@echo "✔ Bucket stats recalibrés : $(BUCKET_STATS_RECAL)"
-
-
-# ============================================================================
-# 6) APPLICATION MASTER SCALE (ajoute pd_ms aux fichiers scorés)
-# ============================================================================
+	@echo "✔ Recalibrated bucket stats written to: $(BUCKET_STATS_RECAL)"
 
 SCORED_VAL_MS := $(SCORED_OUT_DIR)/validation_scored_ms.parquet
 OOS_SCORED_MS := $(SCORED_OUT_DIR)/oos_scored_ms.parquet
 
 .PHONY: val_apply_ms
 val_apply_ms:
-	@echo "\n[MS] Application master scale recalibrée sur Validation..."
+	@echo "\n[MS] Applying recalibrated master scale to Validation..."
 	@test -f "$(SCORED_VAL_DATA)"      || (echo "[ERR] Missing: $(SCORED_VAL_DATA)"; exit 1)
 	@test -f "$(BUCKET_STATS_RECAL)"   || (echo "[ERR] Missing: $(BUCKET_STATS_RECAL)"; exit 1)
 	$(PY) src/apply_master_scale.py \
@@ -398,11 +392,11 @@ val_apply_ms:
 		--bucket-stats $(BUCKET_STATS_RECAL) \
 		--grade-col grade \
 		--pd-col-out pd_ms
-	@echo "✔ Validation enrichie : $(SCORED_VAL_MS)"
+	@echo "✔ Validation enriched: $(SCORED_VAL_MS)"
 
 .PHONY: oos_apply_ms
 oos_apply_ms: oos_score
-	@echo "\n[MS] Application master scale recalibrée sur OOS..."
+	@echo "\n[MS] Applying recalibrated master scale to OOS..."
 	@test -f "$(OOS_SCORED)"          || (echo "[ERR] Missing: $(OOS_SCORED)"; exit 1)
 	@test -f "$(BUCKET_STATS_RECAL)" || (echo "[ERR] Missing: $(BUCKET_STATS_RECAL)"; exit 1)
 	$(PY) src/apply_master_scale.py \
@@ -411,20 +405,16 @@ oos_apply_ms: oos_score
 		--bucket-stats $(BUCKET_STATS_RECAL) \
 		--grade-col grade \
 		--pd-col-out pd_ms
-	@echo "✔ OOS enrichi : $(OOS_SCORED_MS)"
+	@echo "✔ OOS enriched: $(OOS_SCORED_MS)"
 
 
 # ============================================================================
-# 7) MODULES STANDALONE (HORS PIPELINE AUTOMATIQUE)
+# (A ter) MANUAL MODULES (APP #1)
 # ============================================================================
-
-# ----------------------------------------------------------------------------
-# 7.1) OOS SCORING (Full pipeline OOS)
-# ----------------------------------------------------------------------------
 .PHONY: oos_score
 oos_score:
-	@echo "\n[MANUEL] SCORING ECHANTILLON OOS (Out-of-Sample, full pipeline)..."
-	@test -f "$(OOS_LABELS_PARQUET)" || (echo "[ERR] Fichier OOS manquant : $(OOS_LABELS_PARQUET)"; exit 1)
+	@echo "\n[MANUAL] SCORING OOS SAMPLE..."
+	@test -f "$(OOS_LABELS_PARQUET)" || (echo "[ERR] Missing: $(OOS_LABELS_PARQUET)"; exit 1)
 	$(PY) src/apply_model.py \
 		--data $(OOS_LABELS_PARQUET) \
 		--out $(OOS_SCORED) \
@@ -434,14 +424,11 @@ oos_score:
 		--buckets $(MODEL_ARTIFACTS_DIR)/risk_buckets.json \
 		--target $(IMPUTE_TARGET_COL) \
 		--id-col loan_sequence_number
-	@echo "✔ Scoring terminé : $(OOS_SCORED)"
+	@echo "✔ OOS scoring done: $(OOS_SCORED)"
 
-# ----------------------------------------------------------------------------
-# 7.2) OOS: Vintage/Grade report
-# ----------------------------------------------------------------------------
 .PHONY: oos_vintage_report
 oos_vintage_report: oos_score
-	@echo "\n[MANUEL] VINTAGE / GRADE REPORT SUR OOS..."
+	@echo "\n[MANUAL] VINTAGE / GRADE REPORT (OOS)..."
 	$(PY) src/generate_vintage_grade_report.py \
 		--data $(OOS_SCORED) \
 		--out $(VINTAGE_REPORT_OOS) \
@@ -451,16 +438,13 @@ oos_vintage_report: oos_score
 		--target $(IMPUTE_TARGET_COL) \
 		--sample-name "OOS" \
 		--bucket-stats $(MODEL_ARTIFACTS_DIR)/bucket_stats.json
-	@echo "✔ Rapport OOS Vintage / Grade généré : $(VINTAGE_REPORT_OOS)"
+	@echo "✔ OOS report: $(VINTAGE_REPORT_OOS)"
 	@open $(VINTAGE_REPORT_OOS) 2>/dev/null || true
 
-# ----------------------------------------------------------------------------
-# 7.3) Validation: Vintage/Grade report
-# ----------------------------------------------------------------------------
 .PHONY: val_vintage_report
 val_vintage_report:
-	@echo "\n[MANUEL] VINTAGE / GRADE REPORT SUR VALIDATION..."
-	@test -f "$(SCORED_VAL_DATA)" || (echo "[ERR] Fichier validation_scored manquant : $(SCORED_VAL_DATA)"; exit 1)
+	@echo "\n[MANUAL] VINTAGE / GRADE REPORT (Validation)..."
+	@test -f "$(SCORED_VAL_DATA)" || (echo "[ERR] Missing: $(SCORED_VAL_DATA)"; exit 1)
 	$(PY) src/generate_vintage_grade_report.py \
 		--data $(SCORED_VAL_DATA) \
 		--out $(VINTAGE_REPORT_VAL) \
@@ -470,21 +454,17 @@ val_vintage_report:
 		--target $(IMPUTE_TARGET_COL) \
 		--sample-name "Validation" \
 		--bucket-stats $(MODEL_ARTIFACTS_DIR)/bucket_stats.json
-	@echo "✔ Rapport Validation Vintage / Grade généré : $(VINTAGE_REPORT_VAL)"
+	@echo "✔ Validation report: $(VINTAGE_REPORT_VAL)"
 	@open $(VINTAGE_REPORT_VAL) 2>/dev/null || true
 
-
-# ----------------------------------------------------------------------------
-# 7.4) SCORING CUSTOM
-# ----------------------------------------------------------------------------
 CUSTOM_DATA   ?= $(OOS_LABELS_PARQUET)
 CUSTOM_OUT    ?= $(SCORED_OUT_DIR)/custom_scored.parquet
 CUSTOM_TARGET ?= $(IMPUTE_TARGET_COL)
 
 .PHONY: score_custom
 score_custom:
-	@echo "\n[MANUEL] Scoring fichier : $(CUSTOM_DATA)"
-	@test -f "$(CUSTOM_DATA)" || (echo "[ERR] Fichier introuvable : $(CUSTOM_DATA)"; exit 1)
+	@echo "\n[MANUAL] Scoring custom dataset: $(CUSTOM_DATA)"
+	@test -f "$(CUSTOM_DATA)" || (echo "[ERR] Missing: $(CUSTOM_DATA)"; exit 1)
 	$(PY) src/apply_model.py \
 		--data $(CUSTOM_DATA) \
 		--out $(CUSTOM_OUT) \
@@ -494,23 +474,95 @@ score_custom:
 		--buckets $(MODEL_ARTIFACTS_DIR)/risk_buckets.json \
 		--target $(CUSTOM_TARGET) \
 		--id-col loan_sequence_number
-	@echo "✔ Résultat : $(CUSTOM_OUT)"
-
-
-# ----------------------------------------------------------------------------
-# 7.5) NETTOYAGE
-# ----------------------------------------------------------------------------
-.PHONY: clean_all
-clean_all:
-	rm -rf $(DATA_DIR) $(ARTIFACTS_DIR) $(REPORTS_DIR)
-	@echo "✔ Tout est nettoyé."
+	@echo "✔ Custom scoring output: $(CUSTOM_OUT)"
 
 
 # ============================================================================
-# 8) SIMULATIONS
+# (B) EMPIRICAL APPLICATION #2 — LDP / S&P GRADES (tables + plots)
+# Expected repository layout (from repo root):
+#   ldp_application/
+#     run_sp_grade_tables.py
+#     run_sp_grade_plots.py
+#     scripts/sp_grade_tables.py
+#     scripts/sp_grade_plots.py
+#     data/raw/data_rating_corporate.xlsx
 # ============================================================================
+SPG_ROOT   ?= ldp_application
+SPG_FILE   ?= $(SPG_ROOT)/data/raw/data_rating_corporate.xlsx
+SPG_OUTDIR ?= $(SPG_ROOT)/outputs/sp_grade_is_oos
 
-# --- Binomial ---
+SPG_AGENCY ?= Standard & Poor's Ratings Services
+SPG_HORIZON_MONTHS ?= 12
+SPG_CONF_LEVEL ?= 0.95
+
+# Windows (requested; scripts may clip when using external TTC tables)
+SPG_IS_START  ?= 2010
+SPG_IS_END    ?= 2018
+SPG_OOS_START ?= 2010
+SPG_OOS_END   ?= 2020
+
+# TTC settings
+SPG_TTC_SOURCE    ?= sp2012
+SPG_TTC_ESTIMATOR ?= pooled
+SPG_DROP_NO_TTC   ?= 1
+SPG_INCLUDE_UNOBS ?= 0
+
+# Plot options
+SPG_PMAX        ?=
+SPG_MIN_TOTAL_N ?= 1
+
+# Combined CSV name for the *requested* range (fallback to most recent if missing)
+SPG_TABLES_CSV ?= $(SPG_OUTDIR)/sp_grade_tables_$(SPG_OOS_START)_$(SPG_OOS_END).csv
+
+.PHONY: sp_grade_tables sp_grade_plots sp_grade_all
+
+sp_grade_tables:
+	@echo "\n[SP-GRADE] Tables (TTC_SOURCE=$(SPG_TTC_SOURCE))..."
+	@test -f "$(SPG_FILE)" || (echo "[ERR] Missing: $(SPG_FILE)"; exit 1)
+	@if [ "$(SPG_INCLUDE_UNOBS)" = "1" ]; then INC_FLAG="--include-unobserved"; else INC_FLAG=""; fi; \
+	if [ "$(SPG_DROP_NO_TTC)" = "1" ]; then DROP_FLAG="--drop-grades-without-ttc"; else DROP_FLAG=""; fi; \
+	$(PYP) $(SPG_ROOT)/run_sp_grade_tables.py --no-poetry \
+		--file "$(SPG_FILE)" \
+		--outdir "$(SPG_OUTDIR)" \
+		--agency "$(SPG_AGENCY)" \
+		--horizon-months $(SPG_HORIZON_MONTHS) \
+		--confidence-level $(SPG_CONF_LEVEL) \
+		--is-start $(SPG_IS_START) \
+		--is-end $(SPG_IS_END) \
+		--oos-start $(SPG_OOS_START) \
+		--oos-end $(SPG_OOS_END) \
+		--ttc-source $(SPG_TTC_SOURCE) \
+		--ttc-estimator $(SPG_TTC_ESTIMATOR) \
+		$$INC_FLAG $$DROP_FLAG
+	@echo "✔ Tables written to: $(SPG_OUTDIR)"
+	@echo "  - sp_grade_table_YYYY.csv (one per year)"
+	@echo "  - sp_grade_tables_*.csv (combined)"
+
+sp_grade_plots:
+	@echo "\n[SP-GRADE] Plots..."
+	@# Use the “expected” combined CSV; if missing (year clipping), fall back to the newest produced CSV.
+	@TABLES="$(SPG_TABLES_CSV)"; \
+	if [ ! -f "$$TABLES" ]; then \
+		TABLES=$$(ls -1t "$(SPG_OUTDIR)"/sp_grade_tables_*.csv 2>/dev/null | head -n 1 || true); \
+	fi; \
+	test -f "$$TABLES" || (echo "[ERR] Missing tables CSV in $(SPG_OUTDIR). Run 'make sp_grade_tables' first."; exit 1); \
+	echo "Using tables CSV: $$TABLES"; \
+	PMAX_FLAG=""; \
+	if [ -n "$(strip $(SPG_PMAX))" ]; then PMAX_FLAG="--p-max $(SPG_PMAX)"; fi; \
+	$(PYP) $(SPG_ROOT)/run_sp_grade_plots.py --no-poetry \
+		--tables-csv "$$TABLES" \
+		--outdir "$(SPG_OUTDIR)/plots_timeseries" \
+		--confidence-level $(SPG_CONF_LEVEL) \
+		--min-total-n $(SPG_MIN_TOTAL_N) \
+		$$PMAX_FLAG
+	@echo "✔ Plots written to: $(SPG_OUTDIR)/plots_timeseries"
+
+sp_grade_all: sp_grade_tables sp_grade_plots
+
+
+# ============================================================================
+# (C) SIMULATIONS
+# ============================================================================
 .PHONY: binom_sim binom_plots binom_tables binom_all
 binom_sim:
 	poetry run python -m experiments.binom_coverage.sim_binom
@@ -520,7 +572,6 @@ binom_tables:
 	poetry run python -m experiments.binom_coverage.make_table_binom
 binom_all: binom_sim binom_plots binom_tables
 
-# --- Beta-binomial ---
 .PHONY: beta_binom_sim beta_binom_plots beta_binom_tables beta_binom_all
 beta_binom_sim:
 	poetry run python -m experiments.beta_binom_jeffreys.sim_beta_binom
@@ -530,7 +581,6 @@ beta_binom_tables:
 	poetry run python -m experiments.beta_binom_jeffreys.make_table_beta_binom
 beta_binom_all: beta_binom_sim beta_binom_plots beta_binom_tables
 
-# --- Temporal drift ---
 .PHONY: temporal_drift_sim temporal_drift_plots temporal_drift_tables temporal_drift_all
 temporal_drift_sim:
 	poetry run python -m experiments.temporal_drift.sim_temporal_drift
@@ -540,62 +590,23 @@ temporal_drift_tables:
 	poetry run python -m experiments.temporal_drift.make_table_temporal_drift
 temporal_drift_all: temporal_drift_sim temporal_drift_plots temporal_drift_tables
 
-
-# --- Prior sensibility (Bayesian priors: Jeffreys, Laplace, Haldane, etc.) ---
 .PHONY: prior_sens_sim prior_sens_plots prior_sens_tables prior_sens_all
-
 prior_sens_sim:
 	poetry run python -m experiments.prior_sensibility.sim_prior_sensibility
-
 prior_sens_plots:
 	poetry run python -m experiments.prior_sensibility.plot_prior_sensibility
-
 prior_sens_tables:
 	poetry run python -m experiments.prior_sensibility.make_table_prior_sensibility
-
 prior_sens_all: prior_sens_sim prior_sens_plots prior_sens_tables
 
-
-# --- Tout lancer ---
 .PHONY: sims_all
 sims_all: beta_binom_all temporal_drift_all binom_all prior_sens_all
 
 
 # ============================================================================
-# 9) LDP APPLICATION (Intervals comparison: Normal vs Jeffreys vs CP)
-#   Repo layout (from project root):
-#     ldp_application/
-#       run_ldp.py
-#       scripts/ldp_application.py
-#       data/raw/data_rating_corporate.xlsx
+# CLEANUP
 # ============================================================================
-
-LDP_ROOT   ?= ldp_application
-LDP_FILE   ?= $(LDP_ROOT)/data/raw/data_rating_corporate.xlsx
-LDP_OUTDIR ?= $(LDP_ROOT)/outputs/ldp
-LDP_AGENCY ?= Standard & Poor's Ratings Services
-LDP_HORIZON_MONTHS ?= 12
-LDP_ALPHA  ?= 0.05
-
-.PHONY: ldp_list_agencies ldp_run ldp_all
-
-ldp_list_agencies:
-	@echo "\n[LDP] Listing agencies in $(LDP_FILE)..."
-	@test -f "$(LDP_FILE)" || (echo "[ERR] Missing LDP_FILE: $(LDP_FILE)"; exit 1)
-	poetry run python $(LDP_ROOT)/run_ldp.py --list-agencies --file "$(LDP_FILE)"
-
-ldp_run:
-	@echo "\n[LDP] Running LDP interval comparison (Normal / Jeffreys / CP)..."
-	@test -f "$(LDP_FILE)" || (echo "[ERR] Missing LDP_FILE: $(LDP_FILE)"; exit 1)
-	poetry run python $(LDP_ROOT)/run_ldp.py --prefer-poetry \
-		--file "$(LDP_FILE)" \
-		--outdir "$(LDP_OUTDIR)" \
-		--agency "$(LDP_AGENCY)" \
-		--horizon-months $(LDP_HORIZON_MONTHS) \
-		--alpha $(LDP_ALPHA)
-	@echo "✔ LDP outputs: $(LDP_OUTDIR)"
-	@echo "  - interval_comparison_by_rating_all.csv"
-	@echo "  - interval_comparison_by_rating_observable.csv"
-	@echo "  - intervals_by_rating_observable.png"
-
-ldp_all: ldp_run
+.PHONY: clean_all
+clean_all:
+	rm -rf $(DATA_DIR) $(ARTIFACTS_DIR) $(REPORTS_DIR)
+	@echo "Everything cleaned."
