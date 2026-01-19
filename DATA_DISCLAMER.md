@@ -32,6 +32,5 @@ those series remain subject to their respective licenses/terms.
 ## No affiliation
 This repository is an independent research codebase and is **not affiliated with**
 Freddie Mac or any data provider mentioned above.
-```
 
 ---
