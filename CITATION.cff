@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this code or results, please cite the associated SSRN working paper."
+type: software
+title: "Credit Risk Pipeline (Bank-Grade) — CLEAN"
+authors:
+  - family-names: "Pull"
+    given-names: "Yoann"
+  - family-names: "Hurlin"
+    given-names: "Christophe"
+license: "MIT"
+url: "https://ssrn.com/abstract=5291474"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Pull"
+      given-names: "Yoann"
+    - family-names: "Hurlin"
+      given-names: "Christophe"
+  title: "A Bayesian Approach to Probability Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test"
+  journal: "SSRN"
+  year: 2025
+  month: 6
+  day: 12
+  doi: "10.2139/ssrn.5291474"
+  url: "https://ssrn.com/abstract=5291474"
+  notes: "SSRN Working Paper No. 5291474"

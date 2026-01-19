@@ -1,225 +1,185 @@
-# Credit Risk Modeling Pipeline (PD Model)
+# Credit Risk Pipeline (Bank-Grade) — CLEAN
 
-Bank-grade Probability of Default (PD) modeling & calibration in Python.
+This repository contains the **code, experiments, and reproducibility scripts associated with the SSRN paper**:
 
-This project implements an end-to-end credit risk modeling pipeline (mortgage loans) with:
+**Pull, Yoann and Hurlin, Christophe**, *A Bayesian Approach to Probability Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test* (June 12, 2025).  
+Available at SSRN: https://ssrn.com/abstract=5291474  
+DOI: http://dx.doi.org/10.2139/ssrn.5291474
 
-- generation of default labels (e.g. `default_12m`) from raw data,
-- strict imputation (anti-leakage),
-- monotonic binning (Max |Gini|) + WOE transformation,
-- logistic regression for risk ranking,
-- probability calibration (isotonic),
-- construction of a Master Scale (rating grid),
-- scoring for Train / Validation / OOS,
-- generation of HTML reports (global + vintage / grade),
-- master scale recalibration (grade -> PD) using either:
-  - mean aggregation, or
-  - isotonic smoothing on grade-level default rates,
-- application of a recalibrated Master Scale to scored datasets (adds `pd_ms`).
+The project is driven by a single **Makefile** and is organized into **three blocks**:
 
-The architecture is designed for:
+- **(A) Empirical application #1 — Main pipeline**  
+  Labels → Imputation (anti-leakage) → Binning → Model training + calibration + scoring → Report  
+  (+ optional OOS scoring, vintage/grade reports, master-scale recalibration, paper-ready OOS backtest)
 
-- temporal robustness (vintage-based splits),
-- data leakage prevention,
-- interpretability (WOE, LR, master scale, TTC/LRA tables),
-- industrialization (Makefile, frozen artifacts).
+- **(B) Empirical application #2 — LDP / S&P grades**  
+  Build yearly grade tables (CSV) + time-series plots from a corporate ratings Excel file
+
+- **(C) Simulations**  
+  Binomial / Beta-Binomial / Temporal drift / Prior sensitivity (sim + plots + tables)
 
 ---
 
-## 1. Project structure
+## How to cite
 
-```plaintext
-.
-├── Makefile
-├── config.yml
-├── pyproject.toml
-├── src/
-│   ├── make_labels.py
-│   ├── impute_and_save.py
-│   ├── fit_binning.py
-│   ├── train_model.py
-│   ├── apply_model.py
-│   ├── recalibrate_master_scale.py
-│   ├── apply_master_scale.py
-│   ├── estimate_ttc_macro.py
-│   ├── generate_report.py
-│   ├── generate_vintage_grade_report.py
-│   └── features/
-│       └── binning.py
-├── data/
-│   ├── raw/
-│   └── processed/
-└── artifacts/
-````
+If you use this code, results, or figures, please cite:
 
-For a detailed description of each pipeline step, see:
-`docs/pipeline.md` (to be created).
+Pull, Yoann and Hurlin, Christophe, *A Bayesian Approach to Probability Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test* (June 12, 2025). Available at SSRN: https://ssrn.com/abstract=5291474 or http://dx.doi.org/10.2139/ssrn.5291474
+
+### BibTeX
+```bibtex
+@article{PullHurlin2025Jeffreys,
+  title  = {A Bayesian Approach to Probability Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test},
+  author = {Pull, Yoann and Hurlin, Christophe},
+  year   = {2025},
+  month  = jun,
+  note   = {SSRN Working Paper No. 5291474},
+  url    = {https://ssrn.com/abstract=5291474},
+  doi    = {10.2139/ssrn.5291474}
+}
+```
 
 ---
 
-## 2. Quick start
+## Requirements
 
-### Prerequisites
+* Python environment managed with **Poetry**
+* GNU Make
 
-* Python 3.9+
-* Poetry
-* Make
-
-### Install dependencies
+Install dependencies:
 
 ```bash
 poetry install
 ```
 
-### Run the full pipeline (Train + Validation + report)
+Show available commands:
 
 ```bash
-make pipeline
+make help
 ```
-
-This command runs:
-
-1. label generation,
-2. imputation (fit on Train / transform on Train & Validation),
-3. monotonic binning (Max |Gini|),
-4. model training (WOE + LR + isotonic calibration + master scale) and scoring,
-5. TTC macro estimation by grade,
-6. global HTML report generation.
-
-Main outputs are written to:
-
-* `data/processed/` (imputed, binned, scored datasets),
-* `artifacts/` (imputer, bins, model, master scale, calibration tables),
-* `reports/` (HTML reports).
 
 ---
 
-## 3. Main Make targets
+## Repository structure
 
-### Full pipeline
+* `src/` : main pipeline code (Empirical app #1)
+* `data/` : raw inputs + processed datasets (see `data/README.md`)
+* `artifacts/` : trained models, binning rules, figures, tables
+* `reports/` : HTML validation reports
+* `ldp_application/` : LDP / S&P grade tables + plots (Empirical app #2)
+* `experiments/` : simulations (Empirical app #3)
+* `Makefile` : main entry point (recommended)
+
+---
+
+## Quick start (Empirical application #1)
+
+Run the full main pipeline:
 
 ```bash
 make pipeline
 ```
 
-### Individual steps
+Or step-by-step:
 
 ```bash
 make labels
 make impute
 make binning_fit
-make model_train
-make ttc_macro
+make model_train_final
 make report
 ```
 
-### OOS scoring and reports
+Outputs:
+
+* processed datasets: `data/processed/`
+* artifacts: `artifacts/`
+* reports: `reports/`
+
+---
+
+## Empirical application #2 — LDP / S&P grades (Block B)
+
+Input expected:
+
+* `ldp_application/data/raw/data_rating_corporate.xlsx`
+
+Run:
 
 ```bash
-make oos_score
-make oos_vintage_report
-make val_vintage_report
+make sp_grade_all
 ```
 
-### Custom scoring
+Or separately:
 
 ```bash
-make score_custom CUSTOM_DATA=path/to/file.parquet CUSTOM_OUT=path/to/out.parquet
+make sp_grade_tables
+make sp_grade_plots
 ```
 
-### Cleanup
+Outputs:
+
+* `ldp_application/outputs/sp_grade_is_oos/`
+  (yearly tables, combined CSV, and `plots_timeseries/`)
+
+---
+
+## Simulations (Block C)
+
+Run one experiment end-to-end:
+
+```bash
+make binom_all
+make beta_binom_all
+make temporal_drift_all
+make prior_sens_all
+```
+
+Run all:
+
+```bash
+make sims_all
+```
+
+---
+
+## Data sources
+
+### Mortgage loan-level data (Empirical app #1)
+
+The main empirical pipeline uses the **Freddie Mac Single-Family Loan-Level Dataset (Standard)**.
+
+Official page:
+
+```text
+https://www.freddiemac.com/research/datasets/sf-loanlevel-dataset
+```
+
+In this repo we use **Standard quarterly files from 2008Q1 to 2024Q4** and store them
+as extracted text files under:
+
+* `data/raw/mortgage_data/historical_data_YYYYQn/`
+
+See `data/README.md` for the exact layout and dictionary file.
+
+Important: the dataset is provided by Freddie Mac under its own terms; users must obtain it
+themselves and comply with the dataset’s license/terms. See `DATA_DISCLAIMER.md`.
+
+---
+
+## License
+
+* Code in this repository is released under the **MIT License** (see `LICENSE`).
+* This license applies to the **code only**. It does **not** grant rights to any third-party data.
+
+---
+
+## Clean everything
+
+Remove all generated outputs (processed data + artifacts + reports):
 
 ```bash
 make clean_all
 ```
 
 ---
-
-## 4. Master Scale recalibration (grade -> PD)
-
-The project supports a recalibration workflow where the rating grid (grades / edges) is kept fixed, while the PD attached to each grade is recomputed from scored historical data.
-
-Two aggregation modes are supported:
-
-* pooled: computes PD per grade as sum(defaults) / sum(observations) over the full window; this is a volume-weighted estimate,
-* time_mean: computes a one-year default rate per grade and per time period (e.g. vintage quarter), then averages these default rates across time; each period contributes equally.
-
-Two calibration methods are supported:
-
-* mean: uses the raw grade-level PD estimate,
-* isotonic: applies isotonic regression to enforce monotonic grade -> PD (volume-weighted).
-
-### Recalibrate grade -> PD
-
-```bash
-make recalibrate_pd RECAL_METHOD=mean RECAL_AGG=time_mean RECAL_YEARS=5
-```
-
-Examples:
-
-```bash
-make recalibrate_pd RECAL_METHOD=mean RECAL_AGG=pooled RECAL_YEARS=5
-make recalibrate_pd RECAL_METHOD=isotonic RECAL_AGG=time_mean RECAL_YEARS=7
-```
-
-Output:
-
-* `artifacts/model_from_binned/bucket_stats_recalibrated.json`
-
----
-
-## 5. Apply a recalibrated Master Scale to scored datasets
-
-Once `bucket_stats_recalibrated.json` exists, you can apply the recalibrated grade -> PD mapping to scored datasets. This creates files with an additional column:
-
-* `pd_ms`: PD from the recalibrated Master Scale (grade-level PD)
-
-Validation:
-
-```bash
-make val_apply_ms
-```
-
-OOS:
-
-```bash
-make oos_apply_ms
-```
-
-Outputs:
-
-* `data/processed/scored/validation_scored_ms.parquet`
-* `data/processed/scored/oos_scored_ms.parquet`
-
-You can then point reporting scripts to `pd_ms` (instead of `pd`) if you want reports driven by the recalibrated Master Scale PD.
-
----
-
-## 6. Modeling principles & governance
-
-### Anti-leakage
-
-* Imputation is fitted on Train only.
-* Binning and WOE are learned on Train and then frozen.
-* No explicit time variables (e.g. `vintage`, `quarter`, `year`) are used as features.
-
-### Monotonicity
-
-* Monotonic binning with respect to default rate using Max |Gini|.
-* Master scale with PD monotonicity checks across grades.
-* Optional isotonic smoothing at the grade level during recalibration.
-
-### Interpretability
-
-* Main model: logistic regression on WOE features.
-* Interactions are limited and explicit.
-* Coefficients and performance metrics are saved and surfaced in reports.
-
-For detailed modeling choices (WOE, isotonic calibration, master scale construction, and recalibration):
-`docs/modeling_details.md` (to be created).
-
----
-
-## 7. License & intended use
-
-This project was developed in the context of bank-grade PD model calibration and validation.
