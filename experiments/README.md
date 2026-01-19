@@ -1,148 +1,165 @@
-# PD Calibration – Simulation Experiments
+# Experiments (Simulations)
 
-This folder contains **Monte Carlo experiments** used to study the small-sample behaviour of binomial/Beta–binomial confidence intervals and PD validation tests.
+This folder contains simulation studies used to benchmark PD calibration / interval methods
+under controlled data-generating processes.
 
-All simulations are run from the project root via `make` and use the Python modules under `experiments/`.
+Each experiment typically follows the same structure:
+- `sim_*.py` : generate simulation results (raw outputs saved to disk)
+- `plot_*.py` : read saved results and create figures
+- `make_table_*.py` : read saved results and create summary tables
+
+All experiments are designed to be run from the **repository root** using the Makefile.
 
 ---
 
-## 1. Binomial coverage simulations
+## How to run
 
-**Folder:** `experiments/binom_coverage/`  
-**Scripts:**
-- `sim_binom.py` – runs Monte Carlo simulations.
-- `plot_binom.py` – generates coverage plots.
+From the repo root:
 
-### What it does
-
-For several sample sizes \(n\) and a grid of true default probabilities \(p\), we:
-
-1. Simulate defaults  
-   \[
-   D \sim \text{Binomial}(n, p)
-   \]
-   over many replications.
-2. Build confidence/credible intervals for \(p\) using:
-   - Jeffreys equal-tailed interval,
-   - exact Clopper–Pearson interval,
-   - normal approximation,
-   - Jeffreys ECB upper bound,
-   - exact and normal one-sided upper intervals.
-3. Estimate the **empirical coverage** of each method as a function of \(p\).
-4. In addition, we store summary statistics of the intervals across replications:
-   **mean/variance of the bounds** and **mean/variance of interval length**.
-
-Results are saved as CSV in `experiments/binom_coverage/data/` and figures in  
-`experiments/binom_coverage/figs/`.
-
-### How to run
-
-From the project root:
-
+### Run a full experiment (sim + plots + tables)
 ```bash
-make binom_sim    # run Monte Carlo simulations
-make binom_plots  # generate plots from CSV
-make binom_all    # run both
+make binom_all
+make beta_binom_all
+make temporal_drift_all
+make prior_sens_all
 ````
 
----
-
-## 2. Beta–binomial robustness simulations
-
-**Folder:** `experiments/beta_binom_jeffreys/`
-**Scripts:**
-
-* `sim_beta_binom.py` – runs Monte Carlo simulations.
-* `plot_beta_binom.py` – generates coverage plots.
-
-### What it does
-
-To assess robustness to **default clustering / over-dispersion**, we assume that defaults follow a **Beta–Binomial** model:
-
-1. For each configuration ((n, p, \rho)), we simulate:
-
-   * a latent PD (\theta \sim \text{Beta}(\alpha, \beta)) with mean (p) and intra-class correlation (\rho),
-   * defaults (D \mid \theta \sim \text{Binomial}(n, \theta)).
-2. We then **apply binomial-based intervals as if the data were i.i.d. Binomial**, and compare:
-
-   * Jeffreys interval,
-   * exact Clopper–Pearson,
-   * normal approximation.
-3. For each method we estimate:
-
-   * empirical coverage of the true mean PD (p),
-   * average interval length,
-   * rejection rate of the model PD under calibration,
-   * and (as in the binomial study) **mean/variance of the bounds** and **mean/variance of interval length**.
-
-Results are saved in `experiments/beta_binom_jeffreys/data/`
-and plots in `experiments/beta_binom_jeffreys/figs/`.
-
-### How to run
-
-```bash
-make beta_binom_sim    # run Monte Carlo simulations
-make beta_binom_plots  # generate plots from CSV
-make beta_binom_all    # run both
-```
-
----
-
-## 3. Temporal drift experiment
-
-**Folder:** `experiments/temporal_drift/`
-**Scripts:**
-
-* `sim_temporal_drift.py` – runs the temporal drift simulation.
-* `plot_temporal_drift.py` – generates time-series plots.
-
-### What it does
-
-This experiment mimics an **iterative, period-by-period PD validation** under a drifting true PD:
-
-1. We specify:
-
-   * a fixed **model PD** (\hat p),
-   * a **time-varying true PD** (p(t)) that equals (\hat p) up to time (T_0), then drifts linearly away from (\hat p) until time (T).
-2. For each period (t = 1,\dots,T) and each replication, we simulate
-   [
-   D(t) \sim \text{Binomial}\bigl(n, p(t)\bigr)
-   ]
-   and build intervals for (p) using:
-
-   * Jeffreys equal-tailed interval,
-   * exact Clopper–Pearson,
-   * normal approximation.
-3. For each method and each time (t), we record:
-
-   * **coverage** of the true (p(t)),
-   * **rejection rate** of (H_0 : p = \hat p),
-   * **mean/variance of the bounds** and **mean/variance of interval length**.
-4. The experiment is run for several values of (\hat p) (different PD regimes), with a **relative drift** (\delta) (specified as a multiple of (\hat p)).
-
-Results are saved in `experiments/temporal_drift/data/`
-and plots in `experiments/temporal_drift/figs/`.
-
-### How to run
-
-```bash
-make temporal_drift_sim    # run Monte Carlo simulations
-make temporal_drift_plots  # generate plots from CSV
-make temporal_drift_all    # run both
-```
-
----
-
-## 4. Run all simulations at once
-
-To run **all** simulation blocks (binomial, Beta–binomial, temporal drift) and generate all figures in one command:
+### Run everything
 
 ```bash
 make sims_all
 ```
 
-This will sequentially execute:
+### Run only one step
 
-* `beta_binom_all`
-* `temporal_drift_all`
-* `binom_all`
+```bash
+make binom_sim
+make binom_plots
+make binom_tables
+```
+
+---
+
+## Available experiments
+
+### 1) Binomial coverage (`experiments/binom_coverage/`)
+
+Goal: evaluate coverage / error rates under the Binomial model (i.i.d. defaults).
+
+Make targets:
+
+```bash
+make binom_sim
+make binom_plots
+make binom_tables
+make binom_all
+```
+
+Python modules:
+
+* `experiments.binom_coverage.sim_binom`
+* `experiments.binom_coverage.plot_binom`
+* `experiments.binom_coverage.make_table_binom`
+
+---
+
+### 2) Beta-Binomial robustness (`experiments/beta_binom_jeffreys/`)
+
+Goal: test robustness to **default clustering / over-dispersion** (latent heterogeneity).
+
+Make targets:
+
+```bash
+make beta_binom_sim
+make beta_binom_plots
+make beta_binom_tables
+make beta_binom_all
+```
+
+Python modules:
+
+* `experiments.beta_binom_jeffreys.sim_beta_binom`
+* `experiments.beta_binom_jeffreys.plot_beta_binom`
+* `experiments.beta_binom_jeffreys.make_table_beta_binom`
+
+---
+
+### 3) Temporal drift (`experiments/temporal_drift/`)
+
+Goal: test robustness when the true PD changes over time (non-stationarity).
+
+Make targets:
+
+```bash
+make temporal_drift_sim
+make temporal_drift_plots
+make temporal_drift_tables
+make temporal_drift_all
+```
+
+Python modules:
+
+* `experiments.temporal_drift.sim_temporal_drift`
+* `experiments.temporal_drift.plot_temporal_drift`
+* `experiments.temporal_drift.make_table_temporal_drift`
+
+---
+
+### 4) Prior sensitivity (`experiments/prior_sensibility/`)
+
+Goal: compare results across different Beta priors (Jeffreys, Bayes-Laplace, etc.).
+
+Make targets:
+
+```bash
+make prior_sens_sim
+make prior_sens_plots
+make prior_sens_tables
+make prior_sens_all
+```
+
+Python modules:
+
+* `experiments.prior_sensibility.sim_prior_sensibility`
+* `experiments.prior_sensibility.plot_prior_sensibility`
+* `experiments.prior_sensibility.make_table_prior_sensibility`
+
+---
+
+## Outputs
+
+Depending on the experiment, outputs are saved to:
+
+* `artifacts/` (recommended for final plots/tables), and/or
+* experiment-specific output folders (if implemented inside each experiment).
+
+Typical outputs:
+
+* simulation result files (CSV/Parquet)
+* figures (PNG/PDF)
+* summary tables (CSV/LaTeX)
+
+---
+
+## Reproducibility guidelines
+
+* Run experiments via `make ...` to ensure consistent paths.
+* Fix random seeds inside `sim_*.py` (or log them).
+* Store parameters used for each run (grid values, sample sizes, drift settings, etc.)
+  alongside the saved results.
+
+---
+
+## Troubleshooting
+
+* If plots/tables fail, run the simulation step first:
+
+  ```bash
+  make <experiment>_sim
+  ```
+* If you changed code and want to regenerate everything:
+
+  ```bash
+  make clean_all
+  make sims_all
+  ```
