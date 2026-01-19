@@ -100,8 +100,13 @@ Outputs:
 
 ## Empirical application #2 — LDP / S&P grades (Block B)
 
-Input expected:
+The LDP / S&P grade application uses corporate rating history data sourced from:
+https://ratingshistory.info
 
+This resource aggregates historical rating actions disclosed by multiple agencies under SEC Rule 17g-7(b)
+and provides them as CSV files (converted from the original XBRL disclosures).
+
+Input expected:
 * `ldp_application/data/raw/data_rating_corporate.xlsx`
 
 Run:
