@@ -1,4 +1,4 @@
-# Credit Risk Pipeline (Bank-Grade) — CLEAN
+# Credit Risk Pipeline
 
 This repository contains the **code, experiments, and reproducibility scripts associated with the SSRN paper**:
 
