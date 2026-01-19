@@ -52,11 +52,22 @@ This website provides:
 
 The website references the SEC publication guide for abbreviations and technical conventions.
 
-### Expected local layout
-By default, the Makefile expects:
-- `ldp_application/data/raw/data_rating_corporate.xlsx`
+### Expected local layout (updated workflow)
 
-If you replace this file or use another dataset, ensure you comply with the relevant terms.
+**Raw download (CSV):**
+- `ldp_application/data/raw/20220601_SP_Ratings_Services_Corporate.csv` *(example name; depends on the download date)*
+
+**Processed input used by the grade application (CSV-only):**
+The Makefile first builds a monthly snapshot (1 row per obligor × month) using:
+- `ldp_application/process_sp_base.py`
+
+Default output:
+- `ldp_application/data/processed/sp_corporate_monthly.csv`
+
+This processed file follows the same *schema* as the historical `data_rating_corporate.xlsx`
+but is generated automatically and does not include enrichment fields (they are kept empty / NA).
+
+If you replace these files or use another dataset, ensure you comply with the relevant terms.
 
 ---
 
