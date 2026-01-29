@@ -650,7 +650,7 @@ beta_binom_plots:
 beta_binom_tables:
 	poetry run python -m experiments.beta_binom_jeffreys.make_table_beta_binom
 beta_binom_all: beta_binom_sim beta_binom_plots beta_binom_tables
-
+ 
 .PHONY: temporal_drift_sim temporal_drift_plots temporal_drift_tables temporal_drift_all
 temporal_drift_sim:
 	poetry run python -m experiments.temporal_drift.sim_temporal_drift
@@ -672,6 +672,9 @@ prior_sens_all: prior_sens_sim prior_sens_plots prior_sens_tables
 .PHONY: sims_all
 sims_all: beta_binom_all temporal_drift_all binom_all prior_sens_all
 
+
+.PHONY: plot_all_sims
+plot_all_sims: prior_sens_plots beta_binom_plots temporal_drift_plots binom_plots
 
 # ============================================================================
 # CLEANUP
