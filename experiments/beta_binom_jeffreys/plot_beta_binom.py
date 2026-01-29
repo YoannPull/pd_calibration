@@ -64,11 +64,12 @@ def _macro_name(
     # Example:
     # \RMSEbetabinomcurvescoveragen100rho0_01  -> context is already "n100_rho0_01"
     return (
-        "RMSE"
+        "{RMSE"
         + _latex_macro_safe(prefix)
         + _latex_macro_safe(design)
         + _latex_macro_safe(metric)
         + _latex_macro_safe(context)
+        + "}"
     )
 
 

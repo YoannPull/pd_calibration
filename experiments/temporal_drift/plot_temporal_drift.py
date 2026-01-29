@@ -66,7 +66,7 @@ def _latex_macro_safe(s: str) -> str:
 
 def _macro_name(prefix: str, metric: str, context: str) -> str:
     # Example: \RMSEtemporaldraftcoveragescenmycase
-    return "RMSE" + _latex_macro_safe(prefix) + _latex_macro_safe(metric) + _latex_macro_safe(context)
+    return "{RMSE" + _latex_macro_safe(prefix) + _latex_macro_safe(metric) + _latex_macro_safe(context) + "}"
 
 
 def _write_rmse_exports(records: list[dict], figs_dir: Path, basename: str = "rmse_summary") -> None:

@@ -40,7 +40,7 @@ def _latex_macro_safe(s: str) -> str:
 
 def _macro_name(prefix: str, method_key: str, n: int) -> str:
     # example: \RMSEbinomjeffreysn100
-    return f"RMSE{_latex_macro_safe(prefix)}{_latex_macro_safe(method_key)}n{int(n)}"
+    return f"{"{"}RMSE{_latex_macro_safe(prefix)}{_latex_macro_safe(method_key)}n{int(n)}{"}"}"
 
 
 def _write_rmse_exports(
