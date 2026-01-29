@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,57 @@ def _apply_axes_style(ax):
     ax.grid(alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
+
+
+# -------------------------
+# RMSE helpers + exports (same logic as other scripts)
+# -------------------------
+def _rmse_to_nominal(y: np.ndarray, nominal: float, mask: np.ndarray | None = None) -> float:
+    if mask is not None:
+        y = y[mask]
+    if y.size == 0:
+        return float("nan")
+    return float(np.sqrt(np.mean((y - nominal) ** 2)))
+
+
+def _latex_macro_safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", str(s))
+
+
+def _macro_name(prefix: str, metric: str, context: str) -> str:
+    # Example: \RMSEtemporaldraftcoveragescenmycase
+    return "RMSE" + _latex_macro_safe(prefix) + _latex_macro_safe(metric) + _latex_macro_safe(context)
+
+
+def _write_rmse_exports(records: list[dict], figs_dir: Path, basename: str = "rmse_summary") -> None:
+    """
+    Writes:
+      - rmse_summary.csv (one row per (scenario, metric, method group rep))
+      - rmse_summary_macros.tex (one macro per (scenario, metric, rep_method) with numeric RMSE)
+    """
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    df_rmse = pd.DataFrame.from_records(records)
+    df_rmse = df_rmse.sort_values(["prefix", "metric", "scenario_slug", "rep_method"], kind="mergesort")
+    df_rmse.to_csv(figs_dir / f"{basename}.csv", index=False)
+
+    tex_path = figs_dir / f"{basename}_macros.tex"
+    lines: list[str] = [
+        "% Auto-generated RMSE macros (do not edit by hand)",
+        "% Usage: \\input{<path>/rmse_summary_macros.tex}",
+        "% Macros are per scenario+metric+method rep: \\RMSE<prefix><metric><scenarioSlug><methodRep>",
+        "",
+    ]
+    for r in records:
+        context = f"{r['scenario_slug']}{r['rep_method']}"
+        macro = _macro_name(r["prefix"], r["metric"], context)
+        val = float(r["rmse"]) if np.isfinite(float(r["rmse"])) else np.nan
+        if np.isfinite(val):
+            lines.append(f"\\newcommand\\{macro}{{{val:.3f}}}")
+        else:
+            lines.append(f"\\newcommand\\{macro}{{nan}}")
+
+    tex_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # -------------------------
@@ -96,7 +148,6 @@ def _method_label(method: str) -> str:
 
 
 def _short_label(label: str) -> str:
-    # Keep legend/min-panel concise
     out = label
     out = out.replace("Jeffreys equal-tailed", "Jeffreys")
     out = out.replace("Exact Clopper–Pearson", "CP").replace("Exact Clopper-Pearson", "CP")
@@ -139,7 +190,6 @@ def _group_overlapping_methods(
             if m2 in used:
                 continue
             x2, y2 = series[m2]
-            # x should be identical (same t-grid). y is compared up to atol.
             if (
                 len(x2) == len(x0)
                 and np.allclose(x2, x0, rtol=0.0, atol=0.0)
@@ -154,11 +204,6 @@ def _group_overlapping_methods(
 
 
 def _format_label_with_overlaps(rep_method: str, group: list[str]) -> str:
-    """
-    Legend label for the representative curve.
-    If multiple methods overlap, we display:
-      "REP (≡ OTHER1, OTHER2)"
-    """
     rep_label = _method_label(rep_method)
     others = [m for m in group if m != rep_method]
     if not others:
@@ -169,17 +214,29 @@ def _format_label_with_overlaps(rep_method: str, group: list[str]) -> str:
 
 
 def _rep_for_group(group: list[str]) -> str:
-    """
-    Choose a representative method for a group.
-    Preference: the first one (sorted already by construction).
-    """
     return group[0]
+
+
+def _scenario_slug(sub_df: pd.DataFrame, scenario: str) -> str:
+    return (
+        str(sub_df["scenario_slug"].iloc[0])
+        if "scenario_slug" in sub_df.columns
+        else scenario.lower().replace(" ", "_")
+    )
 
 
 # -------------------------
 # Plots
+# Titles removed + RMSE exported (no box on figure)
 # -------------------------
-def plot_reject_rate_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: str = "temporal_drift"):
+def plot_reject_rate_vs_time_by_scenario(
+    df: pd.DataFrame,
+    save_dir: Path,
+    prefix: str = "temporal_drift",
+) -> list[dict]:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+
     for scenario in sorted(df["scenario"].unique()):
         sub_df = df[df["scenario"] == scenario].copy()
 
@@ -196,7 +253,6 @@ def plot_reject_rate_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefi
         fig, ax = plt.subplots(figsize=(10, 6))
         _apply_axes_style(ax)
 
-        # --- group overlaps and plot only one curve per group ---
         groups, series = _group_overlapping_methods(sub_df, ycol="reject_rate", xcol="t", atol=1e-12)
         for grp in groups:
             rep = _rep_for_group(grp)
@@ -216,16 +272,37 @@ def plot_reject_rate_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefi
                 zorder=3,
             )
 
+            # RMSE export only (reject-rate to nominal alpha)
+            rmse = _rmse_to_nominal(y, nominal=alpha_nominal, mask=None)
+
+            records.append(
+                {
+                    "prefix": prefix,
+                    "metric": "reject_rate",
+                    "scenario": str(scenario),
+                    "scenario_slug": _scenario_slug(sub_df, scenario),
+                    "n": int(n),
+                    "T0": int(T0),
+                    "T": int(T),
+                    "p_hat": float(p_hat),
+                    "nominal": float(alpha_nominal),
+                    "rep_method": str(rep),
+                    "rep_label": _short_label(_method_label(rep)),
+                    "collapsed_group": "|".join(grp),
+                    "rmse": float(rmse) if np.isfinite(rmse) else np.nan,
+                    "figure": f"{prefix}_{_scenario_slug(sub_df, scenario)}_reject_rate_vs_time.png",
+                }
+            )
+
         add_drift_marker(ax, T0=T0, T=T)
 
-        title = f"Rejection rates under drift — {scenario} (n={n}, p̂={p_hat:g})"
         ylim_rej = _centered_ylim_around(alpha_nominal, sub_df["reject_rate"], min_halfspan=0.05, max_halfspan=0.25)
 
         finalize_ax(
             ax,
             xlabel="Time period t",
             ylabel=r"Rejection rate of $H_0: p = \hat p$",
-            title=title,
+            title=None,  # <-- remove titles
             nominal_level=alpha_nominal,
             nominal_label=f"Nominal level (α = {alpha_nominal:.2f})",
             add_legend=True,
@@ -236,15 +313,20 @@ def plot_reject_rate_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefi
 
         _maybe_set_integer_xticks(ax, sub_df)
 
-        slug = (
-            str(sub_df["scenario_slug"].iloc[0])
-            if "scenario_slug" in sub_df.columns
-            else scenario.lower().replace(" ", "_")
-        )
+        slug = _scenario_slug(sub_df, scenario)
         save_figure(fig, save_dir / f"{prefix}_{slug}_reject_rate_vs_time.png", also_pdf=False)
 
+    return records
 
-def plot_length_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: str = "temporal_drift"):
+
+def plot_length_vs_time_by_scenario(
+    df: pd.DataFrame,
+    save_dir: Path,
+    prefix: str = "temporal_drift",
+) -> list[dict]:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+
     length_col = "avg_length" if "avg_length" in df.columns else "len_mean"
 
     for scenario in sorted(df["scenario"].unique()):
@@ -262,7 +344,6 @@ def plot_length_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: st
         fig, ax = plt.subplots(figsize=(10, 6))
         _apply_axes_style(ax)
 
-        # --- group overlaps ---
         groups, series = _group_overlapping_methods(sub_df, ycol=length_col, xcol="t", atol=1e-12)
         for grp in groups:
             rep = _rep_for_group(grp)
@@ -282,6 +363,30 @@ def plot_length_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: st
                 zorder=3,
             )
 
+            # RMSE export only (length to its own mean, since no nominal)
+            # You can change nominal definition here if you prefer something else.
+            nominal = float(np.nanmean(y)) if y.size else float("nan")
+            rmse = _rmse_to_nominal(y, nominal=nominal, mask=None)
+
+            records.append(
+                {
+                    "prefix": prefix,
+                    "metric": "length",
+                    "scenario": str(scenario),
+                    "scenario_slug": _scenario_slug(sub_df, scenario),
+                    "n": int(n),
+                    "T0": int(T0),
+                    "T": int(T),
+                    "p_hat": float(p_hat),
+                    "nominal": float(nominal) if np.isfinite(nominal) else np.nan,
+                    "rep_method": str(rep),
+                    "rep_label": _short_label(_method_label(rep)),
+                    "collapsed_group": "|".join(grp),
+                    "rmse": float(rmse) if np.isfinite(rmse) else np.nan,
+                    "figure": f"{prefix}_{_scenario_slug(sub_df, scenario)}_length_vs_time.png",
+                }
+            )
+
         add_drift_marker(ax, T0=T0, T=T)
 
         s_len = sub_df[length_col].dropna().astype(float)
@@ -291,12 +396,11 @@ def plot_length_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: st
             hi = float(s_len.quantile(0.995)) * 1.10 if float(s_len.quantile(0.995)) > 0 else 1.0
             ylim_len = _robust_ylim(s_len, pad=pad, lo=0.0, hi=hi)
 
-        title = f"Interval length under drift — {scenario} (n={n}, p̂={p_hat:g})"
         finalize_ax(
             ax,
             xlabel="Time period t",
             ylabel="Average interval length",
-            title=title,
+            title=None,  # <-- remove titles
             nominal_level=None,
             add_legend=True,
             legend_loc="upper left",
@@ -306,24 +410,27 @@ def plot_length_vs_time_by_scenario(df: pd.DataFrame, save_dir: Path, prefix: st
 
         _maybe_set_integer_xticks(ax, sub_df)
 
-        slug = (
-            str(sub_df["scenario_slug"].iloc[0])
-            if "scenario_slug" in sub_df.columns
-            else scenario.lower().replace(" ", "_")
-        )
+        slug = _scenario_slug(sub_df, scenario)
         save_figure(fig, save_dir / f"{prefix}_{slug}_length_vs_time.png", also_pdf=False)
+
+    return records
 
 
 def plot_coverage_vs_time_by_scenario_with_min_scatter(
     df: pd.DataFrame,
     save_dir: Path,
     prefix: str = "temporal_drift",
-):
+) -> list[dict]:
     """
     Main panel: zoomed coverage vs time + drift marker (NO arrow annotations).
     Bottom panel: scatter of (t*, min coverage), colored by method.
     Overlap-aware: if two methods produce identical curves, we plot one and label equivalence.
+
+    Titles removed + RMSE exported (coverage to nominal conf).
     """
+    save_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+
     for scenario in sorted(df["scenario"].unique()):
         sub_df = df[df["scenario"] == scenario].copy()
 
@@ -353,7 +460,6 @@ def plot_coverage_vs_time_by_scenario_with_min_scatter(
             max_halfspan=0.20,
         )
 
-        # --- group overlaps and plot only one curve per group ---
         groups, series = _group_overlapping_methods(sub_df, ycol="coverage", xcol="t", atol=1e-12)
 
         pts = []  # (min_t, min_y, color, short_label)
@@ -375,11 +481,31 @@ def plot_coverage_vs_time_by_scenario_with_min_scatter(
                 zorder=3,
             )
 
+            # RMSE export only
+            rmse = _rmse_to_nominal(y, nominal=conf, mask=None)
+            records.append(
+                {
+                    "prefix": prefix,
+                    "metric": "coverage",
+                    "scenario": str(scenario),
+                    "scenario_slug": _scenario_slug(sub_df, scenario),
+                    "n": int(n),
+                    "T0": int(T0),
+                    "T": int(T),
+                    "p_hat": float(p_hat),
+                    "nominal": float(conf),
+                    "rep_method": str(rep),
+                    "rep_label": _short_label(_method_label(rep)),
+                    "collapsed_group": "|".join(grp),
+                    "rmse": float(rmse) if np.isfinite(rmse) else np.nan,
+                    "figure": f"{prefix}_{_scenario_slug(sub_df, scenario)}_coverage_vs_time.png",
+                }
+            )
+
             idx_min = int(np.argmin(y))
             min_t = float(t[idx_min])
             min_y = float(y[idx_min])
 
-            # Bottom annotation: keep short, but still signal overlaps
             rep_short = _short_label(_method_label(rep))
             if len(grp) > 1:
                 other_short = [_short_label(_method_label(m)) for m in grp[1:]]
@@ -389,12 +515,11 @@ def plot_coverage_vs_time_by_scenario_with_min_scatter(
 
         add_drift_marker(ax, T0=T0, T=T)
 
-        title = f"Coverage under drift — {scenario} (n={n}, p̂={p_hat:g})"
         finalize_ax(
             ax,
             xlabel="",  # x-label on bottom panel
             ylabel=r"Coverage of $p(t)$",
-            title=title,
+            title=None,  # <-- remove titles
             nominal_level=conf,
             nominal_label=f"Nominal coverage ({conf:.0%})",
             add_legend=True,
@@ -417,7 +542,6 @@ def plot_coverage_vs_time_by_scenario_with_min_scatter(
                 fontsize=9,
             )
 
-        # Nominal line + drift onset marker
         ax_min.axhline(conf, color="black", linestyle="--", linewidth=1.2, alpha=0.8)
         onset = T0 + 0.5
         ax_min.axvline(x=onset, color="black", alpha=0.6, linestyle=(0, (3, 3)), linewidth=1.0)
@@ -438,12 +562,10 @@ def plot_coverage_vs_time_by_scenario_with_min_scatter(
 
         _maybe_set_integer_xticks(ax_min, sub_df)
 
-        slug = (
-            str(sub_df["scenario_slug"].iloc[0])
-            if "scenario_slug" in sub_df.columns
-            else scenario.lower().replace(" ", "_")
-        )
+        slug = _scenario_slug(sub_df, scenario)
         save_figure(fig, save_dir / f"{prefix}_{slug}_coverage_vs_time.png", also_pdf=False)
+
+    return records
 
 
 # -------------------------
@@ -458,6 +580,13 @@ if __name__ == "__main__":
     df = _load_temporal_drift_df(data_dir)
 
     prefix = "temporal_drift"
-    plot_reject_rate_vs_time_by_scenario(df, save_dir=figs_dir, prefix=prefix)
-    plot_coverage_vs_time_by_scenario_with_min_scatter(df, save_dir=figs_dir, prefix=prefix)
-    plot_length_vs_time_by_scenario(df, save_dir=figs_dir, prefix=prefix)
+
+    all_records: list[dict] = []
+    all_records += plot_reject_rate_vs_time_by_scenario(df, save_dir=figs_dir, prefix=prefix)
+    all_records += plot_coverage_vs_time_by_scenario_with_min_scatter(df, save_dir=figs_dir, prefix=prefix)
+    all_records += plot_length_vs_time_by_scenario(df, save_dir=figs_dir, prefix=prefix)
+
+    _write_rmse_exports(all_records, figs_dir=figs_dir, basename="rmse_summary")
+    print(
+        f"[OK] RMSE exported to: {figs_dir / 'rmse_summary.csv'} and {figs_dir / 'rmse_summary_macros.tex'}"
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import numpy as np
 import pandas as pd
 
@@ -49,23 +50,67 @@ def _rmse_to_nominal(y: np.ndarray, nominal: float, mask: np.ndarray | None = No
     return float(np.sqrt(np.mean((y - nominal) ** 2)))
 
 
-def _add_rmse_box_big(ax, text: str) -> None:
-    ax.text(
-        0.985,
-        0.02,
-        text,
-        transform=ax.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=12,
-        fontweight="semibold",
-        bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="0.35", linewidth=1.2),
-        zorder=10,
+# -----------------------------------------------------------------------------
+# RMSE export helpers (CSV + LaTeX macros)
+# -----------------------------------------------------------------------------
+def _latex_macro_safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", str(s))
+
+
+def _latex_escape(s: str) -> str:
+    # minimal escaping so the macro content is safe in captions
+    s = str(s)
+    return (
+        s.replace("\\", r"\textbackslash{}")
+        .replace("&", r"\&")
+        .replace("%", r"\%")
+        .replace("$", r"\$")
+        .replace("#", r"\#")
+        .replace("_", r"\_")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("~", r"\textasciitilde{}")
+        .replace("^", r"\textasciicircum{}")
     )
+
+
+def _macro_name(prefix: str, metric: str, context: str) -> str:
+    # Example: \RMSEpriorsenstwosidedn100focusjeffreys
+    return "RMSE" + _latex_macro_safe(prefix) + _latex_macro_safe(metric) + _latex_macro_safe(context)
+
+
+def _write_rmse_exports(records: list[dict], figs_dir: Path, basename: str = "rmse_summary") -> None:
+    """
+    Writes:
+      - rmse_summary.csv (long format: one row per figure x prior_focus x metric)
+      - rmse_summary_macros.tex (one macro per figure/metric; value = single RMSE number)
+    """
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    df_rmse = pd.DataFrame.from_records(records)
+    df_rmse = df_rmse.sort_values(["prefix", "metric", "context", "prior_focus"], kind="mergesort")
+    df_rmse.to_csv(figs_dir / f"{basename}.csv", index=False)
+
+    tex_path = figs_dir / f"{basename}_macros.tex"
+    lines: list[str] = [
+        "% Auto-generated RMSE macros (do not edit by hand)",
+        "% Usage: \\input{<path>/rmse_summary_macros.tex}",
+        "",
+    ]
+    for r in records:
+        macro = _macro_name(r["prefix"], r["metric"], r["context"])
+        val = float(r["rmse"]) if np.isfinite(float(r["rmse"])) else np.nan
+        if np.isfinite(val):
+            lines.append(f"\\newcommand\\{macro}{{{val:.3f}}}")
+        else:
+            lines.append(f"\\newcommand\\{macro}{{nan}}")
+
+    tex_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # -----------------------------------------------------------------------------
 # Two-sided coverage plots (per focus prior) with proper min annotation
+# Titles removed + RMSE exported (no box on figure)
 # -----------------------------------------------------------------------------
 def plot_two_sided_per_prior(
     df: pd.DataFrame,
@@ -77,12 +122,14 @@ def plot_two_sided_per_prior(
     gray_alpha: float = 0.22,
     gray_color: str = "0.55",
     min_annot_threshold: float = 0.80,
-):
+) -> list[dict]:
     figs_dir.mkdir(parents=True, exist_ok=True)
 
     conf = float(df["conf_level"].iloc[0])
     ns = sorted(df["n"].unique())
     priors = sorted(df["prior"].unique())
+
+    records: list[dict] = []
 
     for n in ns:
         sub_n = df[(df["n"] == n) & (df["tail"] == "two_sided")].copy()
@@ -124,12 +171,12 @@ def plot_two_sided_per_prior(
                 label=prior_focus,
             )
 
-            # finalize axis (adds nominal line + styling)
+            # finalize axis (adds nominal line + styling) -- TITLE REMOVED
             finalize_ax(
                 ax,
                 xlabel="True default probability (p)",
                 ylabel="Coverage probability",
-                title=f"Prior sensitivity — two-sided coverage — n={int(n)}",
+                title=None,  # <-- remove titles
                 nominal_level=conf,
                 nominal_label=f"Nominal level ({conf:.0%})",
                 xlim=xlim,
@@ -137,13 +184,27 @@ def plot_two_sided_per_prior(
                 add_legend=True,
             )
 
-            # RMSE (big box) on focus curve over x-window
+            # RMSE (export only) on focus curve over x-window
             mask = (p >= xlim[0]) & (p <= xlim[1])
             rmse = _rmse_to_nominal(y, nominal=conf, mask=mask)
-            if np.isfinite(rmse):
-                _add_rmse_box_big(ax, f"RMSE to nominal: {rmse:.3f}")
 
-            # --- Min annotation (EXACTLY like plot_binom.py) ---
+            context = f"twoSided_n{int(n)}_focus{_safe_slug(prior_focus)}"
+            records.append(
+                {
+                    "prefix": prefix,
+                    "metric": "two_sided_coverage",
+                    "context": context,
+                    "n": int(n),
+                    "prior_focus": str(prior_focus),
+                    "rmse": float(rmse) if np.isfinite(rmse) else np.nan,
+                    "nominal": float(conf),
+                    "xlim_low": float(xlim[0]),
+                    "xlim_high": float(xlim[1]),
+                    "figure": f"{prefix}_two_sided_n{int(n)}__focus_{_safe_slug(prior_focus)}.png",
+                }
+            )
+
+            # --- Min annotation (same logic as plot_binom.py) ---
             if np.any(mask):
                 p_m = p[mask]
                 y_m = y[mask]
@@ -173,9 +234,12 @@ def plot_two_sided_per_prior(
             out = figs_dir / f"{prefix}_two_sided_n{int(n)}__focus_{_safe_slug(prior_focus)}.png"
             save_figure(fig, out, also_pdf=False)
 
+    return records
+
 
 # -----------------------------------------------------------------------------
 # One-sided conservatism plots (per focus prior)
+# Titles removed + RMSE exported (no box on figure)
 # -----------------------------------------------------------------------------
 def plot_upper_conservatism_per_prior(
     df: pd.DataFrame,
@@ -186,11 +250,13 @@ def plot_upper_conservatism_per_prior(
     prefix: str,
     gray_alpha: float = 0.22,
     gray_color: str = "0.55",
-):
+) -> list[dict]:
     figs_dir.mkdir(parents=True, exist_ok=True)
 
     ns = sorted(df["n"].unique())
     priors = sorted(df["prior"].unique())
+
+    records: list[dict] = []
 
     for n in ns:
         sub_n = df[(df["n"] == n) & (df["tail"] == "upper")].copy()
@@ -232,13 +298,13 @@ def plot_upper_conservatism_per_prior(
                 label=prior_focus,
             )
 
-            # finalize axis (here: reference line at 0.5 as nominal)
+            # finalize axis (reference line at 0.5) -- TITLE REMOVED
             ref = 0.5
             finalize_ax(
                 ax,
                 xlabel="True default probability (p)",
                 ylabel="Conservatism: E[ P(P ≤ p_true | data) ]",
-                title=f"Prior sensitivity — one-sided conservatism — n={int(n)}",
+                title=None,  # <-- remove titles
                 nominal_level=ref,
                 nominal_label="Reference (0.5)",
                 xlim=xlim,
@@ -246,14 +312,30 @@ def plot_upper_conservatism_per_prior(
                 add_legend=True,
             )
 
-            # RMSE to 0.5 (big box)
+            # RMSE (export only)
             mask = (p >= xlim[0]) & (p <= xlim[1])
             rmse = _rmse_to_nominal(y, nominal=ref, mask=mask)
-            if np.isfinite(rmse):
-                _add_rmse_box_big(ax, f"RMSE to 0.5: {rmse:.3f}")
+
+            context = f"upperCons_n{int(n)}_focus{_safe_slug(prior_focus)}"
+            records.append(
+                {
+                    "prefix": prefix,
+                    "metric": "upper_conservatism",
+                    "context": context,
+                    "n": int(n),
+                    "prior_focus": str(prior_focus),
+                    "rmse": float(rmse) if np.isfinite(rmse) else np.nan,
+                    "nominal": float(ref),
+                    "xlim_low": float(xlim[0]),
+                    "xlim_high": float(xlim[1]),
+                    "figure": f"{prefix}_upper_conservatism_n{int(n)}__focus_{_safe_slug(prior_focus)}.png",
+                }
+            )
 
             out = figs_dir / f"{prefix}_upper_conservatism_n{int(n)}__focus_{_safe_slug(prior_focus)}.png"
             save_figure(fig, out, also_pdf=False)
+
+    return records
 
 
 # -----------------------------------------------------------------------------
@@ -268,9 +350,11 @@ if __name__ == "__main__":
     # MAIN
     df = pd.read_csv(data_dir / "prior_sensibility_all_n.csv")
 
-    gray_alpha=0.40
+    gray_alpha = 0.40
 
-    plot_two_sided_per_prior(
+    all_records: list[dict] = []
+
+    all_records += plot_two_sided_per_prior(
         df,
         figs_dir=figs_dir,
         xlim=(0.0, 0.10),
@@ -280,7 +364,7 @@ if __name__ == "__main__":
         min_annot_threshold=0.80,
     )
 
-    plot_upper_conservatism_per_prior(
+    all_records += plot_upper_conservatism_per_prior(
         df,
         figs_dir=figs_dir,
         xlim=(0.0, 0.10),
@@ -294,7 +378,7 @@ if __name__ == "__main__":
     if ldp_path.exists():
         df_ldp = pd.read_csv(ldp_path)
 
-        plot_two_sided_per_prior(
+        all_records += plot_two_sided_per_prior(
             df_ldp,
             figs_dir=figs_dir,
             xlim=(0.0001, 0.005),
@@ -304,7 +388,7 @@ if __name__ == "__main__":
             min_annot_threshold=0.80,
         )
 
-        plot_upper_conservatism_per_prior(
+        all_records += plot_upper_conservatism_per_prior(
             df_ldp,
             figs_dir=figs_dir,
             xlim=(0.0001, 0.005),
@@ -314,3 +398,9 @@ if __name__ == "__main__":
         )
     else:
         print(f"[WARN] Missing: {ldp_path}")
+
+    # Export RMSE (CSV + LaTeX macros)
+    _write_rmse_exports(all_records, figs_dir=figs_dir, basename="rmse_summary")
+    print(
+        f"[OK] RMSE exported to: {figs_dir / 'rmse_summary.csv'} and {figs_dir / 'rmse_summary_macros.tex'}"
+    )
