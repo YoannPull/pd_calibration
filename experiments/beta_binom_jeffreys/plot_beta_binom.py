@@ -64,7 +64,7 @@ def _macro_name(
     # Example:
     # \RMSEbetabinomcurvescoveragen100rho0_01  -> context is already "n100_rho0_01"
     return (
-        "{RMSE"
+        "{\RMSE"
         + _latex_macro_safe(prefix)
         + _latex_macro_safe(design)
         + _latex_macro_safe(metric)
@@ -121,7 +121,7 @@ def _write_rmse_exports(
 
         macro = _macro_name(prefix=prefix, design=design, metric=metric, context=context)
         macro_body = _latex_escape(", ".join(parts))
-        lines.append(f"\\newcommand\\{macro}{{{macro_body}}}")
+        lines.append(f"\\newcommand{macro}{{{macro_body}}}")
 
     tex_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

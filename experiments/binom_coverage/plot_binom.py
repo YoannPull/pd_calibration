@@ -40,7 +40,7 @@ def _latex_macro_safe(s: str) -> str:
 
 def _macro_name(prefix: str, method_key: str, n: int) -> str:
     # example: \RMSEbinomjeffreysn100
-    return f"{"{"}RMSE{_latex_macro_safe(prefix)}{_latex_macro_safe(method_key)}n{int(n)}{"}"}"
+    return f"{"{"}\RMSE{_latex_macro_safe(prefix)}{_latex_macro_safe(method_key)}n{int(n)}{"}"}"
 
 
 def _write_rmse_exports(
@@ -63,9 +63,9 @@ def _write_rmse_exports(
         name = _macro_name(r["prefix"], r["method_key"], r["n"])
         val = r["rmse"]
         if val is None or not np.isfinite(val):
-            lines.append(f"\\newcommand\\{name}{{nan}}")
+            lines.append(f"\\newcommand{name}{{nan}}")
         else:
-            lines.append(f"\\newcommand\\{name}{{{float(val):.3f}}}")
+            lines.append(f"\\newcommand{name}{{{float(val):.3f}}}")
 
     tex_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

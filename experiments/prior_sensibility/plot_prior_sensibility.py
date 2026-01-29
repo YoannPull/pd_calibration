@@ -76,7 +76,7 @@ def _latex_escape(s: str) -> str:
 
 def _macro_name(prefix: str, metric: str, context: str) -> str:
     # Example: \RMSEpriorsenstwosidedn100focusjeffreys
-    return "{RMSE" + _latex_macro_safe(prefix) + _latex_macro_safe(metric) + _latex_macro_safe(context) + "}"
+    return "{\RMSE" + _latex_macro_safe(prefix) + _latex_macro_safe(metric) + _latex_macro_safe(context) + "}"
 
 
 def _write_rmse_exports(records: list[dict], figs_dir: Path, basename: str = "rmse_summary") -> None:
@@ -101,9 +101,9 @@ def _write_rmse_exports(records: list[dict], figs_dir: Path, basename: str = "rm
         macro = _macro_name(r["prefix"], r["metric"], r["context"])
         val = float(r["rmse"]) if np.isfinite(float(r["rmse"])) else np.nan
         if np.isfinite(val):
-            lines.append(f"\\newcommand\\{macro}{{{val:.3f}}}")
+            lines.append(f"\\newcommand{macro}{{{val:.3f}}}")
         else:
-            lines.append(f"\\newcommand\\{macro}{{nan}}")
+            lines.append(f"\\newcommand{macro}{{nan}}")
 
     tex_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
