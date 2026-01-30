@@ -181,9 +181,12 @@ binning_fit:
 # ----------------------------------------------------------------------------
 # Hyperparameter search
 SEARCH          ?= halving
-C_MIN_EXP       ?= -12
-C_MAX_EXP       ?= 6
-C_NUM           ?= 120
+# C_MIN_EXP       ?= -12
+# C_MAX_EXP       ?= 6
+# C_NUM           ?= 120
+C_MIN_EXP       ?= 1.8
+C_MAX_EXP       ?= 2.9
+C_NUM           ?= 25
 HALVING_FACTOR  ?= 3
 SEARCH_VERBOSE  ?= 0
 
@@ -683,3 +686,17 @@ plot_all_sims: prior_sens_plots beta_binom_plots temporal_drift_plots binom_plot
 clean_all:
 	rm -rf $(DATA_DIR) $(ARTIFACTS_DIR) $(REPORTS_DIR)
 	@echo "Everything cleaned."
+
+
+
+## TEMP ##
+.PHONY: diag
+diag: 
+	poetry run python diagnose_vars_stages.py \
+  --pooled data/processed/default_labels/window=12m/pooled.parquet \
+  --imputed data/processed/imputed/train.parquet \
+  --binned data/processed/binned/train.parquet \
+  --bin-suffix __BIN \
+  --vars amortization_type,window,relief_refinance_indicator,interest_only_indicator,super_conforming_flag \
+  --outdir outputs \
+  --subdir var_diagnostics_flags
