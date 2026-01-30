@@ -580,7 +580,9 @@ def train_pipeline(
         BLACKLIST = [
             "quarter", "year", "month", "vintage", "date", "time",
             "maturity", "first_payment", "mi_cancellation",
-            "interest_rate", "loan_sequence_number",
+            "interest_rate", "loan_sequence_number", "amortization_type",
+            "window", "interest_only_indicator", "relief_refinance_indicator", 
+            "super_conforming_flag",
         ]
 
         def safe(col: str) -> bool:
