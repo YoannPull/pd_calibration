@@ -113,7 +113,7 @@ see `replication/README.md`.
 * `reports/` : HTML validation reports
 * `outputs/` : additional paper outputs (e.g., OOS backtest package)
 * `ldp_application/` : LDP / S&P grade tables + plots (Empirical app #2)
-* `experiments/` : simulations (Empirical app #3)
+* `experiments/` : simulations (simulation app)
 
 ---
 
