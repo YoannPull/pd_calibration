@@ -3,43 +3,40 @@
 This document explains how to replicate the main results of the paper using the **replication-only**
 Makefile located at `replication/Makefile`.
 
-
 ---
 
 ## 0) What is replicated?
 
 The replication Makefile covers the full paper bundle:
 
-- **(A) Empirical application #1 — Mortgage pipeline**
-  Labels → Imputation (anti-leakage) → Binning → Model training + calibration + scoring
-  → Report + OOS scoring + OOS vintage/grade report + paper-ready OOS backtest package.
+- **(A) Empirical application #1, Mortgage pipeline**  
+  Labels, Imputation (anti-leakage), Binning, Model training, Calibration, Scoring, Report, OOS scoring, OOS vintage and grade report, and a paper-ready OOS backtest package.
 
-- **(B) Empirical application #2 — S&P grades / LDP**
-  Build a monthly snapshot from a raw ratings file → grade tables → time-series plots.
+- **(B) Empirical application #2, S&P grades / LDP**  
+  Build a monthly snapshot from a raw ratings file, then generate grade tables and time-series plots.
 
-- **(C) Simulations**
-  Binomial / Beta-Binomial / Temporal drift / Prior sensitivity (simulation + plots + tables).
+- **(C) Simulations**  
+  Binomial, Beta-Binomial, Temporal drift, and Prior sensitivity, including simulations, plots, and tables.
 
 Main entrypoint:
+
 ```bash
 make -f replication/Makefile paper_all
-```
+````
 
 ---
 
 ## 1) About the root Makefile
 
-The repository also includes a root-level `Makefile` intended for development and exploratory runs
-(e.g., broader grids, alternative options, partial pipelines). To replicate the paper results,
-use `replication/Makefile` only, as it pins the training settings and provides minimal paper entrypoints.
+The repository also includes a root-level `Makefile` intended for development and exploratory runs (e.g. broader grids, alternative options, partial pipelines). To replicate the paper results, use `replication/Makefile` only, as it pins the training settings and provides minimal paper entrypoints.
 
 ---
 
 ## 2) System requirements
 
-* OS: Linux/macOS recommended
+* OS: Linux or macOS recommended
 * GNU Make
-* Python + Poetry (project-managed environment)
+* Python environment managed with **Poetry**
 
 Install:
 
@@ -47,6 +44,19 @@ Install:
 poetry install
 make -f replication/Makefile help
 ```
+
+### Alternative (without Poetry)
+
+If you prefer not to use Poetry, install dependencies from `requirements.txt`:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+Note: the replication Makefile uses `poetry run` by default. If you run without Poetry, call the Python entry points directly or adapt the Make targets accordingly.
 
 ### Determinism / threading (recommended for replication)
 
@@ -56,21 +66,20 @@ The Makefile enforces single-thread numerical backends by default:
 * `MKL_NUM_THREADS=1`
 * `OPENBLAS_NUM_THREADS=1`
 
-You may override them, but **paper replication** should keep defaults.
+You may override them, but paper replication should keep defaults.
 
 ---
 
-## 3) Data requirements & expected layout
+## 3) Data requirements and expected layout
 
 ### 3.1 Freddie Mac mortgage data (Empirical app #1)
 
-You must obtain the dataset from the official provider and comply with the terms.
+You must obtain the dataset from the official provider and comply with the terms. The raw Freddie Mac dataset is not distributed with this repository. See `DATA_DISCLAIMER.md`.
 
 Expected layout (high-level):
 
 * `data/raw/mortgage_data/historical_data_YYYYQn/`
-
-  * extracted quarterly text files
+  extracted quarterly text files
 
 Replication produces processed data under:
 
@@ -81,15 +90,21 @@ See:
 * `DATA_DISCLAIMER.md`
 * `data/README.md`
 
-### 3.2 S&P corporate ratings file (Empirical app #2)
+### 3.2 Corporate ratings disclosures (Empirical app #2)
 
-Expected raw file:
+Empirical application #2 relies on rating history disclosures published under SEC Rule 17g-7(b) (XBRL). This repository does not redistribute any rating history files. In our original experiments we used a snapshot downloaded in 2022, which may no longer be available from third-party mirrors. Replication therefore requires re-downloading the underlying disclosures from official sources (or equivalent public disclosures). See `DATA_DISCLAIMER.md`.
+
+Expected raw file (CSV example name):
 
 * `ldp_application/data/raw/20220601_SP_Ratings_Services_Corporate.csv`
 
 The replication Makefile first builds a monthly snapshot:
 
 * output: `ldp_application/data/processed/sp_corporate_monthly.csv`
+
+Optional helper tool to download and convert disclosures into sorted CSV files:
+
+* [https://github.com/maxonlinux/ratings-history](https://github.com/maxonlinux/ratings-history)
 
 ---
 
@@ -130,50 +145,45 @@ make -f replication/Makefile sims_all
 Targets run in this order:
 
 1. `labels`
-
-* generates labels cohorts/windows
-* output: `data/processed/default_labels/window=12m/`
+   Generates label cohorts and windows.
+   Output: `data/processed/default_labels/window=12m/`
 
 2. `impute`
+   Fits the imputer on Train and applies it to all splits (anti-leakage).
+   Outputs:
 
-* fits imputer on Train and applies to all splits (anti-leakage)
-* outputs:
-
-  * `data/processed/imputed/`
-  * `artifacts/imputer/`
+   * `data/processed/imputed/`
+   * `artifacts/imputer/`
 
 3. `binning_fit`
+   Max-Gini binning with monotonicity checks.
+   Outputs:
 
-* Max-Gini binning + monotonicity checks
-* outputs:
-
-  * `data/processed/binned/`
-  * `artifacts/binning_maxgini/`
+   * `data/processed/binned/`
+   * `artifacts/binning_maxgini/`
 
 4. `model_train_final`
+   Deterministic final model training with a narrow C-grid around an anchor.
+   Outputs:
 
-* deterministic “FINAL” model training with a **narrow C-grid around an anchor**
-* outputs:
-
-  * `artifacts/model_from_binned/` (model, calibration, bucket stats, etc.)
-  * `data/processed/scored/` (train/validation scored)
+   * `artifacts/model_from_binned/` (model, calibration, bucket stats, etc.)
+   * `data/processed/scored/` (Train and Validation scored)
 
 5. `report`
+   Generates an HTML validation report (Train and Validation).
+   Output:
 
-* generates an HTML validation report (Train + Validation)
-* output:
-
-  * `reports/model_validation_report.html`
+   * `reports/model_validation_report.html`
 
 6. OOS diagnostics (included in `pipeline`)
 
-* `oos_score` → `data/processed/scored/oos_scored.parquet`
-* `oos_vintage_report` → `reports/vintage_grade_oos.html`
-* `oos_backtest_full` → `outputs/oos_backtest/` (paper snapshot package + optional PDF)
+   * `oos_score` to `data/processed/scored/oos_scored.parquet`
+   * `oos_vintage_report` to `reports/vintage_grade_oos.html`
+   * `oos_backtest_full` to `outputs/oos_backtest/` (paper snapshot package + optional PDF)
 
 ### 5.2 C-grid replication logic (important)
 
-Paper replication uses a **fast reproducible grid around `C_ANCHOR`**:
+Paper replication uses a fast reproducible grid around `C_ANCHOR`:
 
 * `C_ANCHOR` (default: 468.633503)
 * `C_EXP_SPAN` (default: 0.20 in log10 units)
@@ -201,7 +211,7 @@ The Makefile computes:
 make -f replication/Makefile sp_snapshot
 ```
 
-### 6.2 Tables + plots
+### 6.2 Tables and plots
 
 ```bash
 make -f replication/Makefile sp_grade_all
@@ -231,8 +241,7 @@ make -f replication/Makefile temporal_drift_all
 make -f replication/Makefile prior_sens_all
 ```
 
-Expected outputs are written in the corresponding experiment output folders
-(as defined in each module).
+Expected outputs are written in the corresponding experiment output folders (as defined in each module).
 
 ---
 
@@ -255,7 +264,7 @@ After `paper_all`, you should typically have:
 
 (C) Simulations
 
-* plots/tables generated by each experiment module
+* plots and tables generated by each experiment module
 
 ---
 
@@ -263,8 +272,8 @@ After `paper_all`, you should typically have:
 
 ### Missing raw data
 
-* If Freddie Mac files are missing: verify `data/raw/...` layout (see `data/README.md`).
-* If S&P file is missing: place it under `ldp_application/data/raw/` as specified above.
+* If Freddie Mac files are missing, verify `data/raw/...` layout (see `data/README.md`).
+* If the corporate ratings CSV is missing, place it under `ldp_application/data/raw/` as specified above.
 
 ### HTML reports do not open automatically
 
@@ -274,7 +283,7 @@ The Makefile uses `open` (macOS). On Linux, open the HTML directly in a browser.
 
 * Keep `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `OPENBLAS_NUM_THREADS=1`
 * Keep dependency versions pinned (`poetry.lock`)
-* Avoid changing `C_ANCHOR`/grid unless explicitly intended
+* Avoid changing the C-grid unless explicitly intended
 
 ---
 
@@ -289,4 +298,3 @@ This removes:
 * `data/processed/`
 * `artifacts/`
 * `reports/`
-

@@ -43,7 +43,7 @@ https://ssrn.com/abstract=5291474 or http://dx.doi.org/10.2139/ssrn.5291474
 * Python environment managed with **Poetry**
 * **GNU Make**
 
-Install dependencies:
+Install dependencies (recommended):
 
 ```bash
 poetry install
@@ -54,6 +54,20 @@ Show replication commands:
 ```bash
 make -f replication/Makefile help
 ```
+
+### Alternative (without Poetry)
+
+If you prefer not to use Poetry, you can install dependencies from `requirements.txt`:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+Note: the replication Makefile uses `poetry run` by default. If you run without Poetry, call the Python
+entry points directly (see `replication/README.md`) or adapt the Make targets accordingly.
 
 ---
 
