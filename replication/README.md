@@ -1,9 +1,8 @@
-# Paper Replication Guide (replication/Makefile)
+# Paper Replication Guide
 
 This document explains how to replicate the main results of the paper using the **replication-only**
 Makefile located at `replication/Makefile`.
 
-> Where to put this file: **`replication/README.md`** (next to `replication/Makefile`).
 
 ---
 

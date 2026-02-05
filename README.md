@@ -6,10 +6,10 @@ This repository contains the **code, experiments, and reproducibility material**
 SSRN: https://ssrn.com/abstract=5291474  
 DOI: http://dx.doi.org/10.2139/ssrn.5291474
 
-> **Paper-grade replication entrypoints** are provided via a dedicated Makefile:
+> **Paper-grade replication entrypoints** are provided via a dedicated Makefile:  
 > **`replication/Makefile`** (recommended starting point).
 >
-> Note: the repository also contains a root `Makefile` used for development and exploratory runs.
+> Note: the repository also contains a root `Makefile` used for development and exploratory runs.  
 > For paper-grade replication, please use `replication/Makefile` exclusively.
 
 ---
@@ -18,11 +18,12 @@ DOI: http://dx.doi.org/10.2139/ssrn.5291474
 
 If you use this code, results, or figures, please cite:
 
-Pull, Yoann and Hurlin, Christophe, *A Bayesian Approach to Probability of Default Model Calibration:
-Theoretical and Empirical Insights on the Jeffreys Test* (June 12, 2025). Available at SSRN:
+Pull, Yoann and Hurlin, Christophe, *A Bayesian Approach to Probability of Default Model Calibration:  
+Theoretical and Empirical Insights on the Jeffreys Test* (June 12, 2025). Available at SSRN:  
 https://ssrn.com/abstract=5291474 or http://dx.doi.org/10.2139/ssrn.5291474
 
 ### BibTeX
+
 ```bibtex
 @article{PullHurlin2025Jeffreys,
   title  = {A Bayesian Approach to Probability of Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test},
@@ -123,13 +124,54 @@ See `data/README.md` for the exact layout and dictionary file.
 Important: the dataset is provided by Freddie Mac under its own terms; users must obtain it
 themselves and comply with the dataset’s license/terms. See `DATA_DISCLAIMER.md`.
 
+#### Data availability and configuration
+
+Due to third-party licensing terms, **the raw mortgage dataset is not distributed with this repository**.
+Users must download the data directly from Freddie Mac and comply with the dataset’s terms, see
+`DATA_DISCLAIMER.md`.
+
+The pipeline is configured via a YAML file (e.g. `config.yaml`). By default, it is set to use quarters
+from **2008Q1 to 2023Q4**. If you download a shorter time span, you can replicate the pipeline by
+updating the quarter lists in the configuration:
+
+```yaml
+data:
+  root: "data/raw/mortgage_data"
+  quarters: ["2008Q1","2008Q2",...,"2023Q4"]
+```
+
+If you change the available quarters, you should also update the explicit train, validation, and
+out-of-sample splits accordingly:
+
+```yaml
+splits:
+  mode: explicit
+  explicit:
+    design_quarters: [...]
+    validation_quarters: [...]
+    oos_quarters: [...]
+```
+
+This allows replication with fewer raw files while keeping the rest of the workflow unchanged.
+
 ### Corporate ratings data (Empirical app #2)
 
-The S&P grades replication expects a corporate ratings export under:
+The S&P grades replication relies on **credit rating history disclosures** published by NRSROs under
+**SEC Rule 17g-7(b)** (XBRL). We do **not** redistribute any rating history files. In our original
+experiments we used a snapshot downloaded in 2022, which may no longer be available from third-party
+mirrors. Replication therefore requires re-downloading the underlying disclosures from official
+sources (or equivalent public disclosures). See `DATA_DISCLAIMER.md`.
 
-* `ldp_application/data/raw/20220601_SP_Ratings_Services_Corporate.csv`
+As an optional helper tool to download and convert rating history disclosures into sorted CSV files,
+see:
 
-The replication Makefile builds a monthly snapshot and then generates grade tables + plots.
+* [https://github.com/maxonlinux/ratings-history](https://github.com/maxonlinux/ratings-history)
+
+Expected raw input (CSV):
+
+* `ldp_application/data/raw/20220601_SP_Ratings_Services_Corporate.csv` *(example name; depends on the snapshot / download date)*
+
+The replication Makefile then builds a monthly snapshot and generates grade tables + plots.
 
 ---
 

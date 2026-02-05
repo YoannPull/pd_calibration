@@ -1,11 +1,10 @@
 # LDP Application (S&P Grade Tables + Plots)
 
-This folder contains the **Empirical application #2** from the Makefile: an LDP-style
-analysis based on **S&P rating grades**. It builds:
-1) yearly grade tables (CSV), and  
+This folder contains **Empirical application #2** from the replication Makefile, an LDP-style analysis based on **S&P rating grades**. It produces:
+1) yearly grade tables (CSV), and
 2) time-series plots computed from the combined CSV.
 
-Everything is meant to be run from the **repository root** via the Makefile.
+Run everything from the **repository root** via the Makefile.
 
 ---
 
@@ -13,31 +12,43 @@ Everything is meant to be run from the **repository root** via the Makefile.
 
 From the repo root:
 
-```
-
+```text
 ldp_application/
-run_sp_grade_tables.py
-run_sp_grade_plots.py
-scripts/
-sp_grade_tables.py
-sp_grade_plots.py
-data/
-raw/
-data_rating_corporate.xlsx
-outputs/
-sp_grade_is_oos/
-
-````
+  run_sp_grade_tables.py
+  run_sp_grade_plots.py
+  scripts/
+    sp_grade_tables.py
+    sp_grade_plots.py
+  data/
+    raw/
+    processed/
+  outputs/
+    sp_grade_is_oos/
+```
 
 ---
 
 ## Input data
 
-Place the Excel file here:
+This application relies on **credit rating history disclosures** (SEC Rule 17g-7, XBRL). This repository does **not** redistribute any rating history files. See `DATA_DISCLAIMER.md` in the repository root for details.
 
-- `ldp_application/data/raw/data_rating_corporate.xlsx`
+### Raw input (CSV)
 
-The Makefile checks that this file exists before running.
+Place a corporate ratings history export here:
+
+* `ldp_application/data/raw/20220601_SP_Ratings_Services_Corporate.csv` *(example name; depends on the snapshot / download date)*
+
+If you start from official disclosures (XBRL), you may use an external helper tool to download and convert them into sorted CSV files:
+
+* [https://github.com/maxonlinux/ratings-history](https://github.com/maxonlinux/ratings-history)
+
+Note: this external project is released under the **AGPL-3.0** licence. It is not a dependency of this repository.
+
+### Processed input (built by the Makefile)
+
+The Makefile first builds a monthly snapshot (1 row per obligor × month). Default output:
+
+* `ldp_application/data/processed/sp_corporate_monthly.csv`
 
 ---
 
@@ -46,9 +57,10 @@ The Makefile checks that this file exists before running.
 From the repository root:
 
 ### Build grade tables
+
 ```bash
 make sp_grade_tables
-````
+```
 
 ### Build plots (from the combined tables CSV)
 
@@ -76,13 +88,11 @@ Typical files:
 * `sp_grade_tables_*.csv` (combined table across years)
 * `plots_timeseries/` (time-series figures)
 
-**Plotting note:** the `sp_grade_plots` target tries to use the expected combined CSV
-name (based on the requested years). If it does not exist (e.g., year clipping),
-it automatically falls back to the newest `sp_grade_tables_*.csv` found in the output directory.
+Plotting note: the `sp_grade_plots` target tries to use the expected combined CSV name (based on the requested years). If it does not exist (e.g. year clipping), it automatically falls back to the newest `sp_grade_tables_*.csv` found in the output directory.
 
 ---
 
-## Main Makefile parameters (you can override at runtime)
+## Main Makefile parameters (override at runtime)
 
 You can override parameters directly in the `make` command, for example:
 
@@ -142,14 +152,16 @@ The Makefile uses:
 
 ## Troubleshooting
 
-* If you get a “Missing: data_rating_corporate.xlsx” error, verify the file path:
-  `ldp_application/data/raw/data_rating_corporate.xlsx`
+* If you get a “missing raw CSV” error, verify the file path under:
+  `ldp_application/data/raw/`
+
 * If plotting fails, run tables first:
 
   ```bash
   make sp_grade_tables
   make sp_grade_plots
   ```
+
 * To regenerate from scratch:
 
   ```bash
