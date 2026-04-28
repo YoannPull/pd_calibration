@@ -25,11 +25,11 @@ def plot_beta_priors_grid(outpath: Path, eps: float = 1e-3):
 
     for ax, (a, b) in zip(axes, pairs):
         y = beta_dist.pdf(p, a, b)
-        linewidth = 4 if np.isclose(a, b) else 2
+        linewidth = 3 if np.isclose(a, b) else 2
         ax.plot(p, y, linewidth=linewidth)
 
         if a == eps and b == eps:
-            ax.set_title(rf"$\alpha=\beta=\varepsilon$ (approx. $\alpha=\beta=0$), $\varepsilon={eps}$")
+            ax.set_title(rf"Haldane approx. $\alpha=\beta=\varepsilon={eps}$")
         else:
             ax.set_title(rf"$\alpha={a},\beta={b}$")
 
@@ -69,7 +69,7 @@ def plot_noninformative_beta_priors_grid(outpath: Path, eps: float = 1e-3):
     for ax, (name, a, b) in zip(axes, priors):
         y = beta_dist.pdf(p, a, b)
         y = np.maximum(y, 1e-300)  # safety for log scale
-        linewidth = 4 if np.isclose(a, b) else 2
+        linewidth = 3 if np.isclose(a, b) else 2
 
         ax.semilogy(p, y, linewidth=linewidth)
         ax.set_title(rf"{name} — $\alpha={a:g},\ \beta={b:g}$")
@@ -94,7 +94,7 @@ def plot_noninformative_beta_priors_grid(outpath: Path, eps: float = 1e-3):
 
 
 if __name__ == "__main__":
-    eps = 1e-3
+    eps = 2e-3
 
     out_grid = Path("plot_paper/reports/figures/beta_priors_grid.png")
     plot_beta_priors_grid(outpath=out_grid, eps=eps)
