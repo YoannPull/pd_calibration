@@ -13,14 +13,32 @@ plt.style.use("seaborn-v0_8-white")
 
 DEFAULT_FIGSIZE = (10, 6)
 
-# Your palette (kept)
+# Color-blind palette
 METHOD_STYLES = {
-    "jeffreys": {"label": "Jeffreys equal-tailed", "color": "#d62728"},
-    "cp": {"label": "Exact Clopper–Pearson", "color": "#ff7f0e"},
-    "normal": {"label": "Normal approximation", "color": "#2ca02c"},
-    "jeffreys_ecb": {"label": "Jeffreys ECB (upper)", "color": "#1f77b4"},
-    "cp_upper": {"label": "Exact CP upper", "color": "#8c564b"},
-    "normal_upper": {"label": "Normal upper", "color": "#9467bd"},
+    "jeffreys": {
+        "label": "Jeffreys equal-tailed",
+        "color": "#0072B2",  # blue
+    },
+    "cp": {
+        "label": "Exact Clopper–Pearson",
+        "color": "#E69F00",  # orange
+    },
+    "normal": {
+        "label": "Normal approximation",
+        "color": "#009E73",  # bluish green
+    },
+    "jeffreys_ecb": {
+        "label": "Jeffreys ECB (upper)",
+        "color": "#D55E00",  # vermillion / red
+    },
+    "cp_upper": {
+        "label": "Exact CP upper",
+        "color": "#CC79A7",  # reddish purple
+    },
+    "normal_upper": {
+        "label": "Normal upper",
+        "color": "#56B4E9",  # sky blue
+    },
 }
 
 def apply_rcparams():

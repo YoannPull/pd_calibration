@@ -7,7 +7,7 @@ OOS Backtest (paper-ready) — feature module
 This module contains the full out-of-sample (OOS) PD backtesting logic used in the
 paper-ready pipeline:
 
-- Build a (Quarter × Grade) aggregation table from a loan-level scored dataset.
+- Build a (Quarter x Grade) aggregation table from a loan-level scored dataset.
 - Compute Jeffreys / Clopper–Pearson / Normal Approx. intervals.
 - Produce per-quarter binary heatmaps (reject/ok/NA).
 - Build traffic-light matrices (p-value or decision-based).
@@ -31,7 +31,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -39,7 +39,7 @@ import pandas as pd
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
-from matplotlib.patches import Patch, Circle
+from matplotlib.patches import Patch, Ellipse, RegularPolygon, FancyBboxPatch, Rectangle
 from matplotlib.lines import Line2D
 
 from scipy.stats import beta as beta_dist
@@ -55,17 +55,49 @@ from experiments.stats.intervals import (
 # =============================================================================
 # Styling (paper look)
 # =============================================================================
-
+#
+# Color-blind safe palette built on Okabe–Ito.
+# Triple encoding everywhere: hue + shape + letter, plus a soft cell tint
+# so the global pattern reads at a glance even in grayscale.
+#
 PAPER = {
-    "bg": "#ffffff",
-    "grid": "#e5e7eb",
-    "axis": "#111827",
-    "muted": "#6b7280",
-    "green": "#1a9850",
-    "amber": "#f59e0b",
-    "red": "#d73027",
-    "na": "#d1d5db",
-    "nan_tile": "#eef2f7",
+    # Surface
+    "bg":       "#FFFFFF",   # soft off-white background
+    "panel":    "#FFFFFF",   # bright panel for cells
+    "grid":     "#FFFFFF",   # subtle grid
+    "frame":    "#CBD0D6",   # outer frame
+    "axis":     "#111827",   # near-black text
+    "muted":    "#6B7280",   # muted grey labels
+    "muted_2":  "#9CA3AF",   # secondary muted (year separators)
+
+    # Categorical signals — pastel colorblind-friendly palette
+    "blue":     "#9ECAE1",   # pastel blue        — B
+    "amber":    "#F2C879",   # pastel amber       — A
+    "red":      "#E9A17B",   # pastel vermillion  — R
+    "na":       "#D6D6D6",   # light grey         — NA
+
+    # Soft fills reused across figures for visual consistency.
+    # Since the main traffic-light colors are already pastel, the same
+    # tones can be used directly as cell fills in the binary heatmaps.
+    "blue_tint":  "#9ECAE1",
+    "amber_tint": "#F2C879",
+    "red_tint":   "#E9A17B",
+    "na_tint":    "#D6D6D6",
+
+    # Misc tile color for NaN in binary heatmap
+    "nan_tile": "#F1F5F9",
+
+    # Marker styling
+    "stroke":        "#FFFFFF",
+    "stroke_width":  1.0,
+    "marker_fontsize": 7.2,
+
+    # Compact traffic-light table typography
+    "cell_fontsize": 6.4,
+    "quarter_fontsize": 6.4,
+    "year_fontsize": 7.6,
+    "grade_fontsize": 7.2,
+    "legend_fontsize": 6.4,
 }
 
 
@@ -86,6 +118,8 @@ def apply_paper_rcparams() -> None:
             "axes.spines.right": False,
             "axes.spines.left": False,
             "axes.spines.bottom": False,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
         }
     )
 
@@ -95,6 +129,215 @@ def paper_axes(ax) -> None:
     for sp in ax.spines.values():
         sp.set_visible(False)
     ax.tick_params(length=0, colors=PAPER["muted"])
+
+
+# =============================================================================
+# Traffic-light accessibility helpers
+# =============================================================================
+
+TL_LABELS = {
+    "blue":  "Blue / ✓",
+    "amber": "Amber / ●",
+    "red":   "Red / ×",
+    "na":    "NA",
+}
+
+TL_SYMBOLS = {
+    "blue":  "✓",
+    "amber": "●",
+    "red":   "×",
+    "na":    "—",
+}
+
+TL_MARKERS = {
+    "blue":  "o",     # legend/scatter proxy for ellipse
+    "amber": "D",     # diamond
+    "red":   "^",     # triangle (pointing up)
+    "na":    "s",     # square
+}
+
+TL_HATCHES = {
+    "blue":  "",
+    "amber": "///",
+    "red":   "xxx",
+    "na":    "...",
+}
+
+TL_TINTS = {
+    "blue":  PAPER["blue_tint"],
+    "amber": PAPER["amber_tint"],
+    "red":   PAPER["red_tint"],
+    "na":    PAPER["na_tint"],
+}
+
+
+def _tl_level(x) -> str:
+    """Normalize traffic-light levels to one of: blue, amber, red, na."""
+    if x is None:
+        return "na"
+    try:
+        if pd.isna(x):
+            return "na"
+    except Exception:
+        pass
+
+    s = str(x).strip().lower()
+    if s in {"blue", "amber", "red", "na"}:
+        return s
+    return "na"
+
+
+def _tl_color(level: str) -> str:
+    level = _tl_level(level)
+    return PAPER[level] if level in {"blue", "amber", "red", "na"} else PAPER["na"]
+
+
+def _tl_tint(level: str) -> str:
+    return TL_TINTS.get(_tl_level(level), PAPER["na_tint"])
+
+
+def _tl_text_color(level: str) -> str:
+    level = _tl_level(level)
+    if level == "amber":
+        return PAPER["axis"]
+    if level == "na":
+        return PAPER["muted"]
+    return PAPER["bg"]
+
+
+def draw_tl_marker(
+    ax,
+    x: float,
+    y: float,
+    level: str,
+    *,
+    size: float = 0.72,
+    annotate: bool = True,
+    zorder: int = 3,
+) -> None:
+    """
+    Draw a color-blind-friendly traffic-light marker.
+
+    Shape encoding (dual-redundant with hue + letter):
+      - Blue  : balanced horizontal ellipse + B
+      - Amber : diamond + A
+      - Red   : upward-pointing triangle + R
+      - NA    : rounded square + NA
+    """
+    level = _tl_level(level)
+    color = _tl_color(level)
+
+    # Letter offset (some shapes need optical correction)
+    label_dy = 0.0
+
+    if level == "blue":
+        # Balanced ellipse — softly oval, not flattened pancake-style.
+        patch = Ellipse(
+            (x, y),
+            width=size * 0.82,
+            height=size * 0.62,
+            facecolor=color,
+            edgecolor=PAPER["stroke"],
+            linewidth=PAPER["stroke_width"],
+            zorder=zorder,
+        )
+
+    elif level == "amber":
+        # Diamond — RegularPolygon with 4 vertices, orientation 0 → diamond shape.
+        patch = RegularPolygon(
+            (x, y),
+            numVertices=4,
+            radius=size * 0.40,
+            orientation=0.0,
+            facecolor=color,
+            edgecolor=PAPER["stroke"],
+            linewidth=PAPER["stroke_width"],
+            zorder=zorder,
+        )
+
+    elif level == "red":
+        # FIX: orientation=0 means "vertex at top" → triangle pointing UP.
+        # The previous π/2 rotation produced a sideways "pennant" look.
+        patch = RegularPolygon(
+            (x, y),
+            numVertices=3,
+            radius=size * 0.46,
+            orientation=0.0,
+            facecolor=color,
+            edgecolor=PAPER["stroke"],
+            linewidth=PAPER["stroke_width"],
+            zorder=zorder,
+        )
+        # Optical centering: lower the "R" so it sits in the wide base.
+        label_dy = -0.06 * size
+
+    else:  # na
+        w = size * 0.72
+        h = size * 0.50
+        patch = FancyBboxPatch(
+            (x - w / 2.0, y - h / 2.0),
+            w,
+            h,
+            boxstyle="round,pad=0.02,rounding_size=0.08",
+            facecolor=color,
+            edgecolor=PAPER["stroke"],
+            linewidth=PAPER["stroke_width"],
+            zorder=zorder,
+        )
+
+    ax.add_patch(patch)
+
+    if annotate:
+        ax.text(
+            x,
+            y + label_dy,
+            TL_SYMBOLS[level],
+            ha="center",
+            va="center",
+            fontsize=PAPER["marker_fontsize"],
+            fontweight=800,
+            color=_tl_text_color(level),
+            zorder=zorder + 1,
+            clip_on=True,
+        )
+
+
+def traffic_light_legend_handles(include_na: bool = True):
+    levels = ["blue", "amber", "red"]
+    if include_na:
+        levels.append("na")
+
+    return [
+        Line2D(
+            [0],
+            [0],
+            marker=TL_MARKERS[level],
+            linestyle="None",
+            markersize=10,
+            markerfacecolor=_tl_color(level),
+            markeredgecolor=PAPER["stroke"],
+            markeredgewidth=1.0,
+            label=TL_LABELS[level],
+        )
+        for level in levels
+    ]
+
+
+def traffic_light_patch_handles(include_na: bool = True):
+    levels = ["blue", "amber", "red"]
+    if include_na:
+        levels.append("na")
+
+    return [
+        Patch(
+            facecolor=_tl_color(level),
+            edgecolor=PAPER["axis"],
+            linewidth=0.6,
+            hatch=TL_HATCHES[level],
+            label=TL_LABELS[level],
+        )
+        for level in levels
+    ]
 
 
 def legend_outside(ax, handles, labels=None, *, side="right", pad=0.02, fontsize=9):
@@ -113,8 +356,8 @@ def legend_outside(ax, handles, labels=None, *, side="right", pad=0.02, fontsize
             facecolor=PAPER["bg"],
             edgecolor=PAPER["grid"],
             fontsize=fontsize,
-            borderpad=0.6,
-            labelspacing=0.5,
+            borderpad=0.7,
+            labelspacing=0.6,
             handlelength=1.8,
         )
     elif side == "bottom":
@@ -129,8 +372,8 @@ def legend_outside(ax, handles, labels=None, *, side="right", pad=0.02, fontsize
             facecolor=PAPER["bg"],
             edgecolor=PAPER["grid"],
             fontsize=fontsize,
-            borderpad=0.6,
-            labelspacing=0.5,
+            borderpad=0.7,
+            labelspacing=0.6,
             handlelength=1.8,
         )
     else:
@@ -143,10 +386,10 @@ def legend_outside(ax, handles, labels=None, *, side="right", pad=0.02, fontsize
 
 def save_fig(fig, png: Path, pdf: Path | None = None) -> None:
     png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(png, bbox_inches="tight")
+    fig.savefig(png, bbox_inches="tight", pad_inches=0.03)
     if pdf is not None:
         pdf.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(pdf, bbox_inches="tight")
+        fig.savefig(pdf, bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
 
 
@@ -484,7 +727,7 @@ def render_snapshot_table_latex(
         ub_hdr = r"UB (97.5\%, \%)"
 
     if include_counts:
-        colspec = "c r r r r r r"
+        colspec = "c r r r r r r r"
         header = (
             r"\textbf{Grade} & \textbf{N} & \textbf{D} & "
             rf"\textbf{{{pd_hdr}}} & \textbf{{{lb_hdr}}} & \textbf{{{ub_hdr}}} & "
@@ -557,6 +800,12 @@ def render_snapshot_table_latex(
 # Plotting
 # =============================================================================
 
+def _year_break_indices(quarters: list) -> list[int]:
+    """Index positions where the year changes (used for subtle vertical separators)."""
+    years = [str(q)[:4] for q in quarters]
+    return [i for i in range(1, len(years)) if years[i] != years[i - 1]]
+
+
 def plot_binary_heatmap_for_quarter(
     df_q: pd.DataFrame,
     out_png: Path,
@@ -576,10 +825,10 @@ def plot_binary_heatmap_for_quarter(
         mat[is_na, j] = -1
 
     n_grades = mat.shape[0]
-    cmap = ListedColormap([PAPER["nan_tile"], PAPER["green"], PAPER["red"]])
+    cmap = ListedColormap([PAPER["nan_tile"], PAPER["blue_tint"], PAPER["red_tint"]])
     norm = BoundaryNorm(boundaries=[-1.5, -0.5, 0.5, 1.5], ncolors=cmap.N)
 
-    fig, ax = plt.subplots(figsize=(6.2, max(2.6, 0.32 * n_grades)))
+    fig, ax = plt.subplots(figsize=(6.4, max(3.0, 0.42 * n_grades)))
     paper_axes(ax)
 
     ax.imshow(mat, cmap=cmap, norm=norm, aspect="auto", interpolation="nearest", origin="lower")
@@ -591,7 +840,7 @@ def plot_binary_heatmap_for_quarter(
 
     ax.set_xticks(np.arange(-0.5, len(xlabels), 1), minor=True)
     ax.set_yticks(np.arange(-0.5, n_grades, 1), minor=True)
-    ax.grid(which="minor", color=PAPER["grid"], linestyle="-", linewidth=1.0)
+    ax.grid(which="minor", color=PAPER["grid"], linestyle="-", linewidth=0.8)
     ax.tick_params(which="minor", bottom=False, left=False)
 
     if annotate:
@@ -599,22 +848,23 @@ def plot_binary_heatmap_for_quarter(
             for c in range(len(xlabels)):
                 v = mat[r, c]
                 if v == -1:
-                    continue
+                    txt, color = "—", PAPER["muted"]
+                elif v == 0:
+                    txt, color = "✓", PAPER["axis"]
+                else:
+                    txt, color = "✕", PAPER["axis"]
                 ax.text(
-                    c,
-                    r,
-                    "✓" if v == 0 else "✕",
-                    ha="center",
-                    va="center",
-                    fontsize=12,
-                    fontweight=800,
-                    color=PAPER["bg"],
+                    c, r,
+                    txt,
+                    ha="center", va="center",
+                    fontsize=12, fontweight=800,
+                    color=color,
                 )
 
     handles = [
-        Patch(facecolor=PAPER["green"], edgecolor="none", label="OK"),
-        Patch(facecolor=PAPER["red"], edgecolor="none", label="Reject"),
-        Patch(facecolor=PAPER["nan_tile"], edgecolor="none", label="NA"),
+        Patch(facecolor=PAPER["blue_tint"], edgecolor=PAPER["blue"], linewidth=0.8, label="OK"),
+        Patch(facecolor=PAPER["red_tint"],  edgecolor=PAPER["red"],  linewidth=0.8, label="Reject"),
+        Patch(facecolor=PAPER["nan_tile"],  edgecolor=PAPER["muted"], linewidth=0.8, label="NA"),
     ]
     legend_outside(ax, handles, side="right", pad=0.02)
 
@@ -623,47 +873,255 @@ def plot_binary_heatmap_for_quarter(
 
 
 def plot_traffic_light_matrix(mat: pd.DataFrame, out_png: Path, out_pdf: Path | None = None) -> None:
+    """
+    Compact publication-quality traffic-light matrix.
+
+    Design:
+      - slightly rectangular horizontal cells;
+      - thin white separators;
+      - colorblind-safe palette: blue, amber, vermillion, grey;
+      - bold letters inside cells;
+      - subtle year labels above quarters;
+      - compact journal-ready layout.
+    """
     grades = mat.index.tolist()
-    quarters = mat.columns.tolist()
+    quarters = [str(q) for q in mat.columns.tolist()]
     nrows, ncols = len(grades), len(quarters)
 
-    fig, ax = plt.subplots(figsize=(max(8.0, 0.52 * ncols) + 1.2, max(3.0, 0.33 * nrows)))
-    ax.set_facecolor(PAPER["bg"])
+    if nrows == 0 or ncols == 0:
+        return
+
+    # Geometry — wider than tall
+    cell_w = 1.12
+    cell_h = 0.62
+    sep = 0.030
+    year_gap = 0.12
+    year_breaks = _year_break_indices(quarters)
+
+    x_left = np.zeros(ncols)
+    offset = 0.0
+    for c in range(ncols):
+        if c in year_breaks:
+            offset += year_gap
+        x_left[c] = c * cell_w + offset
+
+    total_w = x_left[-1] + cell_w
+    total_h = nrows * cell_h
+
+    fig_w = max(6.6, 0.55 * ncols + 1.2)
+    fig_h = max(2.4, 0.22 * nrows + 0.75)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     fig.patch.set_facecolor(PAPER["bg"])
+    ax.set_facecolor(PAPER["bg"])
+    ax.axis("off")
 
-    ax.set_xlim(0, ncols)
-    ax.set_ylim(0, nrows)
-    ax.set_xticks(np.arange(ncols) + 0.5)
-    ax.set_yticks(np.arange(nrows) + 0.5)
-    ax.set_xticklabels([str(q) for q in quarters], rotation=0, color=PAPER["muted"])
-    ax.set_yticklabels([str(g) for g in grades], color=PAPER["muted"])
-    ax.tick_params(length=0)
-    for sp in ax.spines.values():
-        sp.set_visible(False)
+    letter_color = {
+        "blue": PAPER["axis"],
+        "amber": PAPER["axis"],
+        "red": PAPER["axis"],
+        "na": PAPER["muted"],
+    }
 
+    # Cells
     for r in range(nrows):
         for c in range(ncols):
-            ax.add_patch(plt.Rectangle((c, r), 1, 1, facecolor="none", edgecolor=PAPER["grid"], linewidth=1.0))
-            lvl = mat.iloc[r, c]
-            if lvl == "green":
-                col = PAPER["green"]
-            elif lvl == "amber":
-                col = PAPER["amber"]
-            elif lvl == "red":
-                col = PAPER["red"]
-            else:
-                col = PAPER["na"]
-            ax.add_patch(Circle((c + 0.5, r + 0.5), radius=0.33, facecolor=col, edgecolor="none"))
+            lvl = _tl_level(mat.iloc[r, c])
 
-    handles = [
-        Patch(facecolor=PAPER["green"], edgecolor="none", label="Green"),
-        Patch(facecolor=PAPER["amber"], edgecolor="none", label="Amber"),
-        Patch(facecolor=PAPER["red"], edgecolor="none", label="Red"),
-        Patch(facecolor=PAPER["na"], edgecolor="none", label="NA"),
-    ]
-    legend_outside(ax, handles, side="right", pad=0.02)
+            x0 = x_left[c] + sep / 2.0
+            y0 = r * cell_h + sep / 2.0
+            w = cell_w - sep
+            h = cell_h - sep
 
-    fig.tight_layout()
+            ax.add_patch(
+                Rectangle(
+                    (x0, y0),
+                    w,
+                    h,
+                    facecolor=_tl_color(lvl),
+                    edgecolor="#FFFFFF",
+                    linewidth=0.45,
+                    zorder=2,
+                )
+            )
+
+            ax.text(
+                x_left[c] + cell_w / 2.0,
+                r * cell_h + cell_h / 2.0,
+                TL_SYMBOLS[lvl],
+                ha="center",
+                va="center",
+                fontsize=PAPER["cell_fontsize"] + 0.8 if lvl != "na" else PAPER["cell_fontsize"],
+                fontweight=700,
+                color=letter_color[lvl],
+                family="DejaVu Sans",
+                zorder=3,
+            )
+
+    # Grade labels
+    for r, grade in enumerate(grades):
+        ax.text(
+            -0.15,
+            r * cell_h + cell_h / 2.0,
+            str(grade),
+            ha="right",
+            va="center",
+            fontsize=PAPER["grade_fontsize"],
+            color=PAPER["axis"],
+            family="DejaVu Sans",
+            fontstyle="italic",
+        )
+
+    # Quarter labels
+    for c, q in enumerate(quarters):
+        q_clean = q.replace("-", "")
+        q_short = q_clean[-2:] if len(q_clean) >= 2 else q_clean
+
+        ax.text(
+            x_left[c] + cell_w / 2.0,
+            -0.10,
+            q_short,
+            ha="center",
+            va="top",
+            fontsize=PAPER["quarter_fontsize"],
+            color=PAPER["muted"],
+            family="DejaVu Sans",
+            fontweight=500,
+        )
+
+    # Year labels and rules
+    year_groups: dict[str, list[int]] = {}
+    for c, q in enumerate(quarters):
+        year = q[:4]
+        year_groups.setdefault(year, []).append(c)
+
+    year_y = total_h + 0.22
+    rule_y = total_h + 0.075
+
+    for year, cols in year_groups.items():
+        x0 = x_left[cols[0]]
+        x1 = x_left[cols[-1]] + cell_w
+        xm = 0.5 * (x0 + x1)
+
+        ax.text(
+            xm,
+            year_y,
+            year,
+            ha="center",
+            va="center",
+            fontsize=PAPER["year_fontsize"],
+            fontweight=600,
+            color=PAPER["muted"],
+            family="DejaVu Sans",
+        )
+
+        ax.plot(
+            [x0 + 0.05, x1 - 0.05],
+            [rule_y, rule_y],
+            color=PAPER["frame"],
+            linewidth=0.55,
+            solid_capstyle="butt",
+            zorder=1,
+        )
+
+    # Subtle vertical separators between years
+    for c in year_breaks:
+        xb = x_left[c] - 0.5 * year_gap
+        ax.plot(
+            [xb, xb],
+            [0.02, total_h - 0.02],
+            color="#FFFFFF",
+            linewidth=1.0,
+            zorder=4,
+        )
+
+    # Axis label
+    ax.text(
+        -0.15,
+        total_h + 0.075,
+        "Grade",
+        ha="right",
+        va="center",
+        fontsize=PAPER["quarter_fontsize"],
+        color=PAPER["muted"],
+        family="DejaVu Sans",
+    )
+
+    # Compact legend
+    legend_levels = ["blue", "amber", "red", "na"]
+    legend_text = {
+        "blue":  "Blue / ✓",
+        "amber": "Amber / ●",
+        "red":   "Red / ×",
+        "na":    "NA",
+    }
+    
+
+    sw = 0.35
+    sh = 0.30
+    label_pad = 0.035
+    item_gap = 0.78
+    legend_y = -0.78
+
+    label_widths = {
+    "blue": 1.08,
+    "amber": 1.28,
+    "red": 1.08,
+    "na": 0.28,
+    }
+    legend_total_w = sum(sw + label_pad + label_widths[lvl] for lvl in legend_levels) + item_gap * (len(legend_levels) - 1)
+    legend_x0 = (total_w - legend_total_w) / 2.0
+
+    cursor = legend_x0
+    for lvl in legend_levels:
+        ax.add_patch(
+            Rectangle(
+                (cursor, legend_y - sh / 2.0),
+                sw,
+                sh,
+                facecolor=_tl_color(lvl),
+                edgecolor="#FFFFFF",
+                linewidth=0.45,
+                zorder=2,
+            )
+        )
+
+        ax.text(
+            cursor + sw / 2.0,
+            legend_y,
+            TL_SYMBOLS[lvl],
+            ha="center",
+            va="center",
+            fontsize=5.8 if lvl != "na" else 5.0,
+            fontweight=700,
+            color=letter_color[lvl],
+            family="DejaVu Sans",
+            zorder=3,
+        )
+
+        ax.text(
+            cursor + sw + label_pad,
+            legend_y,
+            legend_text[lvl],
+            ha="left",
+            va="center",
+            fontsize=PAPER["legend_fontsize"],
+            color=PAPER["axis"],
+            family="DejaVu Sans",
+        )
+
+        cursor += sw + label_pad + label_widths[lvl] + item_gap
+
+    # Final limits
+    legend_left = legend_x0 - 0.10
+    legend_right = legend_x0 + legend_total_w + 0.10
+    x_lo = min(-0.65, legend_left)
+    x_hi = max(total_w + 0.10, legend_right)
+
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(-0.95, total_h + 0.42)
+    ax.set_aspect("equal")
+
     save_fig(fig, out_png, out_pdf)
 
 
@@ -673,34 +1131,66 @@ def plot_traffic_light_summary_by_quarter(mat: pd.DataFrame, out_png: Path, out_
     def shares(col: pd.Series) -> dict[str, float]:
         tot = col.notna().sum()
         if tot == 0:
-            return {"green": 0.0, "amber": 0.0, "red": 0.0}
+            return {"blue": 0.0, "amber": 0.0, "red": 0.0}
         return {
-            "green": float((col == "green").sum()) / tot,
+            "blue":  float((col == "blue").sum())  / tot,
             "amber": float((col == "amber").sum()) / tot,
-            "red": float((col == "red").sum()) / tot,
+            "red":   float((col == "red").sum())   / tot,
         }
 
     s = pd.DataFrame([shares(mat[q]) for q in quarters], index=quarters)
 
-    fig, ax = plt.subplots(figsize=(max(8.0, 0.52 * len(quarters)) + 1.2, 3.2))
+    fig_w = max(8.0, 0.6 * len(quarters)) + 1.4
+    fig, ax = plt.subplots(figsize=(fig_w, 3.4))
     paper_axes(ax)
 
     bottom = np.zeros(len(quarters))
-    ax.bar(quarters, s["green"].to_numpy(), bottom=bottom, color=PAPER["green"], label="Green")
-    bottom += s["green"].to_numpy()
-    ax.bar(quarters, s["amber"].to_numpy(), bottom=bottom, color=PAPER["amber"], label="Amber")
+    bar_kw = {"edgecolor": PAPER["bg"], "linewidth": 0.8}
+
+    ax.bar(
+        quarters,
+        s["blue"].to_numpy(),
+        bottom=bottom,
+        color=PAPER["blue"],
+        hatch=TL_HATCHES["blue"],
+        label=TL_LABELS["blue"],
+        **bar_kw,
+    )
+    bottom += s["blue"].to_numpy()
+
+    ax.bar(
+        quarters,
+        s["amber"].to_numpy(),
+        bottom=bottom,
+        color=PAPER["amber"],
+        hatch=TL_HATCHES["amber"],
+        label=TL_LABELS["amber"],
+        **bar_kw,
+    )
     bottom += s["amber"].to_numpy()
-    ax.bar(quarters, s["red"].to_numpy(), bottom=bottom, color=PAPER["red"], label="Red")
+
+    ax.bar(
+        quarters,
+        s["red"].to_numpy(),
+        bottom=bottom,
+        color=PAPER["red"],
+        hatch=TL_HATCHES["red"],
+        label=TL_LABELS["red"],
+        **bar_kw,
+    )
+
+    # Year separators on the bar chart too
+    for xb in _year_break_indices(quarters):
+        ax.axvline(xb - 0.5, color=PAPER["frame"], linewidth=1.0, alpha=0.55, zorder=0)
 
     ax.set_ylim(0, 1)
-    ax.grid(axis="y", color=PAPER["grid"], linewidth=1.0)
+    ax.set_yticks(np.linspace(0, 1, 6))
+    ax.set_yticklabels([f"{int(v*100)}%" for v in np.linspace(0, 1, 6)])
+    ax.grid(axis="y", color=PAPER["grid"], linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
     ax.tick_params(axis="x", rotation=0)
 
-    handles = [
-        Patch(facecolor=PAPER["green"], edgecolor="none", label="Green"),
-        Patch(facecolor=PAPER["amber"], edgecolor="none", label="Amber"),
-        Patch(facecolor=PAPER["red"], edgecolor="none", label="Red"),
-    ]
+    handles = traffic_light_patch_handles(include_na=False)
     legend_outside(ax, handles, side="right", pad=0.02)
 
     fig.tight_layout()
@@ -733,10 +1223,23 @@ def plot_severity_map_year(out: pd.DataFrame, year: int, out_png: Path, out_pdf:
     finite = np.isfinite(ES_bps)
     vmax = float(np.nanquantile(ES_bps[finite], 0.98)) if finite.any() else 1.0
 
-    fig, ax = plt.subplots(figsize=(max(7.0, 1.2 + 1.1 * len(q_order)) + 1.4, max(3.0, 0.33 * len(mat.index))))
+    fig_w = max(7.0, 1.0 + 0.95 * len(q_order)) + 1.4
+    fig_h = max(3.6, 0.50 * len(mat.index))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     paper_axes(ax)
 
-    im = ax.imshow(ES_bps, aspect="auto", interpolation="nearest", vmin=0.0, vmax=vmax, origin="lower")
+    # 'cividis' is perceptually uniform AND specifically engineered for
+    # color-vision deficiencies — ideal for severity.
+    im = ax.imshow(
+        ES_bps,
+        aspect="auto",
+        interpolation="nearest",
+        vmin=0.0,
+        vmax=vmax,
+        origin="lower",
+        cmap="cividis",
+    )
+
     ax.set_xticks(range(len(q_order)))
     ax.set_xticklabels(q_order, rotation=0, color=PAPER["muted"])
     ax.set_yticks(range(len(mat.index)))
@@ -744,12 +1247,13 @@ def plot_severity_map_year(out: pd.DataFrame, year: int, out_png: Path, out_pdf:
 
     ax.set_xticks(np.arange(-0.5, len(q_order), 1), minor=True)
     ax.set_yticks(np.arange(-0.5, len(mat.index), 1), minor=True)
-    ax.grid(which="minor", color=PAPER["grid"], linestyle="-", linewidth=1.0)
+    ax.grid(which="minor", color=PAPER["grid"], linestyle="-", linewidth=0.8)
     ax.tick_params(which="minor", bottom=False, left=False)
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
     cbar.set_label("ES (bps)", color=PAPER["muted"])
     cbar.ax.tick_params(colors=PAPER["muted"])
+    cbar.outline.set_visible(False)
 
     fig.tight_layout()
     save_fig(fig, out_png, out_pdf)
@@ -767,7 +1271,8 @@ def plot_evidence_severity_plane_year(out: pd.DataFrame, year: int, cfg: Backtes
     df["n_k"] = df["n_k"].astype(float)
 
     size = np.log1p(df["n_k"].to_numpy(float))
-    size = 30 + 90 * (size - np.nanmin(size)) / (np.nanmax(size) - np.nanmin(size) + 1e-12)
+    denom = (np.nanmax(size) - np.nanmin(size) + 1e-12)
+    size = 40 + 110 * (size - np.nanmin(size)) / denom
 
     def _tl_decision(prob_under: float, es: float) -> str:
         if not (np.isfinite(prob_under) and np.isfinite(es)):
@@ -776,32 +1281,44 @@ def plot_evidence_severity_plane_year(out: pd.DataFrame, year: int, cfg: Backtes
             return "red"
         if (prob_under >= cfg.tl_prob_amber and es >= cfg.tl_es_amber) or (prob_under >= cfg.tl_prob_red):
             return "amber"
-        return "green"
+        return "blue"
 
     df["tl"] = df.apply(lambda r: _tl_decision(r["prob_under"], r["Jeffreys_ES"]), axis=1)
-    col = df["tl"].map({"green": PAPER["green"], "amber": PAPER["amber"], "red": PAPER["red"], "na": PAPER["na"]}).to_numpy()
+    df["_size"] = size
 
-    fig, ax = plt.subplots(figsize=(9.4, 5.0))
+    fig, ax = plt.subplots(figsize=(9.6, 5.2))
     paper_axes(ax)
+    ax.grid(True, color=PAPER["grid"], linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
 
-    ax.scatter(df["ES_bps"], df["prob_under"], s=size, c=col, alpha=0.85, edgecolors="none")
+    # Threshold guides — drawn before scatter so they sit underneath
+    for y in (cfg.tl_prob_red, cfg.tl_prob_amber):
+        ax.axhline(y, linewidth=1.0, color=PAPER["muted_2"], linestyle=":", zorder=1)
+    for x in (cfg.tl_es_red * 1e4, cfg.tl_es_amber * 1e4):
+        ax.axvline(x, linewidth=1.0, color=PAPER["muted_2"], linestyle=":", zorder=1)
 
-    ax.set_xlabel("Expected shortfall (bps)")
-    ax.set_ylabel("P(p > PD | y)")
+    for level in ["blue", "amber", "red", "na"]:
+        sub = df[df["tl"] == level]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["ES_bps"],
+            sub["prob_under"],
+            s=sub["_size"],
+            c=_tl_color(level),
+            marker=TL_MARKERS[level],
+            alpha=0.88,
+            edgecolors=PAPER["stroke"],
+            linewidths=1.0,
+            label=TL_LABELS[level],
+            zorder=3,
+        )
+
+    ax.set_xlabel("Expected shortfall (bps)", color=PAPER["axis"])
+    ax.set_ylabel("P(p > PD | y)", color=PAPER["axis"])
     ax.set_ylim(0, 1)
-    ax.grid(True, color=PAPER["grid"], linewidth=1.0)
 
-    ax.axhline(cfg.tl_prob_red, linewidth=1.1, color=PAPER["muted"])
-    ax.axhline(cfg.tl_prob_amber, linewidth=1.1, color=PAPER["muted"])
-    ax.axvline(cfg.tl_es_red * 1e4, linewidth=1.1, color=PAPER["muted"])
-    ax.axvline(cfg.tl_es_amber * 1e4, linewidth=1.1, color=PAPER["muted"])
-
-    handles = [
-        Patch(facecolor=PAPER["green"], edgecolor="none", label="Green"),
-        Patch(facecolor=PAPER["amber"], edgecolor="none", label="Amber"),
-        Patch(facecolor=PAPER["red"], edgecolor="none", label="Red"),
-        Patch(facecolor=PAPER["na"], edgecolor="none", label="NA"),
-    ]
+    handles = traffic_light_legend_handles(include_na=True)
     legend_outside(ax, handles, side="right", pad=0.02)
 
     fig.tight_layout()
@@ -846,34 +1363,66 @@ def plot_pd_evolution_per_grade(
     y_ub_s = scale(y_ub)
     y_tgt_s = scale(y_tgt)
 
-    fig, ax = plt.subplots(figsize=(10.2, 3.4))
+    fig, ax = plt.subplots(figsize=(10.4, 3.6))
     paper_axes(ax)
-    ax.grid(axis="y", color=PAPER["grid"], linewidth=1.0)
+    ax.grid(axis="y", color=PAPER["grid"], linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
 
-    ci_face = "#cbd5e1"
-    ci_edge = "#94a3b8"
+    # Two-tone CI band: light fill + soft edge for a refined look
+    ci_face = "#D7DEE6"
+    ci_edge = "#94A3B8"
     ax.fill_between(
-        x, y_lb_s, y_ub_s,
-        facecolor=ci_face, alpha=0.45, linewidth=0.9, edgecolor=ci_edge,
-        label=f"Jeffreys {int(cfg.conf_level*100)}% CI", zorder=1,
+        x,
+        y_lb_s,
+        y_ub_s,
+        facecolor=ci_face,
+        alpha=0.55,
+        linewidth=0.0,
+        label=f"Jeffreys {int(cfg.conf_level*100)}% CI",
+        zorder=1,
     )
+    ax.plot(x, y_lb_s, color=ci_edge, linewidth=0.8, alpha=0.7, zorder=1)
+    ax.plot(x, y_ub_s, color=ci_edge, linewidth=0.8, alpha=0.7, zorder=1)
 
-    ax.plot(x, y_obs_s, color=PAPER["axis"], linewidth=2.0, marker="o", markersize=3.5, label="Observed PD", zorder=3)
-    ax.plot(x, y_tgt_s, color=PAPER["muted"], linewidth=1.8, linestyle="--", label=f"Target PD ({cfg.pdk_target})", zorder=2)
+    ax.plot(
+        x,
+        y_obs_s,
+        color=PAPER["axis"],
+        linewidth=2.0,
+        marker="o",
+        markersize=4.0,
+        markerfacecolor=PAPER["axis"],
+        markeredgecolor=PAPER["bg"],
+        markeredgewidth=0.8,
+        label="Observed PD",
+        zorder=3,
+    )
+    ax.plot(
+        x,
+        y_tgt_s,
+        color=PAPER["blue"],
+        linewidth=1.8,
+        linestyle="--",
+        label=f"Target PD ({cfg.pdk_target})",
+        zorder=2,
+    )
 
     q_labels = df["Quarter_str"].tolist()
     ax.set_xticks(x)
     ax.set_xticklabels(q_labels, rotation=0, color=PAPER["muted"])
 
     if cfg.pd_plot_logy:
-        pos = np.r_[y_obs_s[np.isfinite(y_obs_s) & (y_obs_s > 0)], y_tgt_s[np.isfinite(y_tgt_s) & (y_tgt_s > 0)]]
+        pos = np.r_[
+            y_obs_s[np.isfinite(y_obs_s) & (y_obs_s > 0)],
+            y_tgt_s[np.isfinite(y_tgt_s) & (y_tgt_s > 0)],
+        ]
         if pos.size > 0:
             ax.set_yscale("log")
 
     handles = [
         Patch(facecolor=ci_face, edgecolor=ci_edge, label=f"Jeffreys {int(cfg.conf_level*100)}% CI"),
         Line2D([0], [0], color=PAPER["axis"], lw=2.0, marker="o", markersize=4, label="Observed PD"),
-        Line2D([0], [0], color=PAPER["muted"], lw=1.8, ls="--", label=f"Target PD ({cfg.pdk_target})"),
+        Line2D([0], [0], color=PAPER["blue"], lw=1.8, ls="--", label=f"Target PD ({cfg.pdk_target})"),
     ]
     legend_outside(ax, handles, side="right", pad=0.02)
 
@@ -942,12 +1491,30 @@ def plot_beta_posteriors_grade_over_time(
 
     years = sorted(df_ok["Year"].unique().tolist())
     n_years = len(years)
-    cmap = plt.cm.get_cmap("tab10" if n_years <= 10 else "tab20")
-    colors = {yr: cmap(i / max(1, n_years - 1)) for i, yr in enumerate(years)}
 
-    fig, ax = plt.subplots(figsize=(10.6, 4.6))
+    # Color-blind safe categorical palette (Okabe–Ito subset, reordered to
+    # avoid clashing with the traffic-light foreground palette).
+    OKABE_ITO_YEARS = [
+        PAPER["blue"],  # same pastel blue as the traffic-light figures
+        PAPER["red"],   # same pastel vermillion as the traffic-light figures
+        "#009E73",      # bluish green
+        "#CC79A7",      # reddish purple
+        "#56B4E9",      # sky blue
+        PAPER["amber"], # same pastel amber as the traffic-light figures
+        "#F0E442",      # yellow
+        "#000000",      # black
+    ]
+    if n_years <= len(OKABE_ITO_YEARS):
+        colors = {yr: OKABE_ITO_YEARS[i] for i, yr in enumerate(years)}
+    else:
+        # Fallback for more than 8 years — modern API, no deprecation
+        cmap_obj = mpl.colormaps["tab20"]
+        colors = {yr: cmap_obj(i % cmap_obj.N) for i, yr in enumerate(years)}
+
+    fig, ax = plt.subplots(figsize=(10.8, 4.8))
     paper_axes(ax)
-    ax.grid(axis="y", color=PAPER["grid"], linewidth=1.0)
+    ax.grid(axis="y", color=PAPER["grid"], linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
 
     handles_year = []
     for yr in years:
@@ -963,21 +1530,29 @@ def plot_beta_posteriors_grade_over_time(
             y = beta_dist.pdf(x, ai, bi)
             dens_stack.append(y)
 
-            ax.plot(x, y, color=col, alpha=cfg.beta_line_alpha, linewidth=cfg.beta_quarter_linewidth, zorder=2)
-            ax.fill_between(x, 0.0, y, color=col, alpha=cfg.beta_fill_alpha, linewidth=0.0, zorder=1)
+            ax.plot(x, y, color=col, alpha=cfg.beta_line_alpha,
+                    linewidth=cfg.beta_quarter_linewidth, zorder=2)
+            ax.fill_between(x, 0.0, y, color=col,
+                            alpha=cfg.beta_fill_alpha, linewidth=0.0, zorder=1)
 
         if len(dens_stack) > 0:
             y_mean = np.nanmean(np.vstack(dens_stack), axis=0)
-            ax.plot(x, y_mean, color=col, alpha=0.95, linewidth=cfg.beta_year_linewidth, zorder=3)
+            ax.plot(x, y_mean, color=col, alpha=0.95,
+                    linewidth=cfg.beta_year_linewidth, zorder=3)
 
-        handles_year.append(Line2D([0], [0], color=col, lw=cfg.beta_year_linewidth, label=str(yr)))
+        handles_year.append(Line2D([0], [0], color=col,
+                                   lw=cfg.beta_year_linewidth, label=str(yr)))
 
     if np.isfinite(pd0):
         ax.axvline(pd0, color=PAPER["axis"], linewidth=1.8, linestyle="--", zorder=4)
 
+    ax.set_xlabel("p", color=PAPER["axis"])
+    ax.set_ylabel("density", color=PAPER["axis"])
+
     handles = handles_year.copy()
     if np.isfinite(pd0):
-        handles.append(Line2D([0], [0], color=PAPER["axis"], lw=1.8, ls="--", label=f"Target PD ({cfg.pdk_target})"))
+        handles.append(Line2D([0], [0], color=PAPER["axis"], lw=1.8, ls="--",
+                              label=f"Target PD ({cfg.pdk_target})"))
 
     legend_outside(ax, handles, side="right", pad=0.02, fontsize=9)
     fig.tight_layout()
@@ -995,7 +1570,7 @@ def tl_from_pval(pval_H0: float, alpha: float, amber: float) -> str:
         return "red"
     if pval_H0 < amber:
         return "amber"
-    return "green"
+    return "blue"
 
 
 def tl_from_decision(prob_under: float, es: float, cfg: BacktestConfig) -> str:
@@ -1005,7 +1580,7 @@ def tl_from_decision(prob_under: float, es: float, cfg: BacktestConfig) -> str:
         return "red"
     if (prob_under >= cfg.tl_prob_amber and es >= cfg.tl_es_amber) or (prob_under >= cfg.tl_prob_red):
         return "amber"
-    return "green"
+    return "blue"
 
 
 def prep_tl_matrix(out_long: pd.DataFrame, cfg: BacktestConfig, mode: str) -> pd.DataFrame:
@@ -1190,10 +1765,19 @@ def run_oos_backtest(cfg: BacktestConfig) -> None:
     # Severity figures (focus year)
     focus = cfg.focus_year if cfg.focus_year is not None else choose_focus_year(out, cfg)
     if focus is not None:
-        plot_severity_map_year(out, focus, out_png=sev_dir / f"severity_map_{focus}.png",
-                              out_pdf=(sev_dir / f"severity_map_{focus}.pdf") if cfg.save_pdf else None)
-        plot_evidence_severity_plane_year(out, focus, cfg, out_png=sev_dir / f"evidence_severity_plane_{focus}.png",
-                                          out_pdf=(sev_dir / f"evidence_severity_plane_{focus}.pdf") if cfg.save_pdf else None)
+        plot_severity_map_year(
+            out,
+            focus,
+            out_png=sev_dir / f"severity_map_{focus}.png",
+            out_pdf=(sev_dir / f"severity_map_{focus}.pdf") if cfg.save_pdf else None,
+        )
+        plot_evidence_severity_plane_year(
+            out,
+            focus,
+            cfg,
+            out_png=sev_dir / f"evidence_severity_plane_{focus}.png",
+            out_pdf=(sev_dir / f"evidence_severity_plane_{focus}.pdf") if cfg.save_pdf else None,
+        )
         print(f"[OK] severity figures for year={focus}:", sev_dir)
     else:
         print("[WARN] could not infer a focus year; skipped severity plots.")
