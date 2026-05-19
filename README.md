@@ -1,10 +1,13 @@
 # Credit Risk Pipeline — Paper Replication Package
 
-This repository contains the **code, experiments, and reproducibility material** associated with the SSRN paper:
+This repository contains the **code, experiments, and reproducibility material** associated with the article published in the **European Journal of Operational Research (EJOR)**:
 
-**Pull, Yoann and Hurlin, Christophe**, *A Bayesian Approach to Probability of Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test* (June 12, 2025).  
+**Pull, Yoann and Hurlin, Christophe**, *A Bayesian Approach to Probability of Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test*.  
+European Journal of Operational Research.  
+DOI: https://doi.org/10.1016/j.ejor.2026.05.008
+
+A preprint version is also available on SSRN:  
 SSRN: https://ssrn.com/abstract=5291474  
-DOI: http://dx.doi.org/10.2139/ssrn.5291474
 
 > **Paper-grade replication entrypoints** are provided via a dedicated Makefile:  
 > **`replication/Makefile`** (recommended starting point).
@@ -16,23 +19,22 @@ DOI: http://dx.doi.org/10.2139/ssrn.5291474
 
 ## How to cite
 
-If you use this code, results, or figures, please cite:
+If you use this code, results, or figures, please cite the published article:
 
 Pull, Yoann and Hurlin, Christophe, *A Bayesian Approach to Probability of Default Model Calibration:  
-Theoretical and Empirical Insights on the Jeffreys Test* (June 12, 2025). Available at SSRN:  
-https://ssrn.com/abstract=5291474 or http://dx.doi.org/10.2139/ssrn.5291474
+Theoretical and Empirical Insights on the Jeffreys Test*. European Journal of Operational Research.  
+https://doi.org/10.1016/j.ejor.2026.05.008
 
 ### BibTeX
 
 ```bibtex
-@article{PullHurlin2025Jeffreys,
-  title  = {A Bayesian Approach to Probability of Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test},
-  author = {Pull, Yoann and Hurlin, Christophe},
-  year   = {2025},
-  month  = jun,
-  note   = {SSRN Working Paper No. 5291474},
-  url    = {https://ssrn.com/abstract=5291474},
-  doi    = {10.2139/ssrn.5291474}
+@article{PullHurlin2026Jeffreys,
+  title   = {A Bayesian Approach to Probability of Default Model Calibration: Theoretical and Empirical Insights on the Jeffreys Test},
+  author  = {Pull, Yoann and Hurlin, Christophe},
+  journal = {European Journal of Operational Research},
+  year    = {2026},
+  doi     = {10.1016/j.ejor.2026.05.008},
+  url     = {https://doi.org/10.1016/j.ejor.2026.05.008}
 }
 ```
 
